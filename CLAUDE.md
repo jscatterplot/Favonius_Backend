@@ -1082,8 +1082,8 @@ test(api): add coverage for handoff rate limiting
 ### Charger log extraction
 | Variable | Default | Description |
 |---|---|---|
-| `CHARGER_LOG_UPLOAD_BASE_URL` | — | Public URL chargers reach to upload diagnostic archives (the `location` in OCPP `GetDiagnostics`). Must resolve to `POST /internal/charger_logs/upload` on this API service. Without it, the trigger endpoint returns 503. |
-| `CHARGER_LOG_UPLOAD_SIGNING_KEY` | — | HMAC secret for signing per-import upload tokens. Rotating invalidates every in-flight URL. |
+| `CHARGER_LOG_UPLOAD_BASE_URL` | — | Public URL chargers reach to upload diagnostic archives (the `location` in OCPP `GetDiagnostics`). Must resolve to `POST /internal/charger_logs/upload` on this API service. **Optional**: when unset, `dispatch_get_diagnostics` derives it from the triggering request's `Host` (via `derive_upload_base_url`), which is correct on a single public-ingress deploy (e.g. Railway). Set it explicitly only for split-ingress setups where the browser-reachable host differs from the charger-reachable host — the explicit value then takes precedence over derivation. |
+| `CHARGER_LOG_UPLOAD_SIGNING_KEY` | — | HMAC secret for signing per-import upload tokens. **Required** for the feature (cannot be derived); the `fetch_logs` trigger returns 503 until it is set, and the API logs a warning at boot when unset. Rotating invalidates every in-flight URL. |
 | `CHARGER_LOG_UPLOAD_TOKEN_TTL_S` | `3600` | Upload-token lifetime, seconds. Floor of 60 s. |
 | `CHARGER_LOG_UPLOAD_MAX_BYTES` | `52428800` (50 MiB) | Per-upload size cap. `MaxBodySizeMiddleware` reads this for the upload path so the global 1 MiB cap doesn't apply. |
 

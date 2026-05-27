@@ -50,6 +50,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from pydantic.alias_generators import to_camel
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from ..adapters.chargers.upload_token import UPLOAD_PATH, derive_upload_base_url
 from ..adapters.ocpp.dispatch import dispatch_get_diagnostics
 from ..core.controller_manager import ControllerManager
 from ..core.models import DepotConfig
@@ -294,6 +295,23 @@ if not _METRICS_TOKEN:
     logger.warning(
         "METRICS_TOKEN is not set; /metrics will refuse every request "
         "with 503 until the token is configured."
+    )
+
+# Charger diagnostic-log extraction (GetDiagnostics → signed upload URL).
+# The upload URL self-derives from the request host when
+# CHARGER_LOG_UPLOAD_BASE_URL is unset, but the signing key is a secret
+# that cannot be derived — without it the fetch_logs endpoint fails
+# closed with a 503 on first use. Warn at boot so the gap is visible in
+# logs instead of surfacing only when an operator clicks the button. Not
+# a hard fail: charger-log extraction is optional, so a deploy that never
+# uses it should still boot.
+if not os.environ.get("CHARGER_LOG_UPLOAD_SIGNING_KEY"):
+    logger.warning(
+        "CHARGER_LOG_UPLOAD_SIGNING_KEY is not set; charger diagnostic-log "
+        "fetch (POST .../sessions/{id}/fetch_logs) will return 503 until it "
+        "is configured. The upload URL itself self-derives from the request "
+        "host, so CHARGER_LOG_UPLOAD_BASE_URL is optional on a single-ingress "
+        "deploy."
     )
 
 
@@ -754,7 +772,10 @@ _MAX_BODY_SIZE = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(1 * 1024 * 1024))) 
 # applies its own cap (``CHARGER_LOG_UPLOAD_MAX_BYTES``) which the
 # middleware mirrors so a misconfigured global cap doesn't silently
 # block the endpoint while the per-endpoint cap suggests it would work.
-_CHARGER_LOG_UPLOAD_PATH = "/internal/charger_logs/upload"
+# Single source of truth for the path lives in upload_token (imported at
+# top of module) so the middleware cap, the route, and the derived upload
+# URL never drift.
+_CHARGER_LOG_UPLOAD_PATH = UPLOAD_PATH
 
 
 def _body_size_limit_for_path(path: str) -> int:
@@ -11047,6 +11068,7 @@ async def fetch_charger_session_logs_endpoint(
     depot_id: str,
     charger_id: str,
     session_id: str,
+    request: Request,
     user: dict = Depends(ensure_tenant_mirrored),
 ):
     """Enqueue an OCPP ``GetDiagnostics`` to extract the charger's own log.
@@ -11135,6 +11157,17 @@ async def fetch_charger_session_logs_endpoint(
     hour_bucket = int(time.time() // 3600)
     idempotency_key = f"get_diagnostics:{session_id}:{hour_bucket}"
 
+    # Derive the charger-reachable upload URL from this request's host so
+    # CHARGER_LOG_UPLOAD_BASE_URL doesn't have to be configured by hand on
+    # a single public-ingress deploy. dispatch_get_diagnostics gives the
+    # env var precedence over this derived value (the override exists for
+    # split-host setups where the browser host isn't charger-reachable).
+    derived_upload_base_url = derive_upload_base_url(
+        host=request.headers.get("host"),
+        forwarded_proto=request.headers.get("x-forwarded-proto"),
+        fallback_scheme=request.url.scheme,
+    )
+
     try:
         import_id = await dispatch_get_diagnostics(
             db_pools.ts,
@@ -11147,6 +11180,7 @@ async def fetch_charger_session_logs_endpoint(
                 else None
             ),
             vendor=charger_row["vendor"],
+            base_url=derived_upload_base_url,
             # Bound the diagnostic dump to the session window so
             # chargers return only the relevant slice instead of a
             # full-disk export. ABB Terra AC honours these OCPP fields

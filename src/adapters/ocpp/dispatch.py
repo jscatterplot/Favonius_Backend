@@ -256,6 +256,7 @@ async def dispatch_get_diagnostics(
     start_time: Optional[datetime] = None,
     stop_time: Optional[datetime] = None,
     idempotency_key: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> UUID:
     """Enqueue a ``GetDiagnostics`` command and create its import row.
 
@@ -291,23 +292,37 @@ async def dispatch_get_diagnostics(
         idempotency_key: When set, the row's ``UNIQUE`` constraint on
             ``idempotency_key`` blocks a second request from creating
             a duplicate row.
+        base_url: Optional fully-qualified upload URL (scheme + host +
+            ``/internal/charger_logs/upload``) derived from the
+            triggering request's ``Host``. Used only when
+            ``CHARGER_LOG_UPLOAD_BASE_URL`` is unset; the env var takes
+            precedence when both are present.
 
     Returns:
         The new ``charger_log_imports.id``.
 
     Raises:
-        RuntimeError: When ``CHARGER_LOG_UPLOAD_BASE_URL`` /
-            ``CHARGER_LOG_UPLOAD_SIGNING_KEY`` are unset — the charger
-            could not reach a usable URL, so dispatch refuses up-front
-            rather than emit a broken request.
+        RuntimeError: When neither ``CHARGER_LOG_UPLOAD_BASE_URL`` nor a
+            derived ``base_url`` is available (the charger could not
+            reach a usable URL), or when ``CHARGER_LOG_UPLOAD_SIGNING_KEY``
+            is unset (no secret to sign the token). Dispatch refuses
+            up-front rather than emit a broken request.
         asyncpg.UniqueViolationError: When ``idempotency_key`` collides
             with an existing row. Callers translate this to HTTP 409.
     """
-    # Fail fast if the deployment isn't configured. Avoids minting a
-    # token the charger could never use.
-    if get_upload_base_url() is None:
+    # Resolve the upload URL the charger will POST to. Precedence:
+    #   1. CHARGER_LOG_UPLOAD_BASE_URL env — explicit operator override,
+    #      required when the charger-reachable host differs from the host
+    #      an operator's browser used to trigger this.
+    #   2. base_url derived from the triggering request's Host — the
+    #      zero-config path for single public-ingress deploys.
+    # Fail fast if neither is available, rather than mint a token the
+    # charger could never use.
+    resolved_base_url = get_upload_base_url() or base_url
+    if resolved_base_url is None:
         raise RuntimeError(
-            "Charger log upload is not configured: set CHARGER_LOG_UPLOAD_BASE_URL "
+            "Charger log upload URL is not configured and could not be derived "
+            "from the request: set CHARGER_LOG_UPLOAD_BASE_URL "
             "(and CHARGER_LOG_UPLOAD_SIGNING_KEY)."
         )
 
@@ -332,7 +347,7 @@ async def dispatch_get_diagnostics(
     # and a 401 "token mismatch" on upload.
     token = mint_token(import_id)
     token_sha256 = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    location = build_upload_url(import_id, token=token)
+    location = build_upload_url(import_id, base_url=resolved_base_url, token=token)
 
     payload: dict[str, Any] = {
         "location": location,

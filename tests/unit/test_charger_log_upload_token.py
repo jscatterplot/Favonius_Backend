@@ -13,8 +13,10 @@ from uuid import UUID, uuid4
 import pytest
 
 from src.adapters.chargers.upload_token import (
+    UPLOAD_PATH,
     UploadTokenError,
     build_upload_url,
+    derive_upload_base_url,
     get_max_upload_bytes,
     get_token_ttl_seconds,
     mint_token,
@@ -106,6 +108,56 @@ class TestBuildUploadUrl:
         monkeypatch.delenv("CHARGER_LOG_UPLOAD_BASE_URL", raising=False)
         with pytest.raises(RuntimeError):
             build_upload_url(uuid4())
+
+
+class TestDeriveUploadBaseUrl:
+    def test_derives_from_host_and_forwarded_proto(self):
+        url = derive_upload_base_url(
+            host="favoniusbackend-production.up.railway.app",
+            forwarded_proto="https",
+            fallback_scheme="http",
+        )
+        assert url == (
+            "https://favoniusbackend-production.up.railway.app"
+            "/internal/charger_logs/upload"
+        )
+        assert url.endswith(UPLOAD_PATH)
+
+    def test_forwarded_proto_uses_leftmost_value(self):
+        # X-Forwarded-Proto can be a comma-separated chain; the public
+        # scheme is the leftmost (closest to the client).
+        url = derive_upload_base_url(
+            host="api.example.test",
+            forwarded_proto="https, http",
+            fallback_scheme="http",
+        )
+        assert url.startswith("https://")
+
+    def test_falls_back_to_request_scheme_without_forwarded_proto(self):
+        # Direct local uvicorn: no edge proxy, no X-Forwarded-Proto.
+        url = derive_upload_base_url(
+            host="localhost:8000", forwarded_proto=None, fallback_scheme="http"
+        )
+        assert url == "http://localhost:8000/internal/charger_logs/upload"
+
+    def test_returns_none_without_host(self):
+        assert derive_upload_base_url(host=None) is None
+        assert derive_upload_base_url(host="") is None
+        assert derive_upload_base_url(host="   ") is None
+
+    def test_strips_whitespace_around_host(self):
+        url = derive_upload_base_url(
+            host="  api.example.test  ", forwarded_proto="https"
+        )
+        assert url == "https://api.example.test/internal/charger_logs/upload"
+
+    def test_derived_url_is_usable_as_build_upload_url_base(self):
+        # The derived value is the same shape build_upload_url expects as
+        # an explicit base_url, so it round-trips into a usable upload URL.
+        base = derive_upload_base_url(host="api.example.test", forwarded_proto="https")
+        url = build_upload_url(uuid4(), base_url=base)
+        assert url.startswith("https://api.example.test/internal/charger_logs/upload?")
+        assert "token=" in url
 
 
 class TestSigningKeyRequired:

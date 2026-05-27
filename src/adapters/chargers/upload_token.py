@@ -36,6 +36,11 @@ from uuid import UUID
 DEFAULT_TOKEN_TTL_S = 3600
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024  # 50 MiB
 
+# Path the Main API serves the upload endpoint on. A derived base URL
+# (host taken from the triggering request) appends this; the explicit
+# CHARGER_LOG_UPLOAD_BASE_URL env var must already include it.
+UPLOAD_PATH = "/internal/charger_logs/upload"
+
 
 class UploadTokenError(Exception):
     """Raised for any token shape, expiry, or signature failure.
@@ -110,6 +115,51 @@ def get_upload_base_url() -> Optional[str]:
     return raw.rstrip("/")
 
 
+def derive_upload_base_url(
+    *,
+    host: Optional[str],
+    forwarded_proto: Optional[str] = None,
+    fallback_scheme: str = "https",
+) -> Optional[str]:
+    """Reconstruct the charger upload URL from the triggering request's host.
+
+    The Main API serves ``POST /internal/charger_logs/upload``. On a
+    single public-ingress deployment (e.g. Railway) the host an operator's
+    browser/BFF used to reach the API is also the host a charger can
+    reach, so the OCPP ``GetDiagnostics`` ``location`` can be derived
+    instead of requiring ``CHARGER_LOG_UPLOAD_BASE_URL`` to be set by hand.
+
+    Only the ``Host`` header is honoured (passed in as ``host``) — never
+    ``X-Forwarded-Host``. ``Host`` is the value the edge router uses to
+    reach this service, so it is the reliable public host; the derived
+    value becomes the upload target handed to charger hardware, and
+    ``X-Forwarded-Host`` is a comparatively easy header to spoof, so we
+    don't trust it for that purpose. Operators whose browser-reachable
+    host differs from the charger-reachable host set
+    ``CHARGER_LOG_UPLOAD_BASE_URL`` explicitly; that env var takes
+    precedence over derivation in :func:`dispatch_get_diagnostics`.
+
+    Args:
+        host: The request ``Host`` header (``request.headers.get("host")``).
+        forwarded_proto: ``X-Forwarded-Proto`` header, if present. A
+            TLS-terminating edge (Railway, Render, …) forwards over plain
+            HTTP, so the public scheme must come from this header rather
+            than the in-container connection scheme.
+        fallback_scheme: Scheme to use when ``forwarded_proto`` is absent
+            (typically ``request.url.scheme`` — ``http`` for a direct
+            local uvicorn).
+
+    Returns:
+        The full upload URL (scheme + host + path), or ``None`` when no
+        host is available so the caller can fall back to the env var or
+        fail closed.
+    """
+    if not host or not host.strip():
+        return None
+    proto = (forwarded_proto or "").split(",")[0].strip() or fallback_scheme
+    return f"{proto}://{host.strip()}{UPLOAD_PATH}"
+
+
 def mint_token(import_id: UUID, *, now: Optional[float] = None, ttl_s: Optional[int] = None) -> str:
     """Return the token string to embed in the upload URL."""
     ts = int(now if now is not None else time.time())
@@ -177,9 +227,11 @@ def build_upload_url(
 __all__ = [
     "DEFAULT_MAX_BYTES",
     "DEFAULT_TOKEN_TTL_S",
+    "UPLOAD_PATH",
     "UploadToken",
     "UploadTokenError",
     "build_upload_url",
+    "derive_upload_base_url",
     "get_max_upload_bytes",
     "get_signing_key",
     "get_token_ttl_seconds",
