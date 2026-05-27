@@ -8230,8 +8230,10 @@ async def _build_power_timeline(
 ) -> PowerTimelineResponse:
     """Assemble the history + plan series for the power-timeline endpoint.
 
-    History: 15-min buckets of SUM(charging_kw) from the ``telemetry``
-    hypertable, scoped to the depot's charger UUIDs.
+    History: 15-min buckets from the ``telemetry`` hypertable, scoped to
+    the depot's charger station_ids.  Per-charger AVG(charging_kw) is
+    computed first, then summed across chargers, so high-frequency OCPP
+    MeterValues samples (every ~15 s) do not inflate the total.
 
     Plan: per-timestep ``grid_power`` and per-vehicle ``charging_power``
     from the latest ``optimization_runs.schedule_json``, aligned to UTC
@@ -8243,7 +8245,7 @@ async def _build_power_timeline(
     now_utc = datetime.now(tz=timezone.utc)
     history_start = now_utc - timedelta(hours=history_hours)
 
-    # ── 1. Depot metadata + charger_ids from Supabase ────────────────────────
+    # ── 1. Depot metadata + station_ids from Supabase ────────────────────────
     async with db_pools.static.acquire() as conn:
         site_row = await conn.fetchrow(
             """
@@ -8258,8 +8260,8 @@ async def _build_power_timeline(
         if site_row is None:
             raise HTTPException(status_code=404, detail=f"Depot {depot_id} not found")
 
-        charger_rows = await conn.fetch(
-            "SELECT id AS charger_id FROM charging_stations WHERE site_id = $1::uuid",
+        station_rows = await conn.fetch(
+            "SELECT station_id FROM charging_stations WHERE site_id = $1::uuid",
             depot_id,
         )
 
@@ -8267,21 +8269,28 @@ async def _build_power_timeline(
     max_grid_kw: Optional[float] = (
         float(site_row["max_grid_kw"]) if site_row["max_grid_kw"] is not None else None
     )
-    charger_ids: list[str] = [str(r["charger_id"]) for r in charger_rows if r["charger_id"]]
+    station_ids: list[str] = [r["station_id"] for r in station_rows if r["station_id"]]
 
     # ── 2. Telemetry history (TimescaleDB) ───────────────────────────────────
     history_points: list[PowerTimelineHistoryPoint] = []
-    if charger_ids:
+    if station_ids:
         history_query = """
             SELECT
-                time_bucket($1::interval, t.time) AS bucket,
-                SUM(t.charging_kw) FILTER (WHERE t.charging_kw IS NOT NULL) AS charging_kw,
-                COUNT(DISTINCT t.vehicle_id) FILTER (WHERE t.charging_kw > 0.1) AS vehicle_count
-            FROM telemetry t
-            WHERE t.charger_id = ANY($2::uuid[])
-              AND t.time >= $3
-              AND t.time < $4
-              AND t.charging_kw IS NOT NULL
+                bucket,
+                SUM(avg_kw)         AS charging_kw,
+                SUM(vehicle_count)  AS vehicle_count
+            FROM (
+                SELECT
+                    time_bucket($1::interval, t.time)                                     AS bucket,
+                    t.station_id,
+                    AVG(t.charging_kw) FILTER (WHERE t.charging_kw IS NOT NULL)           AS avg_kw,
+                    COUNT(DISTINCT t.vehicle_id) FILTER (WHERE t.charging_kw > 0.1)       AS vehicle_count
+                FROM telemetry t
+                WHERE t.station_id = ANY($2::text[])
+                  AND t.time >= $3
+                  AND t.time < $4
+                GROUP BY bucket, t.station_id
+            ) charger_buckets
             GROUP BY bucket
             ORDER BY bucket
         """
@@ -8290,7 +8299,7 @@ async def _build_power_timeline(
             rows = await conn.fetch(
                 history_query,
                 interval,
-                charger_ids,
+                station_ids,
                 history_start,
                 now_utc,
             )
@@ -8329,7 +8338,8 @@ async def _build_power_timeline(
         else:
             try:
                 sched = json.loads(raw_json)
-            except (TypeError, json.JSONDecodeError):
+            except (TypeError, ValueError, json.JSONDecodeError):
+                logger.warning("Unparseable schedule_json for depot %s; returning empty plan", depot_id)
                 sched = {}
         if not isinstance(sched, dict):
             sched = {}
