@@ -192,7 +192,7 @@ expected:
 
 **Grading**:
 - Per-question pass/fail on (a) the right `agent_views.*` function(s) were referenced, (b) no validator rejection, (c) `final_answer` includes/excludes the required substrings, (d) `agent_runs.status='success'`.
-- Aggregate gate: 19/20 (95%) green to pass CI for any PR touching `src/api/agent/`.
+- Aggregate gate (as shipped): the harness asserts **every** scenario individually plus the exact 7/7/6 category shape — i.e. 20/20 green to pass CI for any PR touching `src/api/agent/` (stricter than the originally-planned 95%/19-of-20).
 - Diagnostic mode (`pytest -m agent_sql_golden -v --diag`) prints the LLM trace + executed SQL for failed cases.
 
 ### The 20 questions

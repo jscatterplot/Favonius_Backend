@@ -287,7 +287,7 @@ The chat agent has a second execution path that opens it up to arbitrary depot a
 
 #### SQL-mode v1 gate & dashboard
 
-**v1 gate** — the SQL path is gated in CI by `tests/golden/agent_sql.yaml` (20 Q&A scenarios spanning energy+cost / ops-status / pricing), replayed through a `FakeAnthropicClient` against a real TimescaleDB savepoint by `tests/golden/test_agent_sql_golden.py` (≥19/20 to pass). It is the SQL-path counterpart to the consumption fast path's `tests/golden/agent_consumption.yaml`.
+**v1 gate** — the SQL path is gated in CI by `tests/golden/agent_sql.yaml` (20 Q&A scenarios spanning energy+cost / ops-status / pricing), replayed through a `FakeAnthropicClient` against a real TimescaleDB savepoint by `tests/golden/test_agent_sql_golden.py` (every scenario is asserted individually and the exact 7/7/6 category shape is checked, so all 20 must pass). It is the SQL-path counterpart to the consumption fast path's `tests/golden/agent_consumption.yaml`.
 
 **Dashboard** — `monitoring/grafana/agent_sql_dashboard.json` (Grafana 10; the repo's first dashboard) graphs the SQL-mode metrics: turn duration (p50/p95/p99, intent=`sql_general`), turns/min by status, validation rejections by `error_kind`, executor role-swap failures, tokens by model, and budget refusals/hour.
 
@@ -319,7 +319,7 @@ Every non-graceful turn writes exactly one `agent_runs.failure_reason` (migratio
 
 #### Token budget
 
-The SQL-mode chat agent is cost-protected by a per-org monthly token ceiling (`src/api/agent/budget.py`). Precedence: a positive `organizations.agent_token_budget_monthly` column (`migrations/supabase/045_organizations_agent_token_budget.sql`) beats the hard-coded platform default `DEFAULT_TOKEN_BUDGET_MONTHLY = 10_000_000`. Usage accrues per `(organization_id, YYYYMM)` in the `agent_token_usage` hypertable (migration `046_agent_token_budget.sql`); the tracker reserves an estimate before the LLM call and reconciles the measured total after (fail-open — a budget read never breaks a turn). An over-budget turn is refused **before** Anthropic is called → `status="refused"`, `failure_reason="budget_exceeded"`, and `favonius_agent_sql_budget_refused_total{organization_id}` increments. There is **no env var** for the budget — it is a first-class, per-company commercial DB attribute by design (the PLAN-era `AGENT_SQL_TOKEN_BUDGET_PER_ORG_MONTHLY` was intentionally not built).
+The SQL-mode chat agent is cost-protected by a per-org monthly token ceiling (`src/api/agent/budget.py`). Precedence: a positive `organizations.agent_token_budget_monthly` column (`migrations/supabase/045_organizations_agent_token_budget.sql`) beats the hard-coded platform default `DEFAULT_TOKEN_BUDGET_MONTHLY = 10_000_000`. Usage accrues per `(organization_id, YYYYMM)` in the `agent_token_usage` table (migration `046_agent_token_budget.sql`); the tracker reserves an estimate before the LLM call and reconciles the measured total after (fail-open — a budget read never breaks a turn). An over-budget turn is refused **before** Anthropic is called → `status="refused"`, `failure_reason="budget_exceeded"`, and `favonius_agent_sql_budget_refused_total{organization_id}` increments. There is **no env var** for the budget — it is a first-class, per-company commercial DB attribute by design (the PLAN-era `AGENT_SQL_TOKEN_BUDGET_PER_ORG_MONTHLY` was intentionally not built).
 
 ### Depot Agent — Workflow Runtime (`src/api/agent_workflows/`)
 
