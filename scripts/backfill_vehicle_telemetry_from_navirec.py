@@ -37,6 +37,7 @@ import asyncio
 import logging
 import os
 import sys
+import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -112,6 +113,15 @@ async def run_backfill(
     start_iso = since.astimezone(timezone.utc).isoformat()
     end_iso = until.astimezone(timezone.utc).isoformat()
 
+    # Canonicalize the depot id (lowercase) so the in-memory comparison below
+    # matches site_id::text from Postgres even if the operator passed an
+    # uppercase UUID on the CLI.
+    if depot_id is not None:
+        try:
+            depot_id = str(uuid.UUID(depot_id))
+        except (ValueError, AttributeError):
+            pass  # leave as-is; the SQL ::uuid cast will validate/raise
+
     # Scope the plate map to the target depot so a plate shared with another
     # depot isn't dropped as globally-ambiguous (which would skip valid rows).
     plate_map = await build_plate_map(static_pool, depot_id=depot_id)
@@ -144,6 +154,11 @@ async def run_backfill(
             # and attach the parent's plate.
             point = parse_navirec_point(raw)
             if point is None:
+                continue
+            # Skip future-dated rows (clock skew / bad data): like the live
+            # poller, a future timestamp would win _get_vehicle_socs freshness
+            # and feed a wrong SoC to the optimizer until that time passes.
+            if point.time > until:
                 continue
             planned[vehicle_depot] += 1
             if not execute:

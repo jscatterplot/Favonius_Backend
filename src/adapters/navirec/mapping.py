@@ -101,10 +101,13 @@ def _coerce_soc(value: Any) -> Optional[float]:
     """Coerce a telematics SoC into the Favonius 0–1 range.
 
     Values > 1.5 are treated as a 0–100 percentage and divided by 100; the
-    result is clamped to [0, 1]. Unparseable or non-finite input (``NaN`` /
-    ``inf``) returns ``None`` — clamping a NaN would silently fabricate a valid
-    SoC that could override real charger telemetry in the freshest-wins merge.
+    result is clamped to [0, 1]. Unparseable, boolean, or non-finite input
+    (``NaN`` / ``inf``) returns ``None`` — a bool (``True``→1.0) or a clamped
+    NaN would silently fabricate a valid SoC that could override real charger
+    telemetry in the freshest-wins merge.
     """
+    if isinstance(value, bool):
+        return None
     try:
         soc = float(value)
     except (TypeError, ValueError):
