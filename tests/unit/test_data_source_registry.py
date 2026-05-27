@@ -6,6 +6,7 @@ import pytest
 
 from src.core.data_sources import registry
 from src.core.data_sources.base import (
+    CredentialField,
     DataSourceProvider,
     IngestionContext,
     IngestionResult,
@@ -34,6 +35,40 @@ def test_catalogue_includes_kempower():
     # The password field is marked secret so the UI masks it.
     pw = next(f for f in kempower.credential_fields if f.key == "password")
     assert pw.secret is True and pw.type == "password"
+
+
+def test_credential_field_auth_group_defaults_to_none():
+    field = CredentialField(key="username", label="Username")
+    assert field.auth_group is None
+    assert "auth_group" in field.model_dump()
+    assert field.model_dump()["auth_group"] is None
+
+
+def test_credential_field_auth_group_round_trips():
+    field = CredentialField(key="api_key", label="API Key", type="password", auth_group="apikey")
+    dumped = field.model_dump()
+    assert dumped["auth_group"] == "apikey"
+
+
+def test_catalogue_entry_serialises_auth_group():
+    """auth_group appears in the provider catalogue wire format used by /providers."""
+    entry = ProviderCatalogueEntry(
+        provider_key="test-provider",
+        display_name="Test",
+        description="test",
+        credential_fields=[
+            CredentialField(key="username", label="Username", auth_group="basic"),
+            CredentialField(key="password", label="Password", type="password", auth_group="basic"),
+            CredentialField(key="api_key", label="API Key", type="password", auth_group="apikey"),
+            CredentialField(key="location_id", label="Location ID"),
+        ],
+    )
+    wire = entry.model_dump()
+    fields_by_key = {f["key"]: f for f in wire["credential_fields"]}
+    assert fields_by_key["username"]["auth_group"] == "basic"
+    assert fields_by_key["password"]["auth_group"] == "basic"
+    assert fields_by_key["api_key"]["auth_group"] == "apikey"
+    assert fields_by_key["location_id"]["auth_group"] is None
 
 
 def test_second_provider_is_drop_in():
