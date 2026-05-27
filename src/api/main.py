@@ -8327,27 +8327,32 @@ async def _build_power_timeline(
     # ── 2. Telemetry history (TimescaleDB) ───────────────────────────────────
     history_points: list[PowerTimelineHistoryPoint] = []
     if station_ids:
-        # Per sample, compute an "effective kW": the reported instantaneous
-        # charging_kw when present, else a rate derived from the cumulative
-        # energy register's delta to the previous sample on the same
-        # connector (Δenergy_kwh / Δhours). ABB Terra firmwares emit only
-        # Energy.Active.Import.Register, so charging_kw is NULL there and the
-        # history would otherwise be blank. per_connector then averages those
-        # within each bucket (OCPP writes MeterValues every ~15 s, so AVG
-        # gives mean kW rather than a cumulative sum) before summing across
-        # chargers; per_bucket_vehicles counts distinct charging vehicles per
-        # bucket so a reconnect mid-bucket or a vehicle on two connectors
-        # isn't double-counted. The energy delta is guarded against register
-        # resets (delta < 0), sub-second duplicate timestamps, and multi-hour
-        # gaps so a stale register jump can't smear a bogus spike.
+        # Build the per-bucket kW two ways and prefer the reported reading:
+        #   * reported — rows that carry an instantaneous charging_kw.
+        #   * derived  — for chargers that emit only the cumulative
+        #     Energy.Active.Import.Register measurand (ABB Terra firmwares),
+        #     charging_kw is NULL, so kW is recovered from the register's
+        #     delta to the PREVIOUS register sample (Δenergy_kwh / Δhours).
+        # The derived window is filtered to energy-bearing rows first: a single
+        # MeterValues frame is stored as several telemetry rows (SoC, current,
+        # voltage …) and only the register row carries energy_kwh, so an
+        # unfiltered LAG would see an interleaved NULL row and the derivation
+        # would collapse to nothing. per_connector then averages each
+        # connector's samples within the bucket — COALESCE keeps reported kW
+        # when present, else the derived kW — and the totals are summed across
+        # chargers. per_bucket_vehicles counts distinct charging vehicles per
+        # bucket so a reconnect mid-bucket or a vehicle on two connectors isn't
+        # double-counted. The energy delta is guarded against register resets
+        # (delta < 0), sub-second duplicate timestamps, and gaps longer than one
+        # timeline step (so a stale register jump can't smear a flat rate across
+        # buckets it never covered).
         history_query = """
-            WITH samples AS (
+            WITH energy_samples AS (
                 SELECT
                     t.time,
                     t.station_id,
                     t.connector_id,
                     t.vehicle_id,
-                    t.charging_kw,
                     t.energy_kwh,
                     LAG(t.energy_kwh) OVER w AS prev_energy_kwh,
                     LAG(t.time)       OVER w AS prev_time
@@ -8355,43 +8360,65 @@ async def _build_power_timeline(
                 WHERE t.station_id = ANY($2::text[])
                   AND t.time >= $3
                   AND t.time < $4
+                  AND t.energy_kwh IS NOT NULL
                 WINDOW w AS (
                     PARTITION BY t.station_id, t.connector_id ORDER BY t.time
                 )
             ),
-            effective AS (
+            derived AS (
                 SELECT
                     time_bucket($1::interval, time) AS bucket,
                     station_id,
                     connector_id,
                     vehicle_id,
                     CASE
-                        WHEN charging_kw IS NOT NULL THEN charging_kw
-                        WHEN energy_kwh IS NOT NULL
-                             AND prev_energy_kwh IS NOT NULL
+                        WHEN prev_energy_kwh IS NOT NULL
                              AND energy_kwh >= prev_energy_kwh
                              AND prev_time IS NOT NULL
-                             AND EXTRACT(EPOCH FROM (time - prev_time)) BETWEEN 1 AND 3600
+                             AND EXTRACT(EPOCH FROM (time - prev_time)) BETWEEN 1 AND $5
                         THEN (energy_kwh - prev_energy_kwh)
                              / (EXTRACT(EPOCH FROM (time - prev_time)) / 3600.0)
                         ELSE NULL
-                    END AS eff_kw
-                FROM samples
+                    END AS kw
+                FROM energy_samples
+            ),
+            reported AS (
+                SELECT
+                    time_bucket($1::interval, t.time) AS bucket,
+                    t.station_id,
+                    t.connector_id,
+                    t.vehicle_id,
+                    t.charging_kw AS kw
+                FROM telemetry t
+                WHERE t.station_id = ANY($2::text[])
+                  AND t.time >= $3
+                  AND t.time < $4
+                  AND t.charging_kw IS NOT NULL
+            ),
+            combined AS (
+                SELECT bucket, station_id, connector_id, vehicle_id, kw, TRUE  AS reported
+                FROM reported
+                UNION ALL
+                SELECT bucket, station_id, connector_id, vehicle_id, kw, FALSE AS reported
+                FROM derived
             ),
             per_connector AS (
                 SELECT
                     bucket,
                     station_id,
                     connector_id,
-                    AVG(eff_kw) FILTER (WHERE eff_kw IS NOT NULL) AS avg_kw
-                FROM effective
+                    COALESCE(
+                        AVG(kw) FILTER (WHERE reported AND kw IS NOT NULL),
+                        AVG(kw) FILTER (WHERE NOT reported AND kw IS NOT NULL)
+                    ) AS avg_kw
+                FROM combined
                 GROUP BY bucket, station_id, connector_id
             ),
             per_bucket_vehicles AS (
                 SELECT
                     bucket,
-                    COUNT(DISTINCT vehicle_id) FILTER (WHERE eff_kw > 0.1) AS vehicle_count
-                FROM effective
+                    COUNT(DISTINCT vehicle_id) FILTER (WHERE kw > 0.1) AS vehicle_count
+                FROM combined
                 GROUP BY bucket
             )
             SELECT
@@ -8404,6 +8431,10 @@ async def _build_power_timeline(
             ORDER BY pc.bucket
         """
         interval = f"{_TIMELINE_TIMESTEP_MINUTES} minutes"
+        # Reject derived intervals longer than one timeline step so a sparse or
+        # post-gap register reading can't be averaged across buckets it never
+        # spanned. ABB Terra emits MeterValues every ~15 s, well inside this.
+        max_gap_seconds = float(_TIMELINE_TIMESTEP_MINUTES * 60)
         async with db_pools.ts.acquire() as conn:
             rows = await conn.fetch(
                 history_query,
@@ -8411,6 +8442,7 @@ async def _build_power_timeline(
                 station_ids,
                 history_start,
                 now_utc,
+                max_gap_seconds,
             )
         for row in rows:
             bucket: datetime = row["bucket"]

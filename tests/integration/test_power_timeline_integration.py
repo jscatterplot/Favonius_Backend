@@ -49,9 +49,12 @@ async def seeded(db_pools: IntegrationPools):
     static = db_pools.static_pool
     ts = db_pools.ts_pool
     async with static.acquire() as conn:
+        # name + address are NOT NULL with no default on the Supabase sites table.
         await conn.execute(
-            "INSERT INTO sites (id, timezone) VALUES ($1, $2)",
+            "INSERT INTO sites (id, name, address, timezone) VALUES ($1, $2, $3, $4)",
             depot_id,
+            "IT Power-Timeline Depot",
+            "1 Integration Way",
             "Europe/Vilnius",
         )
         await conn.execute(
@@ -167,3 +170,44 @@ async def test_history_prefers_reported_charging_kw_over_derived(db_pools, seede
     derived = [h.charging_kw for h in resp.history if h.charging_kw is not None]
     assert derived
     assert max(derived) == pytest.approx(42.0, rel=0.01)
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+@pytest.mark.database
+async def test_history_derivation_skips_interleaved_null_energy_rows(db_pools, seeded):
+    """Register deltas must skip the NULL-energy rows a MeterValues frame also writes.
+
+    The legacy WS handler stores each sampled value as its own telemetry row, so a
+    single frame yields a register row (``energy_kwh`` set) plus SoC/current/voltage
+    rows (``energy_kwh`` NULL) a few microseconds apart. An unfiltered ``LAG`` would
+    read one of those NULL rows as the "previous" register and derive nothing — the
+    real production shape behind the blank chart.
+    """
+    now = datetime.now(tz=timezone.utc)
+    rows: list[tuple] = []
+    for i in range(5):
+        t = now - timedelta(minutes=5 * (5 - i))
+        # Register row (energy_kwh set) + a sibling SoC row 1 µs later (energy_kwh NULL).
+        rows.append((t, seeded.station_id, str(seeded.vehicle_id), None, 1000.0 + 5.0 * i))
+        rows.append(
+            (t + timedelta(microseconds=1), seeded.station_id, str(seeded.vehicle_id), None, None)
+        )
+    async with seeded.ts.acquire() as conn:
+        await conn.executemany(
+            """
+            INSERT INTO telemetry (
+                time, station_id, connector_id, vehicle_id, charging_kw, energy_kwh
+            )
+            VALUES ($1, $2, 1, $3::uuid, $4, $5)
+            """,
+            rows,
+        )
+
+    pools = main.DatabasePools(static=db_pools.static_pool, ts=db_pools.ts_pool)
+    with patch.object(main, "db_pools", pools):
+        resp = await _build_power_timeline(str(seeded.depot_id), 24)
+
+    derived = [h.charging_kw for h in resp.history if h.charging_kw is not None]
+    assert derived, "interleaved NULL-energy rows must not blank the derived series"
+    assert max(derived) == pytest.approx(60.0, rel=0.15)
