@@ -212,6 +212,26 @@ async def test_5xx_retry(client):
 
 
 @pytest.mark.asyncio
+async def test_204_no_content_returns_empty(client):
+    with respx.mock(assert_all_called=False) as mock:
+        _route_auth(mock)
+        mock.get(f"{_BASE}/things/x").mock(return_value=httpx.Response(204))
+        result = await client.get_thing("x")
+        assert result == {}
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_2xx_with_body_is_success(client):
+    with respx.mock(assert_all_called=False) as mock:
+        _route_auth(mock)
+        mock.get(f"{_BASE}/things/x").mock(return_value=httpx.Response(201, json={"id": "x"}))
+        result = await client.get_thing("x")
+        assert result["id"] == "x"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_4xx_no_retry_raises(client):
     with respx.mock(assert_all_called=False) as mock:
         _route_auth(mock)

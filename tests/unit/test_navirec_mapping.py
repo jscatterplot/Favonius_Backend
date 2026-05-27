@@ -170,6 +170,16 @@ def test_parse_navirec_point_requires_soc_and_time():
     assert parse_navirec_point({"soc": 50}) is None  # no timestamp
 
 
+def test_blank_higher_priority_field_falls_through():
+    # A placeholder in a higher-priority key must not block a later valid key.
+    r = navirec_vehicle_to_reading({"plate": "X", "stateOfCharge": "", "soc": 50, "timestamp": _TS})
+    assert r is not None and r.soc == pytest.approx(0.50)
+    r2 = navirec_vehicle_to_reading(
+        {"licensePlate": "   ", "plate": "ABC123", "soc": 50, "timestamp": _TS}
+    )
+    assert r2.vehicle_plate == "ABC123"
+
+
 def test_model_rejects_out_of_range_soc():
     with pytest.raises(ValidationError):
         VehicleTelemetryReading(vehicle_plate="X", soc=2.0, time=_TS_DT)

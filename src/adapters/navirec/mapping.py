@@ -79,10 +79,22 @@ class ParsedPoint(NamedTuple):
 
 
 def _first(raw: dict[str, Any], keys: tuple[str, ...]) -> Any:
-    """Return the first present, non-null value among ``keys``."""
+    """Return the first present, usable value among ``keys``.
+
+    Skips ``None`` and blank/whitespace-only strings so a placeholder in a
+    higher-priority field (e.g. ``"stateOfCharge": ""``) doesn't block fallback
+    to a later valid key (``"batteryLevel"``). Numeric ``0`` / ``False`` are
+    returned as-is — the field-specific coercers decide whether they're valid.
+    """
     for key in keys:
-        if key in raw and raw[key] is not None:
-            return raw[key]
+        if key not in raw:
+            continue
+        value = raw[key]
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
     return None
 
 
@@ -105,6 +117,12 @@ def _coerce_soc(value: Any) -> Optional[float]:
     (``NaN`` / ``inf``) returns ``None`` — a bool (``True``→1.0) or a clamped
     NaN would silently fabricate a valid SoC that could override real charger
     telemetry in the freshest-wins merge.
+
+    KNOWN LIMITATION (pin via scripts/probe_navirec_api.py): a raw value in the
+    (0, 1.5] band is ambiguous — ``1`` could be 1% (percent encoding) or 100%
+    (fraction encoding). We can't disambiguate without knowing Navirec's unit,
+    and assuming percent would corrupt a true fraction (``0.85`` → 0.85%). Once
+    the probe confirms the encoding, replace this heuristic with the fixed unit.
     """
     if isinstance(value, bool):
         return None

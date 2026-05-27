@@ -142,7 +142,7 @@ async def run_backfill(
         if depot_id is not None and vehicle_depot != depot_id:
             continue
         nav_id = navirec_vehicle_id(nv)
-        if nav_id is None:
+        if not nav_id:  # None or blank — can't fetch history without an id
             skipped_vehicles += 1
             continue
         matched_vehicles += 1

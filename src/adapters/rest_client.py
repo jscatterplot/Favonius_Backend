@@ -188,7 +188,11 @@ class BaseRestClient:
                 await asyncio.sleep(_RETRY_BACKOFF_S[attempt])
                 continue
 
-            if resp.status_code == 200:
+            if 200 <= resp.status_code < 300:
+                # 204 / empty-body successes (e.g. an empty final page) aren't
+                # JSON — return an empty envelope so pagination ends cleanly.
+                if resp.status_code == 204 or not resp.content:
+                    return {}
                 data: dict[str, Any] = resp.json()
                 return data
 
