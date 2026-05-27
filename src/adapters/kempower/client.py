@@ -30,6 +30,10 @@ from ..rest_client import BaseRestClient, RestClientError
 
 logger = logging.getLogger(__name__)
 
+# Kempower IAM endpoint: exchange a permanent refresh token for a short-lived
+# access JWT.  This is a platform-level URL, separate from the main API base.
+_REFRESH_TOKEN_URL = "https://kempower.io/api/auth/refreshAccessToken"
+
 
 class KempowerClientError(RestClientError):
     """Raised on unrecoverable Kempower API errors."""
@@ -43,6 +47,7 @@ class KempowerClient(BaseRestClient):
     def __init__(
         self,
         *,
+        refresh_token: Optional[str] = None,
         username: Optional[str] = None,
         password: Optional[str] = None,
         base_url: Optional[str] = None,
@@ -50,12 +55,24 @@ class KempowerClient(BaseRestClient):
         timeout_s: float = 30.0,
     ) -> None:
         """Validate credentials, resolve the base URL, and init the shared base client."""
-        self._username = username or os.getenv("KEMPOWER_USERNAME")
-        self._password = password or os.getenv("KEMPOWER_PASSWORD")
-        if not self._username or not self._password:
+        # Env-var fallbacks only apply when the caller passed no credentials at
+        # all (CLI / default-deployment usage). Explicit constructor args always
+        # win completely — mixing e.g. username+password from args with a
+        # KEMPOWER_REFRESH_TOKEN from the environment would silently use the
+        # wrong auth path.
+        if refresh_token is None and username is None and password is None:
+            self._refresh_token = os.getenv("KEMPOWER_REFRESH_TOKEN") or None
+            self._username = os.getenv("KEMPOWER_USERNAME")
+            self._password = os.getenv("KEMPOWER_PASSWORD")
+        else:
+            self._refresh_token = refresh_token
+            self._username = username
+            self._password = password
+        if not self._refresh_token and not (self._username and self._password):
             raise KempowerClientError(
-                "Kempower credentials missing. Set KEMPOWER_USERNAME and "
-                "KEMPOWER_PASSWORD, or pass them directly to KempowerClient."
+                "Kempower credentials missing. Provide a refresh_token, or both "
+                "username and password (or set KEMPOWER_REFRESH_TOKEN / "
+                "KEMPOWER_USERNAME + KEMPOWER_PASSWORD)."
             )
         resolved_base_url = base_url or os.getenv("KEMPOWER_API_BASE_URL") or self.DEFAULT_BASE_URL
         super().__init__(
@@ -71,10 +88,38 @@ class KempowerClient(BaseRestClient):
     # ------------------------------------------------------------------
 
     async def _fetch_token(self) -> str:
-        """Exchange username/password for a ChargEye JWT."""
-        url = f"{self._base_url}/auth/login"
+        """Obtain a short-lived access JWT using whichever credential was provided.
+
+        Refresh token path: GET the Kempower IAM endpoint with the permanent
+        refresh token as Bearer — no username/password needed.
+        Password path: POST /auth/login with username + password.
+        """
+        if self._refresh_token:
+            return await self._fetch_token_from_refresh()
+        return await self._fetch_token_from_password()
+
+    async def _fetch_token_from_refresh(self) -> str:
+        """Exchange the permanent refresh token for a short-lived access JWT."""
+        resp = await self._client.get(
+            _REFRESH_TOKEN_URL,
+            headers={"Authorization": f"Bearer {self._refresh_token}"},
+        )
+        if resp.status_code != 200:
+            raise KempowerClientError(
+                f"Kempower token refresh failed: HTTP {resp.status_code} {resp.text[:200]}"
+            )
+        body = resp.json()
+        token = body.get("accessToken") or body.get("token")
+        if not token:
+            raise KempowerClientError(
+                "Kempower token refresh response missing 'accessToken'/'token' field"
+            )
+        return str(token)
+
+    async def _fetch_token_from_password(self) -> str:
+        """Exchange username + password for a short-lived access JWT."""
         resp = await self._client.post(
-            url,
+            f"{self._base_url}/auth/login",
             json={"username": self._username, "password": self._password},
         )
         if resp.status_code != 200:

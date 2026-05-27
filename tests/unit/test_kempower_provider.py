@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -29,13 +29,16 @@ class _FakeClientCM:
         return None
 
 
-def _ctx(config: dict[str, Any]) -> IngestionContext:
+def _ctx(
+    config: dict[str, Any],
+    credentials: Optional[dict[str, Any]] = None,
+) -> IngestionContext:
     return IngestionContext(
         connection_id=str(uuid4()),
         job_id=str(uuid4()),
         depot_id=str(uuid4()),
         organization_id=str(uuid4()),
-        credentials={"username": "u", "password": "p"},
+        credentials=credentials if credentials is not None else {"username": "u", "password": "p"},
         config=config,
         static_pool=MagicMock(),
         ts_pool=MagicMock(),
@@ -83,6 +86,37 @@ async def test_validate_credentials_maps_client_error(monkeypatch):
         await provider.validate_credentials(
             {"username": "u", "password": "p"}, {"locationId": "loc1"}
         )
+
+
+async def test_validate_credentials_with_refresh_token(monkeypatch):
+    client = MagicMock()
+    client.get_location = AsyncMock(return_value={"id": "loc1"})
+    provider = kp.KempowerProvider()
+    monkeypatch.setattr(provider, "_build_client", lambda c, cfg: _FakeClientCM(client))
+    await provider.validate_credentials({"refresh_token": "tok"}, {"locationId": "loc1"})
+    client.get_location.assert_awaited_once_with("loc1")
+
+
+async def test_validate_credentials_missing_all_auth():
+    provider = kp.KempowerProvider()
+    with pytest.raises(CredentialValidationError, match="refresh token or both"):
+        await provider.validate_credentials({}, {"locationId": "loc1"})
+
+
+async def test_validate_credentials_both_groups_rejected():
+    provider = kp.KempowerProvider()
+    with pytest.raises(CredentialValidationError, match="not both"):
+        await provider.validate_credentials(
+            {"refresh_token": "tok", "username": "u", "password": "p"},
+            {"locationId": "loc1"},
+        )
+
+
+async def test_validate_credentials_partial_basic_auth_rejected():
+    # username without password is not enough.
+    provider = kp.KempowerProvider()
+    with pytest.raises(CredentialValidationError, match="refresh token or both"):
+        await provider.validate_credentials({"username": "u"}, {"locationId": "loc1"})
 
 
 async def test_run_ingestion_happy_path(monkeypatch):

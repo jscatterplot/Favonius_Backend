@@ -36,6 +36,11 @@ class CredentialField(BaseModel):
     help_text: Optional[str] = None
     options: Optional[list[dict[str, Any]]] = None
     pattern: Optional[str] = None
+    # Fields sharing the same auth_group value form a mutually-exclusive
+    # credential option (e.g. "basic" vs "apikey"). The frontend enforces that
+    # exactly one group is filled in. Fields without an auth_group are
+    # validated independently as before.
+    auth_group: Optional[str] = None
 
 
 class ProviderCatalogueEntry(BaseModel):
