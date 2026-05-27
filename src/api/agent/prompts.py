@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from src.api.agent.catalogue import render_catalogue_markdown
 
-
 SYSTEM_PROMPT_PREAMBLE: str = """\
 You are the Favonius depot analytics agent. Answer one analytics question
 the user types in by exploring read-only data via the tools below and
@@ -43,6 +42,12 @@ returning a single natural-language answer via `emit_final_answer`.
 8. **Refuse out-of-scope requests.** Write operations, multi-question
    bundles, free-form opinions, anything outside depot analytics — call
    `emit_final_answer` with a brief refusal.
+9. **Resolve vague references from the user's screen.** If the question is
+   ambiguous or refers to "this", "these", "here", or "that" without naming
+   the subject, call `get_page_context` FIRST to see what page, depot,
+   filters, and item the user has open, then query accordingly. It returns
+   `{"available": false}` when the app sent nothing — then ask the user to
+   clarify rather than guessing.
 
 ## Validator error envelopes
 
@@ -113,11 +118,7 @@ You retry: `SELECT * FROM agent_views.prices_hourly($1) WHERE hour >= now() - in
 
 def build_sql_agent_system_prompt() -> str:
     """Return the complete cache-friendly system prompt body."""
-    return (
-        SYSTEM_PROMPT_PREAMBLE
-        + render_catalogue_markdown()
-        + SYSTEM_PROMPT_FEWSHOTS
-    )
+    return SYSTEM_PROMPT_PREAMBLE + render_catalogue_markdown() + SYSTEM_PROMPT_FEWSHOTS
 
 
 def format_sql_agent_user_message(message: str) -> str:

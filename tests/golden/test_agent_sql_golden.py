@@ -45,14 +45,8 @@ import yaml
 
 from src.api.agent.auth_context import AuthContext
 from src.api.agent.controller import _sql_functions_accessed
-from src.api.agent.prompts import (
-    build_sql_agent_system_prompt,
-    format_sql_agent_user_message,
-)
-from src.api.agent.sql_tools import (
-    SQL_AGENT_TOOL_NAMES,
-    build_sql_agent_tool_registry,
-)
+from src.api.agent.prompts import build_sql_agent_system_prompt, format_sql_agent_user_message
+from src.api.agent.sql_tools import SQL_AGENT_TOOL_NAMES, build_sql_agent_tool_registry
 from src.api.agent_workflows.eval.runner import FakeAnthropicClient
 from src.api.agent_workflows.runtime import QAResult, run_qa_turn
 
@@ -147,9 +141,7 @@ def _validate_against_schema(scenario: dict[str, Any]) -> None:
     from jsonschema.exceptions import ValidationError
 
     try:
-        Draft7Validator(
-            _scenario_schema(), format_checker=draft7_format_checker
-        ).validate(scenario)
+        Draft7Validator(_scenario_schema(), format_checker=draft7_format_checker).validate(scenario)
     except ValidationError as exc:
         loc = ".".join(str(p) for p in exc.path) if exc.path else "<root>"
         raise ScenarioError(
@@ -627,7 +619,12 @@ async def run_agent_sql_scenario(
             await _load_static_snapshot(static_conn, snapshot, org_map)
             await _load_ts_snapshot(ts_conn, snapshot, scenario_now, org_map)
 
-            registry = build_sql_agent_tool_registry(_TxPool(static_conn), _TxPool(ts_conn), auth)
+            registry = build_sql_agent_tool_registry(
+                _TxPool(static_conn),
+                _TxPool(ts_conn),
+                auth,
+                page_context=scenario.get("page_context"),
+            )
             fake = FakeAnthropicClient(scenario["llm_trace"])
             qa = await run_qa_turn(
                 anthropic_client=fake,

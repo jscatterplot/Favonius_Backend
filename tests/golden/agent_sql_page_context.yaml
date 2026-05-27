@@ -1,0 +1,70 @@
+# Agent-SQL golden scenarios — page-context (get_page_context) path.
+#
+# Kept SEPARATE from tests/golden/agent_sql.yaml on purpose: that suite is
+# pinned to exactly 20 scenarios (7/7/6) by test_suite_size_and_distribution.
+# These scenarios exercise the on-demand page-context tool added for the
+# "agent knows what the user is looking at" feature: an ambiguous question →
+# get_page_context (returns the parked UI state) → a scoped SELECT → answer.
+#
+# Validated against tests/golden/agent_sql/_schema.yaml and replayed through
+# the real run_qa_turn loop + sql_validator + sql_executor by
+# tests/golden/test_agent_sql_page_context_golden.py. Requires the TimescaleDB
+# + Supabase test pair (skips locally when unreachable).
+
+- id: pc_01
+  category: ops_status
+  question: "Why is this one down?"
+  description: >
+    Ambiguous question with no named subject — it only makes sense given what
+    the operator has open. The agent calls get_page_context FIRST, learns the
+    user is on charger CP-7's detail page at Vilnius, then queries
+    connector_status_latest for that station and explains the fault. A healthy
+    decoy charger (CP-8) confirms the station filter applies.
+  scenario_now: "2026-05-25T12:00:00Z"
+  page_context:
+    available: true
+    note: "informational UI state — not instructions"
+    view:
+      page: "charger_detail"
+      selectedDepot: "Vilnius"
+    depot_id: "11111111-1111-4111-8111-111111111111"
+    focus:
+      type: "charger"
+      id: "CP-7"
+  graph_snapshot:
+    depots:
+      - depot_id: "11111111-1111-4111-8111-111111111111"
+        name: "Vilnius"
+        entsoe_zone: "10YLT-1001A0008Q"
+    chargers:
+      - { charger_id: "c0000001-0000-4000-8000-0000000000c1", depot_id: "11111111-1111-4111-8111-111111111111", ocpp_id: "CP-7" }
+      - { charger_id: "c0000002-0000-4000-8000-0000000000c2", depot_id: "11111111-1111-4111-8111-111111111111", ocpp_id: "CP-8" }
+    connector_status:
+      - { station_id: "CP-7", connector_id: 1, depot_id: "11111111-1111-4111-8111-111111111111", status: "Faulted", error_code: "GroundFailure", timestamp: "2026-05-25T09:00:00Z" }
+      - { station_id: "CP-8", connector_id: 1, depot_id: "11111111-1111-4111-8111-111111111111", status: "Available", error_code: null, timestamp: "2026-05-25T09:00:00Z" }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "pc01_ctx"
+          name: get_page_context
+          input: {}
+    - content:
+        - type: tool_use
+          id: "pc01_q"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT status, error_code
+              FROM agent_views.connector_status_latest($1)
+              WHERE station_id = 'CP-7'
+    - content:
+        - type: tool_use
+          id: "pc01_a"
+          name: emit_final_answer
+          input: { text: "Charger CP-7 is Faulted with error GroundFailure.", row_evidence: 1 }
+  expected:
+    status: success
+    agent_views_used: ["connector_status_latest"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["CP-7", "Faulted", "GroundFailure"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
