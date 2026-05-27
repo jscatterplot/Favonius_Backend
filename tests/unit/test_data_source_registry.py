@@ -30,11 +30,17 @@ def test_get_unknown_provider_raises():
 def test_catalogue_includes_kempower():
     entries = registry.iter_catalogue()
     kempower = next(e for e in entries if e.provider_key == "kempower")
-    field_keys = {f.key for f in kempower.credential_fields}
-    assert {"username", "password", "locationId"} <= field_keys
-    # The password field is marked secret so the UI masks it.
-    pw = next(f for f in kempower.credential_fields if f.key == "password")
-    assert pw.secret is True and pw.type == "password"
+    fields_by_key = {f.key: f for f in kempower.credential_fields}
+    assert {"refresh_token", "username", "password", "locationId"} <= fields_by_key.keys()
+    # Both auth methods are annotated for the frontend's mutual-exclusivity logic.
+    assert fields_by_key["refresh_token"].auth_group == "token"
+    assert fields_by_key["username"].auth_group == "basic"
+    assert fields_by_key["password"].auth_group == "basic"
+    # Non-auth fields have no group.
+    assert fields_by_key["locationId"].auth_group is None
+    # Secrets are masked.
+    assert fields_by_key["refresh_token"].secret is True
+    assert fields_by_key["password"].secret is True and fields_by_key["password"].type == "password"
 
 
 def test_credential_field_auth_group_defaults_to_none():

@@ -15,6 +15,7 @@ import pytest
 import respx
 
 from src.adapters.kempower import KempowerClient, KempowerClientError
+from src.adapters.kempower.client import _REFRESH_TOKEN_URL
 
 _BASE = "https://api.chargeye.example"
 
@@ -30,15 +31,22 @@ def _patch_sleep(monkeypatch):
 
 @pytest.fixture
 def client() -> KempowerClient:
-    return KempowerClient(
-        username="u",
-        password="p",
-        base_url=_BASE,
-    )
+    return KempowerClient(username="u", password="p", base_url=_BASE)
+
+
+@pytest.fixture
+def refresh_client() -> KempowerClient:
+    return KempowerClient(refresh_token="my-refresh-tok", base_url=_BASE)
 
 
 def _route_login(mock, token: str = "token-1", status_code: int = 200):
     return mock.post(f"{_BASE}/auth/login").mock(
+        return_value=httpx.Response(status_code, json={"accessToken": token})
+    )
+
+
+def _route_refresh(mock, token: str = "access-token-1", status_code: int = 200):
+    return mock.get(_REFRESH_TOKEN_URL).mock(
         return_value=httpx.Response(status_code, json={"accessToken": token})
     )
 
@@ -199,9 +207,73 @@ async def test_iter_transactions_passes_window_params(client):
 
 
 @pytest.mark.asyncio
+async def test_refresh_token_auth_hits_kempower_io(refresh_client):
+    with respx.mock(assert_all_called=False) as mock:
+        refresh_route = _route_refresh(mock)
+        mock.get(f"{_BASE}/locations/loc-1").mock(
+            return_value=httpx.Response(200, json={"id": "loc-1"})
+        )
+        await refresh_client.get_location("loc-1")
+        assert refresh_route.call_count == 1
+        # The permanent refresh token is sent as Bearer to the Kempower IAM URL.
+        assert refresh_route.calls.last.request.headers["Authorization"] == "Bearer my-refresh-tok"
+    await refresh_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_auth_caches_token(refresh_client):
+    with respx.mock(assert_all_called=False) as mock:
+        refresh_route = _route_refresh(mock)
+        mock.get(f"{_BASE}/locations/loc-1").mock(
+            return_value=httpx.Response(200, json={"id": "loc-1"})
+        )
+        await refresh_client.get_location("loc-1")
+        await refresh_client.get_location("loc-1")
+        assert refresh_route.call_count == 1
+    await refresh_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_auth_refreshes_on_401(refresh_client):
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(_REFRESH_TOKEN_URL).mock(
+            side_effect=[
+                httpx.Response(200, json={"accessToken": "old"}),
+                httpx.Response(200, json={"accessToken": "new"}),
+            ]
+        )
+        mock.get(f"{_BASE}/locations/loc-1").mock(
+            side_effect=[
+                httpx.Response(401, text="expired"),
+                httpx.Response(200, json={"id": "loc-1"}),
+            ]
+        )
+        result = await refresh_client.get_location("loc-1")
+        assert result["id"] == "loc-1"
+    await refresh_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_response_missing_token_raises(refresh_client):
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(_REFRESH_TOKEN_URL).mock(
+            return_value=httpx.Response(200, json={"unexpected": "shape"})
+        )
+        with pytest.raises(KempowerClientError, match="accessToken"):
+            await refresh_client.get_location("loc-1")
+    await refresh_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_alone_is_sufficient():
+    c = KempowerClient(refresh_token="tok", base_url=_BASE)
+    await c.aclose()
+
+
+@pytest.mark.asyncio
 async def test_missing_credentials_raises():
     with pytest.raises(KempowerClientError, match="credentials missing"):
-        KempowerClient(username=None, password=None, base_url=_BASE)
+        KempowerClient(base_url=_BASE)
 
 
 @pytest.mark.asyncio

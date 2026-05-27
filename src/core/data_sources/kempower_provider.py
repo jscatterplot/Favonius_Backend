@@ -78,10 +78,20 @@ class KempowerProvider(DataSourceProvider):
             ),
             credential_fields=[
                 CredentialField(
+                    key="refresh_token",
+                    label="Refresh Token",
+                    type="password",
+                    required=True,
+                    secret=True,
+                    help_text="Long-lived token provided by Kempower support.",
+                    auth_group="token",
+                ),
+                CredentialField(
                     key="username",
                     label="ChargEye username",
                     type="string",
                     required=True,
+                    auth_group="basic",
                 ),
                 CredentialField(
                     key="password",
@@ -89,6 +99,7 @@ class KempowerProvider(DataSourceProvider):
                     type="password",
                     required=True,
                     secret=True,
+                    auth_group="basic",
                 ),
                 CredentialField(
                     key="locationId",
@@ -118,6 +129,7 @@ class KempowerProvider(DataSourceProvider):
 
     def _build_client(self, credentials: dict[str, Any], config: dict[str, Any]) -> KempowerClient:
         return KempowerClient(
+            refresh_token=credentials.get("refresh_token"),
             username=credentials.get("username"),
             password=credentials.get("password"),
             base_url=(config.get("baseUrl") or credentials.get("baseUrl"))
@@ -131,8 +143,12 @@ class KempowerProvider(DataSourceProvider):
         location_id = config.get("locationId") or credentials.get("locationId")
         if not location_id:
             raise CredentialValidationError("locationId is required")
-        if not credentials.get("username") or not credentials.get("password"):
-            raise CredentialValidationError("username and password are required")
+        has_refresh_token = bool(credentials.get("refresh_token"))
+        has_basic = bool(credentials.get("username")) and bool(credentials.get("password"))
+        if not has_refresh_token and not has_basic:
+            raise CredentialValidationError(
+                "Provide either a refresh token or both username and password."
+            )
         raw_backfill = config.get("backfillSince") or credentials.get("backfillSince")
         if raw_backfill:
             try:

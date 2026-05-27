@@ -43,6 +43,10 @@ class KempowerClientError(RuntimeError):
 _TOKEN_EXPIRY_S = 8 * 60 * 60
 _TOKEN_REFRESH_BUFFER_S = 5 * 60
 
+# Kempower IAM endpoint: exchange a permanent refresh token for a short-lived
+# access JWT.  This is a platform-level URL, separate from the main API base.
+_REFRESH_TOKEN_URL = "https://kempower.io/api/auth/refreshAccessToken"
+
 # Retry policy. ENTSO-E uses the same shape (see ``src/adapters/entsoe/``).
 _MAX_RETRIES = 4
 _RETRY_BACKOFF_S = (1.0, 2.0, 4.0, 8.0)
@@ -56,18 +60,21 @@ class KempowerClient:
     def __init__(
         self,
         *,
+        refresh_token: Optional[str] = None,
         username: Optional[str] = None,
         password: Optional[str] = None,
         base_url: Optional[str] = None,
         client: Optional[httpx.AsyncClient] = None,
         timeout_s: float = 30.0,
     ) -> None:
+        self._refresh_token = refresh_token or os.getenv("KEMPOWER_REFRESH_TOKEN")
         self._username = username or os.getenv("KEMPOWER_USERNAME")
         self._password = password or os.getenv("KEMPOWER_PASSWORD")
-        if not self._username or not self._password:
+        if not self._refresh_token and not (self._username and self._password):
             raise KempowerClientError(
-                "Kempower credentials missing. Set KEMPOWER_USERNAME and "
-                "KEMPOWER_PASSWORD, or pass them directly to KempowerClient."
+                "Kempower credentials missing. Provide a refresh_token, or both "
+                "username and password (or set KEMPOWER_REFRESH_TOKEN / "
+                "KEMPOWER_USERNAME + KEMPOWER_PASSWORD)."
             )
         self._base_url = (
             base_url
@@ -105,9 +112,38 @@ class KempowerClient:
         ):
             return self._token
 
-        url = f"{self._base_url}/auth/login"
+        token = (
+            await self._acquire_token_from_refresh()
+            if self._refresh_token
+            else await self._acquire_token_from_password()
+        )
+        self._token = token
+        self._token_acquired_at = now
+        logger.debug("Kempower auth refreshed (token len=%d)", len(token))
+        return token
+
+    async def _acquire_token_from_refresh(self) -> str:
+        """Exchange the permanent refresh token for a short-lived access JWT."""
+        resp = await self._client.get(
+            _REFRESH_TOKEN_URL,
+            headers={"Authorization": f"Bearer {self._refresh_token}"},
+        )
+        if resp.status_code != 200:
+            raise KempowerClientError(
+                f"Kempower token refresh failed: HTTP {resp.status_code} {resp.text[:200]}"
+            )
+        body = resp.json()
+        token = body.get("accessToken") or body.get("token")
+        if not token:
+            raise KempowerClientError(
+                "Kempower token refresh response missing 'accessToken'/'token' field"
+            )
+        return token
+
+    async def _acquire_token_from_password(self) -> str:
+        """Exchange username + password for a short-lived access JWT."""
         resp = await self._client.post(
-            url,
+            f"{self._base_url}/auth/login",
             json={"username": self._username, "password": self._password},
         )
         if resp.status_code != 200:
@@ -120,9 +156,6 @@ class KempowerClient:
             raise KempowerClientError(
                 "Kempower auth response missing 'accessToken'/'token' field"
             )
-        self._token = token
-        self._token_acquired_at = now
-        logger.debug("Kempower auth refreshed (token len=%d)", len(token))
         return token
 
     # ------------------------------------------------------------------
