@@ -78,6 +78,29 @@ async def test_depots_entsoe_zone_resolution(sql_real_static_pool):
                 == "10YLT-1001A0008Q"
             )
 
+            # Padded override is trimmed (mirrors resolve_bidding_zone's .strip()),
+            # so the exact-match join against prices_hourly.bidding_zone still works.
+            assert (
+                await _entsoe_zone_for(
+                    conn,
+                    name="Padded override depot",
+                    timezone="Europe/Vilnius",
+                    tariff_config={"entsoe_zone": "  10Y1001A1001A82H  "},
+                )
+                == "10Y1001A1001A82H"
+            )
+
+            # Whitespace-only override is treated as unset, then falls back to timezone.
+            assert (
+                await _entsoe_zone_for(
+                    conn,
+                    name="Whitespace override depot",
+                    timezone="Europe/Vilnius",
+                    tariff_config={"entsoe_zone": "   "},
+                )
+                == "10YLT-1001A0008Q"
+            )
+
             # Unmapped (non-European) timezone, no override → NULL (not a fabricated zone).
             assert (
                 await _entsoe_zone_for(

@@ -46,7 +46,20 @@ AS $$
            s.latitude,
            s.longitude,
            COALESCE(
-               NULLIF((s.tariff_config ->> 'entsoe_zone')::text, ''),
+               -- Mirror src/db/queries.py:resolve_bidding_zone: only a non-blank
+               -- STRING override counts (it returns explicit.strip()); a number/
+               -- bool, an empty string, or whitespace-only falls through to the
+               -- timezone-derived zone below.
+               NULLIF(
+                   regexp_replace(
+                       CASE
+                           WHEN jsonb_typeof(s.tariff_config -> 'entsoe_zone') = 'string'
+                           THEN s.tariff_config ->> 'entsoe_zone'
+                       END,
+                       '^\s+|\s+$', '', 'g'
+                   ),
+                   ''
+               ),
                (
                    SELECT z.zone
                    FROM (VALUES

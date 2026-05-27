@@ -164,10 +164,12 @@ jobs:
         run: |
           pytest tests/e2e/test_agent_search.py -m acceptance --tb=short
 
-      - name: Run agent-SQL real-DB integration (skips without ANTHROPIC_API_KEY)
-        # The S3 real-Anthropic integration test. With the secret set it runs
-        # against the same pair plus a live Anthropic call; without it the
-        # autouse fixture skips all three so PRs stay green and burn no tokens.
+      - name: Run agent-SQL real-DB integration (live-LLM test skips without ANTHROPIC_API_KEY)
+        # The S3 real-Anthropic test (test_sql_mode_real_db.py) runs against the
+        # pair plus a live Anthropic call when the secret is set; its autouse
+        # fixture skips it when the key is unset so PRs stay green and burn no
+        # tokens. The LLM-free real-DB tests in this dir (e.g.
+        # test_depots_entsoe_zone_real_db.py) run regardless, against the pair.
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
