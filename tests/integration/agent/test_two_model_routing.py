@@ -73,10 +73,15 @@ async def test_pilot_org_routes_explore_to_haiku(seeded_db, fake_llm_client) -> 
 
 @pytest.mark.asyncio
 async def test_default_org_keeps_single_model(seeded_db, fake_llm_client) -> None:
-    """Flag at its default (false) → explore stays on CONFIG.model; the gate gates."""
-    from src.api.agent.llm import CONFIG
+    """Flag at its default (false) → BOTH phases stay on the configured default.
 
+    Proves the gate gates *and* that the off path never silently forces Sonnet
+    for the format phase (the Codex P2 regression).
+    """
+    from src.api.agent.llm_router import configured_default_model
+
+    default_model = configured_default_model()
     route = await _route_for_turn(seeded_db, fake_llm_client, org_key="org_b", user_key="user_b")
     assert route["two_model_enabled"] is False
-    assert route["explore_model"] == CONFIG.model
-    assert route["format_model"] == "claude-sonnet-4-6"
+    assert route["explore_model"] == default_model
+    assert route["format_model"] == default_model

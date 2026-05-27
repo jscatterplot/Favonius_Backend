@@ -389,6 +389,14 @@ _MODEL_PRICES_USD_PER_MTOK: dict[str, tuple[float, float]] = {
     "claude-haiku-4-5": (1.0, 5.0),
 }
 
+# Pin the single-model baseline the split is compared against, independent of
+# the ambient ``AGENT_LLM_MODEL`` (``CONFIG.model``). Inheriting it would make
+# this every-push gate environment-dependent: under ``AGENT_LLM_MODEL=claude-haiku-4-5``
+# the single_model variant already uses Haiku for explore (reduction → 0%), and
+# a known-good-but-unpriced default like ``claude-opus-4-7`` would KeyError. The
+# split's value is defined as the saving against the Sonnet baseline.
+_BASELINE_MODEL = "claude-sonnet-4-6"
+
 # Conservative per-call output + format-payload sizes. Outputs are tiny next to
 # the ~2.6k-token extraction prompt, so the result is insensitive to them; the
 # format payload is sized generously so the saving is not overstated.
@@ -418,17 +426,16 @@ def _variant_total_cost_usd(*, two_model_enabled: bool) -> tuple[float, str, str
     router (:func:`pick_model`) so the test tracks the real routing logic.
     """
     from src.api.agent.llm import (
-        CONFIG,
         EXTRACT_PLAN_SYSTEM_PROMPT,
         FORMAT_ANSWER_SYSTEM_PROMPT,
     )
     from src.api.agent.llm_router import pick_model
 
     explore_model = pick_model(
-        "explore", two_model_enabled=two_model_enabled, default_model=CONFIG.model
+        "explore", two_model_enabled=two_model_enabled, default_model=_BASELINE_MODEL
     )
     format_model = pick_model(
-        "format", two_model_enabled=two_model_enabled, default_model=CONFIG.model
+        "format", two_model_enabled=two_model_enabled, default_model=_BASELINE_MODEL
     )
 
     extract_sys_tokens = _est_tokens(EXTRACT_PLAN_SYSTEM_PROMPT)

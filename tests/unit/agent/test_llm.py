@@ -458,15 +458,14 @@ class TestFormatAnswer:
     ):
         # Haiku 4.5 supports neither adaptive thinking nor effort; sending
         # either is a 400, so the format step must fall back to temperature
-        # and omit thinking/output_config. The two-model router pins the
-        # format phase to Sonnet regardless of CONFIG.model, so a non-thinking
-        # model now reaches format_answer only via the explicit per-call
-        # override (which still wins over the router).
+        # and omit thinking/output_config. With the two-model split off (the
+        # default), the format phase honors CONFIG.model, so patching it to a
+        # non-thinking model exercises the fallback.
         _replace_config(monkeypatch, model="claude-haiku-4-5")
         patch_anthropic_client.return_value = _make_response([_make_text_block("ok")])
 
         plan = QueryPlan.model_validate(VALID_PLAN_INPUT)
-        await format_answer(plan, [], {}, [], model="claude-haiku-4-5")
+        await format_answer(plan, [], {}, [])
 
         kwargs = patch_anthropic_client.call_args.kwargs
         assert kwargs["temperature"] == llm_module.FORMAT_STEP_TEMPERATURE

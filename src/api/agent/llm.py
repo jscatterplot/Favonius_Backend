@@ -34,7 +34,7 @@ from typing import Any, Optional
 import anthropic
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from src.api.agent.llm_router import pick_model
+from src.api.agent.llm_router import DEFAULT_MODEL, pick_model
 from src.api.agent.plan import QueryPlan
 from src.api.agent.thinking import VALID_EFFORT_LEVELS, generation_kwargs
 from src.monitoring.metrics import AGENT_LLM_TOKENS
@@ -76,7 +76,7 @@ class LLMConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    model: str = Field(default="claude-sonnet-4-6")
+    model: str = Field(default=DEFAULT_MODEL)
     extract_max_tokens: int = Field(default=400)
     # Bumped from 800 to leave headroom for adaptive-thinking tokens on
     # the format step — thinking and the answer share this ceiling.
@@ -113,7 +113,7 @@ class LLMConfig(BaseModel):
     def from_env(cls) -> "LLMConfig":
         """Build the config from environment variables."""
         return cls(
-            model=os.environ.get("AGENT_LLM_MODEL", "claude-sonnet-4-6"),
+            model=os.environ.get("AGENT_LLM_MODEL", DEFAULT_MODEL),
             extract_max_tokens=int(os.environ.get("AGENT_LLM_EXTRACT_MAX_TOKENS", "400")),
             format_max_tokens=int(os.environ.get("AGENT_LLM_FORMAT_MAX_TOKENS", "2048")),
             temperature=float(os.environ.get("AGENT_LLM_TEMPERATURE", "0.0")),
@@ -661,11 +661,11 @@ async def format_answer(
             Lets the formatter distinguish "no sessions" from "no energy
             recorded" from a real total without re-deriving it from rows.
         model: Optional per-call model override.
-        two_model_enabled: Plumbed through for symmetry with
-            :func:`extract_plan`. The format phase routes to
-            ``claude-sonnet-4-6`` regardless (the user-facing reply never
-            downgrades), so this only matters when ``model`` is unset and
-            documents intent at the call site.
+        two_model_enabled: When True (resolved per-org upstream), the format
+            phase routes to ``claude-sonnet-4-6`` (the user-facing reply never
+            uses the cheap explore model); when False it uses ``CONFIG.model``
+            (current single-model behavior). Ignored when ``model`` is passed —
+            the explicit override always wins.
 
     Returns:
         A natural-language reply string.

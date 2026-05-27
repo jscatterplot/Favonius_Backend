@@ -3,9 +3,10 @@
 Covers:
   * ``pick_model`` — phase → model, gated by ``two_model_enabled``.
   * ``resolve_org_two_model_enabled`` — per-org column precedence + fail-safe.
-  * the two ``llm.py`` call sites — that ``extract_plan`` routes the "explore"
-    call to Haiku when enabled (and to ``CONFIG.model`` when not), and that
-    ``format_answer`` always routes the "format" call to Sonnet.
+  * the two ``llm.py`` call sites — when enabled, ``extract_plan`` routes the
+    "explore" call to Haiku and ``format_answer`` routes the "format" call to
+    Sonnet; when disabled, both keep ``CONFIG.model``.
+  * ``configured_default_model`` — the llm-free single-model default.
 """
 
 from __future__ import annotations
@@ -16,8 +17,10 @@ from uuid import UUID
 import pytest
 
 from src.api.agent.llm_router import (
+    DEFAULT_MODEL,
     EXPLORE_MODEL,
     FORMAT_MODEL,
+    configured_default_model,
     pick_model,
     resolve_org_two_model_enabled,
 )
@@ -48,19 +51,37 @@ def test_pick_model_explore_disabled_uses_default() -> None:
     )
 
 
-def test_pick_model_format_always_sonnet() -> None:
-    # Format never downgrades, regardless of flag or default.
-    for enabled in (True, False):
+def test_pick_model_format_on_uses_sonnet() -> None:
+    # Split ON: format uses the quality model, never the cheap explore model.
+    assert (
+        pick_model("format", two_model_enabled=True, default_model="claude-haiku-4-5")
+        == FORMAT_MODEL
+        == "claude-sonnet-4-6"
+    )
+
+
+def test_pick_model_off_uses_default_for_both_phases() -> None:
+    # Split OFF: BOTH phases keep the configured single-model behavior — even a
+    # non-Sonnet default. The off path must not silently force Sonnet (the P2
+    # regression Codex flagged on the format branch).
+    for phase in ("explore", "format"):
         assert (
-            pick_model("format", two_model_enabled=enabled, default_model="claude-haiku-4-5")
-            == FORMAT_MODEL
-            == "claude-sonnet-4-6"
+            pick_model(phase, two_model_enabled=False, default_model="claude-opus-4-7")
+            == "claude-opus-4-7"
         )
 
 
 def test_pick_model_unknown_phase_raises() -> None:
     with pytest.raises(ValueError):
         pick_model("planning", two_model_enabled=True, default_model="x")  # type: ignore[arg-type]
+
+
+def test_configured_default_model_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # llm-free read of AGENT_LLM_MODEL; falls back to DEFAULT_MODEL.
+    monkeypatch.delenv("AGENT_LLM_MODEL", raising=False)
+    assert configured_default_model() == DEFAULT_MODEL == "claude-sonnet-4-6"
+    monkeypatch.setenv("AGENT_LLM_MODEL", "claude-opus-4-7")
+    assert configured_default_model() == "claude-opus-4-7"
 
 
 # ── resolve_org_two_model_enabled (precedence + fail-safe) ─────────────────────
@@ -233,15 +254,8 @@ async def test_extract_plan_explicit_override_wins(monkeypatch: pytest.MonkeyPat
     assert client.messages.calls[0]["model"] == "claude-opus-4-7"
 
 
-@pytest.mark.asyncio
-async def test_format_answer_always_routes_to_sonnet(monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.api.agent import llm
+def _format_plan_and_window() -> tuple[Any, dict[str, Any]]:
     from src.api.agent.plan import EntityMention, QueryPlan, TimeWindow
-
-    client = _CapturingClient(
-        _Response([_TextBlock("Here is your answer.")], stop_reason="end_turn")
-    )
-    monkeypatch.setattr(llm, "_get_client", lambda: client)
 
     plan = QueryPlan(
         intent="consumption_by_user",
@@ -249,8 +263,34 @@ async def test_format_answer_always_routes_to_sonnet(monkeypatch: pytest.MonkeyP
         time_window=TimeWindow(kind="relative", relative="last_month"),
     )
     window = {"start": "2026-04-01T00:00:00Z", "end": "2026-05-01T00:00:00Z", "tz": "UTC"}
+    return plan, window
 
-    for enabled in (True, False):
-        client.messages.calls.clear()
-        await llm.format_answer(plan, [], window, [], two_model_enabled=enabled)
-        assert client.messages.calls[0]["model"] == "claude-sonnet-4-6"
+
+@pytest.mark.asyncio
+async def test_format_answer_routes_to_sonnet_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.api.agent import llm
+
+    client = _CapturingClient(
+        _Response([_TextBlock("Here is your answer.")], stop_reason="end_turn")
+    )
+    monkeypatch.setattr(llm, "_get_client", lambda: client)
+    plan, window = _format_plan_and_window()
+
+    await llm.format_answer(plan, [], window, [], two_model_enabled=True)
+    # Split ON: the user-facing reply never uses the cheap explore model.
+    assert client.messages.calls[0]["model"] == "claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+async def test_format_answer_uses_default_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.api.agent import llm
+
+    client = _CapturingClient(
+        _Response([_TextBlock("Here is your answer.")], stop_reason="end_turn")
+    )
+    monkeypatch.setattr(llm, "_get_client", lambda: client)
+    plan, window = _format_plan_and_window()
+
+    await llm.format_answer(plan, [], window, [], two_model_enabled=False)
+    # Split OFF: format keeps the configured single-model behavior (CONFIG.model).
+    assert client.messages.calls[0]["model"] == llm.CONFIG.model

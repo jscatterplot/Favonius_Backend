@@ -54,7 +54,11 @@ from src.api.agent.intents.consumption_by_user import (
     compile_consumption_by_user,
     summarize_consumption_rows,
 )
-from src.api.agent.llm_router import pick_model, resolve_org_two_model_enabled
+from src.api.agent.llm_router import (
+    configured_default_model,
+    pick_model,
+    resolve_org_two_model_enabled,
+)
 from src.api.agent.plan import QueryPlan
 from src.api.agent.planner import classify as planner_classify
 from src.api.agent.planner import fetch_org_sql_enabled, is_sql_mode_enabled
@@ -519,14 +523,16 @@ async def run_turn(
         # spike). Fail-safe to off. We record the routing so the choice is
         # auditable in agent_runs.steps_json (the spike's verification anchor);
         # llm.py applies the same pick_model() at its own two call sites.
-        from src.api.agent import llm as _llm  # local import: keep controller import llm-free
-
+        # configured_default_model() reads AGENT_LLM_MODEL llm-free, so a turn
+        # with an injected fake/custom llm_client never imports the
+        # Anthropic-backed llm module on this path.
         two_model_enabled = await resolve_org_two_model_enabled(static_pool, auth.organization_id)
+        default_model = configured_default_model()
         explore_model = pick_model(
-            "explore", two_model_enabled=two_model_enabled, default_model=_llm.CONFIG.model
+            "explore", two_model_enabled=two_model_enabled, default_model=default_model
         )
         format_model = pick_model(
-            "format", two_model_enabled=two_model_enabled, default_model=_llm.CONFIG.model
+            "format", two_model_enabled=two_model_enabled, default_model=default_model
         )
         await agent_runs_step(
             ts_pool,
