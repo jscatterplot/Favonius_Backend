@@ -133,10 +133,10 @@ Each session ≤ ~2 hours. Numbered S0 onward. #216 has merged — S0 can start.
 ### S4 — Per-org monthly token-budget ceiling
 - **Goal**: prevent a runaway org from burning the Anthropic bill.
 - **Files touched**:
-  - `migrations/043_agent_token_budget.sql` — small table `agent_token_usage(organization_id uuid, period_yyyymm text, input_tokens bigint, output_tokens bigint, last_updated timestamptz, PRIMARY KEY(organization_id, period_yyyymm))`. Append-style upsert.
+  - `migrations/046_agent_token_budget.sql` — small table `agent_token_usage(organization_id uuid, period_yyyymm text, input_tokens bigint, output_tokens bigint, last_updated timestamptz, PRIMARY KEY(organization_id, period_yyyymm))`. Append-style upsert. _(Shipped as 046, not the planned 043 — parallel PRs took the lower numbers.)_
   - `src/api/agent/budget.py` — `check_and_reserve(org, est_tokens) -> Reservation`, `record_actual(reservation, actual_tokens)`. In-process counter with periodic flush; on cold-start, hydrate from the table.
   - `src/api/agent/controller.py` — call `check_and_reserve` before `run_qa_turn`, `record_actual` after.
-  - Env: `AGENT_SQL_TOKEN_BUDGET_PER_ORG_MONTHLY` (default e.g. `10_000_000`). Per-org override stored in `organizations.metadata->>'agent_token_budget_monthly'` if present.
+  - Budget config (**as shipped — no env var**): the platform default is the hard-coded constant `DEFAULT_TOKEN_BUDGET_MONTHLY = 10_000_000` (`src/api/agent/budget.py`); the per-org override is the first-class `organizations.agent_token_budget_monthly` column (`migrations/supabase/045_organizations_agent_token_budget.sql`), read fail-open via `to_jsonb(o)->>'agent_token_budget_monthly'`. The originally-planned `AGENT_SQL_TOKEN_BUDGET_PER_ORG_MONTHLY` env var was intentionally dropped — the budget is a per-company commercial attribute, so it lives in the DB (a dedicated column, not a `metadata` JSONB key), not an env knob.
   - `tests/unit/agent/test_budget.py` — accept/reject/edge cases.
 - **Deliverable**: a synthetic test that fakes a high-token response exceeds the ceiling and the next turn returns a friendly refusal (`{"status": "refused", "reason": "monthly_budget_exceeded"}`) via `emit_final_answer`.
 - **Done when**: the refusal path is observable in `agent_runs.status` and the Prometheus metric `favonius_agent_sql_budget_refused_total` increments.
@@ -248,7 +248,7 @@ After all sessions complete:
 2. **Golden gate** — `pytest -m agent_sql_golden` (≥19/20).
 3. **AT-18 e2e** — `pytest tests/e2e/test_agent_search.py -m acceptance`.
 4. **Cross-org isolation** — manual: mint a JWT for org A and one for org B, ask the same depot-scoped question, confirm B sees `not_found` or empty.
-5. **Budget refusal** — set `AGENT_SQL_TOKEN_BUDGET_PER_ORG_MONTHLY=1000`, run any non-trivial question, expect a refusal.
+5. **Budget refusal** — set `organizations.agent_token_budget_monthly = 1000` for the test org (see `tests/integration/agent_sql/test_budget_refusal_real_db.py`), run any non-trivial question, expect a refusal.
 6. **CI** — extended `workflow-golden.yml` gates the new harness; `make lint` clean.
 
 ---
@@ -256,7 +256,7 @@ After all sessions complete:
 ## Open questions
 
 1. **Trigger-log granularity** — decided: skip the `agent_views.trigger_log` view. If Q16 fails on `optimization_runs.trigger_reason`, that's an eval signal, not a missing-view signal.
-2. **Per-org budget storage** — env var only, or per-org override in `organizations.metadata`? Recommendation: support both (env = default, JSONB override per org).
+2. **Per-org budget storage** — **resolved (as built)**: no env var. The platform default is the hard-coded constant `DEFAULT_TOKEN_BUDGET_MONTHLY = 10_000_000` and the per-org override is a dedicated first-class `organizations.agent_token_budget_monthly` column (`migrations/supabase/045`), not an `organizations.metadata` JSONB key.
 3. **Two-model split priority** — Haiku-then-Sonnet (S5) is a cost optimisation, not a correctness one. If the golden suite already runs comfortably under budget on Sonnet-only, S5 can defer. Recommendation: gate S5 on observed token-cost telemetry from a one-week shadow run.
 4. **PR #216 review feedback** — if `#216` lands with material design changes (e.g. the planner gets replaced with a Haiku classifier), some of this plan needs to rebase. Recommendation: re-read this plan against the merged commit before starting S1.
 5. **Schedule-adherence coverage** — you excluded it from v1. The catalogue can still expose `agent_views.schedules_recent`; the gap is only the eval suite. Confirm we leave that gap open for v2.
