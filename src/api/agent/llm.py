@@ -34,6 +34,7 @@ from typing import Any, Optional
 import anthropic
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from src.api.agent.llm_router import pick_model
 from src.api.agent.plan import QueryPlan
 from src.api.agent.thinking import VALID_EFFORT_LEVELS, generation_kwargs
 from src.monitoring.metrics import AGENT_LLM_TOKENS
@@ -490,14 +491,21 @@ def _extract_tool_input(message: Any) -> Optional[dict[str, Any]]:
     return None
 
 
-async def extract_plan(message: str, *, model: Optional[str] = None) -> QueryPlan:
+async def extract_plan(
+    message: str, *, model: Optional[str] = None, two_model_enabled: bool = False
+) -> QueryPlan:
     """Extract a :class:`QueryPlan` from a natural-language message.
 
     Args:
         message: The user's raw message text.
         model: Optional per-call model override. Used by the
             side-by-side eval script and tests; production code leaves
-            it unset and inherits ``CONFIG.model``.
+            it unset and inherits the routed model.
+        two_model_enabled: When True (resolved per-org upstream), this
+            "explore" call routes to ``claude-haiku-4-5`` via
+            :func:`src.api.agent.llm_router.pick_model`; otherwise it uses
+            ``CONFIG.model`` (current behavior). Ignored when ``model`` is
+            passed — the explicit override always wins.
 
     Returns:
         A validated :class:`QueryPlan`.
@@ -507,7 +515,9 @@ async def extract_plan(message: str, *, model: Optional[str] = None) -> QueryPla
             in a row. The caller is responsible for surfacing a generic
             failure to the user.
     """
-    chosen_model = model or CONFIG.model
+    chosen_model = model or pick_model(
+        "explore", two_model_enabled=two_model_enabled, default_model=CONFIG.model
+    )
     client = _get_client()
 
     system: list[dict[str, Any]] = [
@@ -630,6 +640,7 @@ async def format_answer(
     *,
     result_summary: Optional[dict[str, Any]] = None,
     model: Optional[str] = None,
+    two_model_enabled: bool = False,
 ) -> str:
     """Format a SQL result set into a natural-language reply.
 
@@ -650,11 +661,18 @@ async def format_answer(
             Lets the formatter distinguish "no sessions" from "no energy
             recorded" from a real total without re-deriving it from rows.
         model: Optional per-call model override.
+        two_model_enabled: Plumbed through for symmetry with
+            :func:`extract_plan`. The format phase routes to
+            ``claude-sonnet-4-6`` regardless (the user-facing reply never
+            downgrades), so this only matters when ``model`` is unset and
+            documents intent at the call site.
 
     Returns:
         A natural-language reply string.
     """
-    chosen_model = model or CONFIG.model
+    chosen_model = model or pick_model(
+        "format", two_model_enabled=two_model_enabled, default_model=CONFIG.model
+    )
     client = _get_client()
 
     capped_rows = rows[:_FORMAT_ROW_CAP]
