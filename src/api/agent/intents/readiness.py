@@ -38,6 +38,7 @@ from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from src.api.agent_workflows.plan_parsing import extract_vehicle_plan
+from src.api.timezone import safe_zone
 
 # PRD §8.1 hard constraint: vehicles must leave at ≥99% SoC. Used when a
 # schedule row leaves required_soc NULL.
@@ -354,16 +355,6 @@ def render_readiness_answer(verdict: ReadinessVerdict) -> str:
 _READINESS_DEFAULT_HOURS = 24
 
 
-def _safe_zone(tz_name: Optional[str]) -> ZoneInfo:
-    """IANA tz name → ``ZoneInfo``, degrading to UTC on missing/invalid input."""
-    if tz_name:
-        try:
-            return ZoneInfo(tz_name)
-        except Exception:  # noqa: BLE001 - any bad zone name → UTC
-            return ZoneInfo("UTC")
-    return ZoneInfo("UTC")
-
-
 def resolve_readiness_window(
     message: str,
     now: datetime,
@@ -381,7 +372,7 @@ def resolve_readiness_window(
     anchors the calendar-day boundaries; ``None`` degrades to UTC.
     """
     text = (message or "").lower()
-    tz = _safe_zone(tz_name)
+    tz = safe_zone(tz_name)
     local_now = now.astimezone(tz)
 
     if re.search(r"\btomorrow\b", text):

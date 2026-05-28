@@ -32,6 +32,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from ..db import queries as db_queries
+from .timezone import safe_zone
 
 logger = logging.getLogger(__name__)
 
@@ -57,21 +58,6 @@ class SavingsSummary:
     baseline_known: bool = True
 
 
-def _safe_zone(tz_name: Optional[str]) -> ZoneInfo:
-    """Resolve an IANA tz name to ``ZoneInfo``, falling back to UTC.
-
-    A missing or invalid depot timezone degrades to UTC rather than
-    raising — a small wall-clock skew on a savings window is preferable
-    to a 500.
-    """
-    if tz_name:
-        try:
-            return ZoneInfo(tz_name)
-        except Exception:  # pragma: no cover - belt-and-braces
-            return ZoneInfo("UTC")
-    return ZoneInfo("UTC")
-
-
 def _month_start_local_as_utc(now_utc: datetime, tz_name: Optional[str]) -> datetime:
     """First instant of the current calendar month in depot tz, returned as UTC.
 
@@ -79,7 +65,7 @@ def _month_start_local_as_utc(now_utc: datetime, tz_name: Optional[str]) -> date
     to a 500 here; the small month-boundary skew is acceptable for the
     "savings month-to-date" summary.
     """
-    tz = _safe_zone(tz_name)
+    tz = safe_zone(tz_name)
     local_now = now_utc.astimezone(tz)
     month_start_local = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     return month_start_local.astimezone(timezone.utc)
@@ -115,7 +101,7 @@ def overnight_window_utc(now_utc: datetime, tz_name: Optional[str]) -> tuple[dat
         ``(start_utc, end_utc)`` — both timezone-aware UTC datetimes,
         ``start_utc < end_utc``.
     """
-    tz = _safe_zone(tz_name)
+    tz = safe_zone(tz_name)
     local_now = now_utc.astimezone(tz)
     end_local = local_now.replace(hour=OVERNIGHT_END_HOUR, minute=0, second=0, microsecond=0)
     start_local = (end_local - timedelta(days=1)).replace(

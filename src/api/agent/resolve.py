@@ -28,6 +28,8 @@ from typing import Any, Awaitable, Callable, Optional
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+from src.api.timezone import safe_zone
+
 from src.api.agent.auth_context import AuthContext, ResolvedEntity, ResolvedTimeWindow
 from src.api.agent.plan import EntityMention, TimeWindow
 
@@ -465,10 +467,7 @@ def resolve_relative_bounds(
     Returns:
         ``(start_utc, end_utc)`` — timezone-aware UTC datetimes.
     """
-    try:
-        tz = ZoneInfo(tz_name) if tz_name else ZoneInfo("UTC")
-    except Exception:  # noqa: BLE001 - any bad zone name → UTC fallback
-        tz = ZoneInfo("UTC")
+    tz = safe_zone(tz_name)
     start_local, end_local = _resolve_relative(relative, tz, now=now)
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
