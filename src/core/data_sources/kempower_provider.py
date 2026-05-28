@@ -58,6 +58,26 @@ def _parse_backfill_since(value: Optional[str]) -> Optional[datetime]:
     return max(dt, floor)
 
 
+def _config_value(
+    config: dict[str, Any], credentials: dict[str, Any], *keys: str
+) -> Optional[Any]:
+    """Read a connect-form value, tolerating camelCase or snake_case keys.
+
+    The nested ``config`` / ``credentials`` blobs are opaque pass-throughs, so an
+    upstream BFF/proxy that case-converts request bodies (e.g. a decamelize layer
+    that snake_cases the whole payload) can deliver ``location_id`` where the
+    catalogue advertises ``locationId``. Accept either form — preferring
+    ``config`` over ``credentials`` and the key order given — so the resolver is
+    agnostic to transport casing. Empty strings are treated as absent.
+    """
+    for source in (config, credentials):
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
 class KempowerProvider(DataSourceProvider):
     """Imports chargers, vehicles, access matrix, and sessions from ChargEye."""
 
@@ -133,7 +153,7 @@ class KempowerProvider(DataSourceProvider):
             refresh_token=credentials.get("refresh_token"),
             username=credentials.get("username"),
             password=credentials.get("password"),
-            base_url=(config.get("baseUrl") or credentials.get("baseUrl"))
+            base_url=_config_value(config, credentials, "baseUrl", "base_url")
             or os.getenv("KEMPOWER_API_BASE_URL"),
         )
 
@@ -141,7 +161,7 @@ class KempowerProvider(DataSourceProvider):
         self, credentials: dict[str, Any], config: dict[str, Any]
     ) -> None:
         """Cheap authenticated probe: fetch the configured location."""
-        location_id = config.get("locationId") or credentials.get("locationId")
+        location_id = _config_value(config, credentials, "locationId", "location_id")
         if not location_id:
             raise CredentialValidationError("locationId is required")
         has_refresh_token = bool(credentials.get("refresh_token"))
@@ -154,7 +174,7 @@ class KempowerProvider(DataSourceProvider):
             raise CredentialValidationError(
                 "Provide either a refresh token or both username and password."
             )
-        raw_backfill = config.get("backfillSince") or credentials.get("backfillSince")
+        raw_backfill = _config_value(config, credentials, "backfillSince", "backfill_since")
         if raw_backfill:
             try:
                 _parse_backfill_since(raw_backfill)
@@ -172,14 +192,14 @@ class KempowerProvider(DataSourceProvider):
 
     async def run_ingestion(self, ctx: IngestionContext) -> IngestionResult:
         """Drive the shared onboarding stages, reporting progress per stage."""
-        location_id = ctx.config.get("locationId") or ctx.credentials.get("locationId")
+        location_id = _config_value(ctx.config, ctx.credentials, "locationId", "location_id")
         if not location_id:
             return IngestionResult(
                 status="failed",
                 error_detail="locationId missing from connection config/credentials",
             )
         backfill_since = _parse_backfill_since(
-            ctx.config.get("backfillSince") or ctx.credentials.get("backfillSince")
+            _config_value(ctx.config, ctx.credentials, "backfillSince", "backfill_since")
         )
         counts = OnboardingCounts()
         error_detail: Optional[str] = None
