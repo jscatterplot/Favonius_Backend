@@ -216,3 +216,68 @@ async def test_run_ingestion_missing_location_fails():
     ctx = _ctx({})
     result = await provider.run_ingestion(ctx)
     assert result.status == "failed"
+
+
+# ── snake_case key tolerance ───────────────────────────────────────────────
+# A BFF/proxy that decamelizes request bodies delivers the nested config keys
+# as snake_case (location_id / backfill_since / base_url) even though the
+# catalogue advertises camelCase. The resolver must accept either form.
+
+
+async def test_validate_credentials_accepts_snake_case_location(monkeypatch):
+    client = MagicMock()
+    client.get_location = AsyncMock(return_value={"id": "loc1"})
+    provider = kp.KempowerProvider()
+    monkeypatch.setattr(provider, "_build_client", lambda c, cfg: _FakeClientCM(client))
+
+    await provider.validate_credentials({"refresh_token": "tok"}, {"location_id": "loc1"})
+    client.get_location.assert_awaited_once_with("loc1")
+
+
+async def test_validate_credentials_accepts_snake_case_backfill(monkeypatch):
+    client = MagicMock()
+    client.get_location = AsyncMock(return_value={"id": "loc1"})
+    provider = kp.KempowerProvider()
+    monkeypatch.setattr(provider, "_build_client", lambda c, cfg: _FakeClientCM(client))
+
+    # snake_case backfill_since must parse (not raise) just like backfillSince.
+    await provider.validate_credentials(
+        {"refresh_token": "tok"},
+        {"location_id": "loc1", "backfill_since": "2025-01-01"},
+    )
+    client.get_location.assert_awaited_once_with("loc1")
+
+
+async def test_run_ingestion_accepts_snake_case_location(monkeypatch):
+    provider = kp.KempowerProvider()
+    monkeypatch.setattr(provider, "_build_client", lambda c, cfg: _FakeClientCM(MagicMock()))
+
+    captured: dict[str, Any] = {}
+
+    async def fake_chargers(pool, client, *, depot_id, kempower_location_id, dry_run, counts):
+        captured["location_id"] = kempower_location_id
+        return {}
+
+    async def noop_vehicles(pool, client, **kw):
+        return {}
+
+    async def noop_access(pool, **kw):
+        return None
+
+    monkeypatch.setattr(kp, "import_chargers", fake_chargers)
+    monkeypatch.setattr(kp, "import_vehicles", noop_vehicles)
+    monkeypatch.setattr(kp, "upsert_access_matrix", noop_access)
+
+    ctx = _ctx({"location_id": "loc-snake"})
+    result = await provider.run_ingestion(ctx)
+
+    assert result.status == "succeeded"
+    assert captured["location_id"] == "loc-snake"
+
+
+def test_config_value_prefers_config_and_camelcase():
+    # config wins over credentials; first matching key in the given order wins.
+    assert kp._config_value({"locationId": "a"}, {"location_id": "b"}, "locationId", "location_id") == "a"
+    assert kp._config_value({}, {"location_id": "b"}, "locationId", "location_id") == "b"
+    assert kp._config_value({"locationId": ""}, {"location_id": "b"}, "locationId", "location_id") == "b"
+    assert kp._config_value({}, {}, "locationId", "location_id") is None
