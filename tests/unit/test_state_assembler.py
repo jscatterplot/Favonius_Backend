@@ -4,7 +4,7 @@ Reference: PRD.md#11-2-unit-test-requirements
 Coverage target: ≥ 80%
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -560,6 +560,29 @@ class TestComputeAvailability:
         # Unknown vehicle should be ignored
         assert "unknown_bus" not in availability
 
+    def test_compute_availability_aware_schedule_naive_start(self, assembler):
+        """Regression: tz-aware schedule rows + naive start must not raise.
+
+        get_current_state passes naive ``datetime.utcnow()`` while schedule
+        rows come back tz-aware from Postgres timestamptz; the comparison
+        previously raised "can't compare offset-naive and offset-aware
+        datetimes" and 500'd /depots/{id}/state.
+        """
+        naive_start = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+        aware_base = naive_start.replace(tzinfo=timezone.utc)
+        schedules = [
+            {
+                "vehicle_id": "bus_1",
+                "departure_time": aware_base + timedelta(hours=6),
+                "return_time": aware_base + timedelta(hours=10),
+            }
+        ]
+
+        availability = assembler._compute_availability(schedules, naive_start, 96)
+
+        assert any(not availability["bus_1"][i] for i in range(24, 40))
+        assert availability["bus_2"][0] is True
+
 
 class TestRecentTelemetry:
     """Test snapshot recent telemetry helpers."""
@@ -632,6 +655,22 @@ class TestComputeDepartureTimes:
         assert len(departures) == 2
         assert departures["bus_1"] == 24  # 6 hours
         assert departures["bus_2"] == 32  # 8 hours
+
+    def test_compute_departure_times_aware_schedule_naive_start(self, assembler):
+        """Regression: tz-aware departure_time + naive start must not raise."""
+        naive_start = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+        aware_base = naive_start.replace(tzinfo=timezone.utc)
+        schedules = [
+            {
+                "vehicle_id": "bus_1",
+                "departure_time": aware_base + timedelta(hours=6),
+                "return_time": aware_base + timedelta(hours=10),
+            }
+        ]
+
+        departures = assembler._compute_departure_times(schedules, naive_start)
+
+        assert departures["bus_1"] == 24  # 6 hours * 4 timesteps/hour
 
     def test_compute_departure_times_earliest(self, assembler):
         """Test that earliest departure is kept for each vehicle."""
