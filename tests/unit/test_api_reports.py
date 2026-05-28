@@ -1978,15 +1978,13 @@ class TestDeliverReportToApprover:
     def test_monthly_consumption_sends_to_approver(self):
         import asyncio
 
-        pool = _single_conn_pool(_approved_report_row())
         email = FakeEmailClient()
-        with patch.object(_main, "db_pools", pool), patch.object(
-            _main, "report_email_client", email
-        ), patch.object(_main, "report_email_from", "noreply@favonius.io"):
+        with patch.object(_main, "report_email_client", email), patch.object(
+            _main, "report_email_from", "noreply@favonius.io"
+        ):
             out = asyncio.run(
                 _main._deliver_report_to_approver(
-                    depot_id="dep",
-                    report_id="rep-1",
+                    report_row=_approved_report_row(),
                     kind="monthly_consumption",
                     export_url="/depots/dep/reports/rep-1/export",
                     to_email="boss@depot.example",
@@ -2003,8 +2001,7 @@ class TestDeliverReportToApprover:
         with patch.object(_main, "report_email_client", FakeEmailClient()):
             out = asyncio.run(
                 _main._deliver_report_to_approver(
-                    depot_id="dep",
-                    report_id="rep-1",
+                    report_row=_approved_report_row(kind="incident"),
                     kind="incident",
                     export_url=None,
                     to_email="boss@depot.example",
@@ -2018,8 +2015,7 @@ class TestDeliverReportToApprover:
         with patch.object(_main, "report_email_client", FakeEmailClient()):
             out = asyncio.run(
                 _main._deliver_report_to_approver(
-                    depot_id="dep",
-                    report_id="rep-1",
+                    report_row=_approved_report_row(),
                     kind="monthly_consumption",
                     export_url="/x",
                     to_email=None,
@@ -2033,14 +2029,35 @@ class TestDeliverReportToApprover:
         with patch.object(_main, "report_email_client", None):
             out = asyncio.run(
                 _main._deliver_report_to_approver(
-                    depot_id="dep",
-                    report_id="rep-1",
+                    report_row=_approved_report_row(),
                     kind="monthly_consumption",
                     export_url="/x",
                     to_email="boss@depot.example",
                 )
             )
         assert out is None
+
+    def test_delivery_failure_is_caught_not_raised(self):
+        import asyncio
+
+        def _boom(_message, _n):
+            raise RuntimeError("provider exploded")
+
+        with (
+            patch.object(_main, "report_email_client", FakeEmailClient(script=_boom)),
+            patch.object(_main, "report_email_from", "noreply@favonius.io"),
+        ):
+            out = asyncio.run(
+                _main._deliver_report_to_approver(
+                    report_row=_approved_report_row(),
+                    kind="monthly_consumption",
+                    export_url="/depots/dep/reports/rep-1/export",
+                    to_email="boss@depot.example",
+                )
+            )
+        # Best-effort: the exception is swallowed and surfaced as a failed delivery.
+        assert out["status"] == "failed"
+        assert out["error"]
 
 
 class TestReportsApproveCommand:
@@ -2059,6 +2076,7 @@ class TestReportsApproveCommand:
                 "kind": "monthly_consumption",
                 "exportUrl": f"/depots/{depot_id}/reports/{report_id}/export",
                 "approvedAt": approved_at,
+                "reportRow": _approved_report_row(),
             },
         ), patch(
             "src.api.main._deliver_report_to_approver",

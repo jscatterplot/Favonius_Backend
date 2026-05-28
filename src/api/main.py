@@ -7922,13 +7922,17 @@ async def export_report(
             detail=f"No export data available for {row['kind']} reports",
         )
 
-    parsed_data = row["data"] if isinstance(row["data"], dict) else json.loads(row["data"])
+    parsed_data = _report_schedules._parse_report_data(row["data"])
     # Render through the same path the email delivery uses (one renderer for both).
     attachment = _report_schedules.render_attachment(fmt, row, parsed_data)
+    # Use the report id for a stable, per-report unique download filename
+    # (render_attachment's kind+period name is fine for email but collides
+    # across reports of the same kind+period as an HTTP download).
+    filename = f"report_{report_id}.{fmt}"
     return Response(
         content=attachment.content,
         media_type=attachment.content_type,
-        headers={"Content-Disposition": f'attachment; filename="{attachment.filename}"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -12474,12 +12478,14 @@ async def _mark_report_approved(
     """Flip a draft/pending report to approved within ``conn``'s transaction.
 
     Sets export_url for monthly_consumption reports that carry stored data.
-    Returns ``{"kind", "exportUrl", "approvedAt"}`` or None when the report is
-    absent or not in an approvable status.
+    Returns ``{"kind", "exportUrl", "approvedAt", "reportRow"}`` or None when the
+    report is absent or not in an approvable status. ``reportRow`` is the locked
+    row (all columns delivery needs), so the post-commit emailer can reuse it
+    instead of re-reading.
     """
     report_row = await conn.fetchrow(
         """
-        SELECT kind, data
+        SELECT id, depot_id, title, kind, group_by, period_start, period_end, data
         FROM reports
         WHERE id = $1::uuid AND depot_id = $2::uuid AND status IN ('draft', 'pending')
         FOR UPDATE
@@ -12510,6 +12516,7 @@ async def _mark_report_approved(
         "kind": report_row["kind"],
         "exportUrl": export_url,
         "approvedAt": updated["approved_at"],
+        "reportRow": report_row,
     }
 
 
@@ -12551,8 +12558,7 @@ async def _handle_reports_approve(
         )
 
     delivery = await _deliver_report_to_approver(
-        depot_id=depot_id,
-        report_id=report_id,
+        report_row=approved["reportRow"],
         kind=approved["kind"],
         export_url=approved["exportUrl"],
         to_email=(user or {}).get("email"),
@@ -12569,13 +12575,17 @@ async def _handle_reports_approve(
 
 async def _deliver_report_to_approver(
     *,
-    depot_id: str,
-    report_id: str,
+    report_row: "asyncpg.Record",
     kind: str,
     export_url: Optional[str],
     to_email: Optional[str],
 ) -> Optional[dict]:
     """Email the rendered monthly_consumption report to the approving user.
+
+    ``report_row`` is the row already read (and depot-scoped) by
+    ``_mark_report_approved`` — reused here so there is no second DB read.
+    Fully best-effort: any render/send/DB error is caught and surfaced as a
+    failed delivery so a committed approval is never turned into a 500.
 
     Returns a delivery dict ``{emailAddress, format, status, providerMessageId,
     error}`` or None when nothing was sent (non-consumption kind, no stored data,
@@ -12586,25 +12596,28 @@ async def _deliver_report_to_approver(
         or export_url is None
         or not to_email
         or report_email_client is None
+        or report_row is None
+        or report_row["data"] is None
     ):
         return None
 
-    async with db_pools.ts.acquire() as conn:
-        report_row = await conn.fetchrow(
-            "SELECT id, depot_id, title, kind, group_by, period_start, period_end, data "
-            "FROM reports WHERE id = $1::uuid",
-            report_id,
+    try:
+        status_, provider_message_id, error = await _report_schedules.deliver_report_to_email(
+            report_email_client,
+            report_row=report_row,
+            to_email=to_email,
+            fmt="pdf",
+            default_from=report_email_from,
         )
-    if report_row is None or report_row["data"] is None:
-        return None
-
-    status_, provider_message_id, error = await _report_schedules.deliver_report_to_email(
-        report_email_client,
-        report_row=report_row,
-        to_email=to_email,
-        fmt="pdf",
-        default_from=report_email_from,
-    )
+    except Exception as exc:  # noqa: BLE001 - best-effort: never 500 a committed approval
+        logger.warning("report approve delivery to %s failed: %s", to_email, exc)
+        return {
+            "emailAddress": to_email,
+            "format": "pdf",
+            "status": "failed",
+            "providerMessageId": None,
+            "error": str(exc),
+        }
     return {
         "emailAddress": to_email,
         "format": "pdf",

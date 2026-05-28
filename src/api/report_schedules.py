@@ -669,9 +669,18 @@ def render_attachment(fmt: str, report_row: "asyncpg.Record", parsed_data: Optio
 
 
 def _build_report_message(
-    report_row: "asyncpg.Record", *, to_email: str, attachment, default_from: str
+    report_row: "asyncpg.Record",
+    *,
+    to_email: str,
+    attachment,
+    default_from: str,
+    scheduled: bool = False,
 ):
-    """Build the EmailMessage that carries a rendered report to one recipient."""
+    """Build the EmailMessage that carries a rendered report to one recipient.
+
+    ``scheduled`` selects the lead-in copy: cron deliveries read "Your scheduled
+    report …"; ad-hoc (approve-triggered) deliveries read "Your report …".
+    """
     from ..notifications.email_client import EmailMessage  # lazy
 
     title = report_row["title"]
@@ -681,9 +690,10 @@ def _build_report_message(
             f"{report_row['period_start'].date().isoformat()} – "
             f"{report_row['period_end'].date().isoformat()}"
         )
-    body_text = f"Your report '{title}' is attached.\n\nPeriod: {period_label}\n"
+    lead = "Your scheduled report" if scheduled else "Your report"
+    body_text = f"{lead} '{title}' is attached.\n\nPeriod: {period_label}\n"
     body_html = (
-        f"<p>Your report <strong>{title}</strong> is attached.</p>"
+        f"<p>{lead} <strong>{title}</strong> is attached.</p>"
         f"<p>Period: {period_label}</p>"
     )
     return EmailMessage(
@@ -774,6 +784,7 @@ async def _deliver_to_recipients(
                 to_email=rec["email_address"],
                 attachment=attachment,
                 default_from=default_from,
+                scheduled=True,
             )
             result = await email_client.send(message)
             if result.ok:
