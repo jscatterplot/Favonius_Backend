@@ -460,6 +460,8 @@ def build_optimization_model(
 
     # Battery storage dynamics - initial condition
     def batt_init_rule(m):
+        if not has_battery:
+            return pyo.Constraint.Skip
         return m.SoC_batt[0] == state.battery_soc
 
     model.batt_init = pyo.Constraint(rule=batt_init_rule)
