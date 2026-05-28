@@ -220,6 +220,11 @@ class DepotController:
 
         try:
             await self.run_optimization(reason)
+        except _ReadinessBlockedError as e:
+            # Expected for depots that aren't fully onboarded yet (missing
+            # vehicles / schedules / charger-vehicle access). Not a failure:
+            # log at WARNING without a traceback so it doesn't read as an error.
+            logger.warning(f"Triggered optimization skipped (inputs not ready): {e}")
         except Exception as e:
             logger.error(f"Triggered optimization failed: {e}", exc_info=True)
 
@@ -876,6 +881,11 @@ class DepotController:
 
                 await asyncio.sleep(60)  # Check every minute
 
+            except _ReadinessBlockedError as e:
+                # Hourly solve vetoed because the depot isn't fully onboarded
+                # yet. Expected and non-transient: log quietly and keep looping.
+                logger.warning(f"Hourly optimization skipped (inputs not ready): {e}")
+                await asyncio.sleep(60)
             except Exception as e:
                 logger.error(f"Control loop error: {e}", exc_info=True)
                 await asyncio.sleep(60)

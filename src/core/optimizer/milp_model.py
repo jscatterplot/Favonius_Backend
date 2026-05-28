@@ -97,11 +97,16 @@ def _validate_inputs(state: DepotState, config: DepotConfig) -> None:
     if not (0 < config.charger_efficiency <= 1.0):
         raise InvalidConfigError("charger_efficiency must be in (0, 1]", "charger_efficiency")
 
-    if config.battery_capacity <= 0:
-        raise InvalidConfigError("battery_capacity must be positive", "battery_capacity")
+    # 0 is the documented "no battery" sentinel (DepotConfig.battery_capacity /
+    # battery_power in models.py); a depot with no stationary battery loads with
+    # both at 0. The model builder disables battery dispatch entirely in that
+    # case (see ``has_battery`` in build_optimization_model), so 0 is safe to
+    # accept here — only a negative value is a genuine misconfiguration.
+    if config.battery_capacity < 0:
+        raise InvalidConfigError("battery_capacity must not be negative", "battery_capacity")
 
-    if config.battery_power <= 0:
-        raise InvalidConfigError("battery_power must be positive", "battery_power")
+    if config.battery_power < 0:
+        raise InvalidConfigError("battery_power must not be negative", "battery_power")
 
 
 def _compute_tighter_soc_bounds(
@@ -196,8 +201,17 @@ def build_optimization_model(
     model.P_grid = pyo.Var(model.T, domain=pyo.NonNegativeReals)
     model.P_peak = pyo.Var(domain=pyo.NonNegativeReals)
 
+    # A depot with no stationary battery loads with battery_capacity and
+    # battery_power both 0 (the "no battery" sentinel). Disable battery dispatch
+    # entirely in that case: pin the power variables to 0 via their bounds and
+    # skip the SoC dynamics constraint below (it divides by battery_capacity).
+    # Requiring BOTH to be positive also fails safe for a degenerate config
+    # where only one of the two is set.
+    has_battery = config.battery_capacity > 0 and config.battery_power > 0
+    batt_power = config.battery_power if has_battery else 0.0
+
     # Battery storage variables
-    model.P_batt = pyo.Var(model.T, bounds=(-config.battery_power, config.battery_power))
+    model.P_batt = pyo.Var(model.T, bounds=(-batt_power, batt_power))
     model.SoC_batt = pyo.Var(model.T, bounds=(0.2, 0.8))
 
     # Apply tighter SoC bounds
@@ -368,10 +382,10 @@ def build_optimization_model(
     # Split battery power into charge and discharge components for efficiency handling
     eta_batt = config.battery_efficiency  # Round-trip efficiency (default 0.92)
     model.P_batt_discharge = pyo.Var(
-        model.T, domain=pyo.NonNegativeReals, bounds=(0, config.battery_power)
+        model.T, domain=pyo.NonNegativeReals, bounds=(0, batt_power)
     )
     model.P_batt_charge = pyo.Var(
-        model.T, domain=pyo.NonNegativeReals, bounds=(0, config.battery_power)
+        model.T, domain=pyo.NonNegativeReals, bounds=(0, batt_power)
     )
 
     # Link P_batt to charge/discharge: P_batt = P_discharge - P_charge
@@ -454,6 +468,11 @@ def build_optimization_model(
     # P_batt > 0 = discharge (reduces SoC), P_batt < 0 = charge (increases SoC)
     def batt_dynamics_rule(m, t):
         if t == 0:
+            return pyo.Constraint.Skip
+        # No stationary battery: P_batt is pinned to 0 and battery_capacity is 0,
+        # so there is nothing to track and dividing by capacity would be a
+        # ZeroDivisionError. SoC_batt is then a free, unused variable.
+        if not has_battery:
             return pyo.Constraint.Skip
         # Per PRD: SoC_batt[t] = SoC_batt[t-1] - (P_batt[t-1] × Δt) / E_batt_storage
         # Subtracting P_batt: if P_batt > 0 (discharge), SoC decreases; if P_batt < 0 (charge), SoC increases
