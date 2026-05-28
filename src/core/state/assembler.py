@@ -165,7 +165,7 @@ class StateAssembler:
         import time
 
         start_time = time.time()
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         horizon_end = now + timedelta(hours=horizon_hours)
         n_steps = int(horizon_hours / self.config.delta_t)
 

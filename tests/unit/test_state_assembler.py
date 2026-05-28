@@ -988,6 +988,55 @@ class TestGetCurrentState:
         assert all(p >= 0.0 for p in state.building_power)
 
     @pytest.mark.asyncio
+    async def test_get_current_state_with_timezone_aware_schedules(self, assembler):
+        """Regression: schedules carry tz-aware UTC datetimes, so the horizon
+        clock must be aware too.
+
+        The recurring-template expander and asyncpg TIMESTAMPTZ columns both
+        yield aware UTC datetimes. ``get_current_state`` previously built its
+        clock with naive ``datetime.utcnow()``; once a schedule landed in the
+        horizon, ``_compute_availability`` / ``_compute_departure_times`` compared
+        naive vs aware and raised ``TypeError: can't compare offset-naive and
+        offset-aware datetimes`` — failing optimization readiness and
+        ``GET /depots/{id}/state`` with a 500. Earlier get_current_state tests
+        only ever mocked an empty schedule list, so the comparison never ran.
+        """
+        from datetime import timezone
+
+        dep = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(hours=6)
+        ret = dep + timedelta(hours=4)
+        aware_schedules = [
+            {
+                "vehicle_id": "bus_1",
+                "departure_time": dep,  # aware UTC, as the expander/asyncpg yield
+                "return_time": ret,
+                "estimated_energy_kwh": 120.0,
+                "route_id": "Classic",
+            }
+        ]
+
+        assembler._get_vehicle_socs = AsyncMock(return_value={"bus_1": 0.6})
+        assembler._get_battery_soc = AsyncMock(return_value=0.5)
+        assembler._get_prices = AsyncMock(return_value=[0.15] * 96)
+        assembler._get_schedules = AsyncMock(return_value=aware_schedules)
+        assembler._get_vdv463_charging_requests = AsyncMock(return_value=[])
+        assembler._get_current_month_peak = AsyncMock(return_value=0.0)
+        assembler._get_demand_charge_rate = AsyncMock(return_value=20.0)
+        assembler._get_building_power = AsyncMock(return_value=[0.0] * 96)
+        assembler._get_incoming_vehicles = AsyncMock(return_value=[])
+
+        # Must not raise (naive vs aware TypeError) — this is the regression.
+        state = await assembler.get_current_state(horizon_hours=24)
+
+        # Horizon clock is tz-aware now.
+        assert assembler.last_horizon[0].tzinfo is not None
+        # bus_1 is on a route for part of the horizon → some timestep unavailable.
+        assert "bus_1" in state.vehicle_availability
+        assert not all(state.vehicle_availability["bus_1"])
+        # Departure index was computed without crashing.
+        assert state.departure_times.get("bus_1", -1) >= 0
+
+    @pytest.mark.asyncio
     async def test_get_current_state_custom_horizon(self, assembler, mock_db_pool):
         """Test state assembly with custom horizon."""
         mock_conn = AsyncMock()
