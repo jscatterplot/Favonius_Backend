@@ -109,6 +109,20 @@ class TestBuildUploadUrl:
         with pytest.raises(RuntimeError):
             build_upload_url(uuid4())
 
+    def test_strips_trailing_slash_from_base(self):
+        # A trailing slash makes the charger POST to /upload/ which FastAPI
+        # 307-redirects; embedded charger clients often drop the body across
+        # the redirect, so the upload silently never lands. The query must
+        # attach directly to the slash-less route.
+        import_id = uuid4()
+        url = build_upload_url(
+            import_id,
+            base_url="https://api.example.test/internal/charger_logs/upload/",
+            token="tok",
+        )
+        assert url.startswith("https://api.example.test/internal/charger_logs/upload?")
+        assert "/upload/?" not in url
+
 
 class TestDeriveUploadBaseUrl:
     def test_derives_from_host_and_forwarded_proto(self):
