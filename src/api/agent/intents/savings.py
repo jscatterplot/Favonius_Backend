@@ -65,12 +65,6 @@ _WINDOW_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("today", re.compile(r"\btoday\b")),
 )
 
-# Relative kinds that map straight onto a TimeWindow.relative literal.
-_RELATIVE_KINDS: frozenset[str] = frozenset(
-    {"today", "yesterday", "this_week", "last_week", "last_month"}
-)
-
-
 @dataclass(frozen=True)
 class SavingsWindow:
     """A resolved savings window: UTC bounds + a human label."""
