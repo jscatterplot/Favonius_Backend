@@ -28,17 +28,9 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
-from uuid import UUID
-from zoneinfo import ZoneInfo
 
-from src.api.agent.plan import TimeWindow
-from src.api.agent.resolve import resolve_time_window
+from src.api.agent.resolve import resolve_relative_bounds
 from src.api.savings import overnight_window_utc
-
-# Sentinel depot id used only to satisfy resolve_time_window's
-# (visible_depot_ids, depot_timezones) contract for the relative phrases —
-# the savings intent resolves a single window against one timezone at a time.
-_TZ_SENTINEL = UUID("00000000-0000-0000-0000-000000000000")
 
 # Window kind → human label used in the rendered answer.
 _WINDOW_LABELS: dict[str, str] = {
@@ -119,36 +111,16 @@ def resolve_savings_window(
         # Month start (depot-local) → now. "this_month" relative gives the
         # full calendar month; we clamp the end to `now` because you cannot
         # have saved in the future.
-        start = _relative_bounds("this_month", tz_name, now)[0]
+        start = resolve_relative_bounds("this_month", tz_name, now=now)[0]
         return SavingsWindow(kind=kind, label=label, period_start=start, period_end=now)
 
-    start, end = _relative_bounds(kind, tz_name, now)
+    start, end = resolve_relative_bounds(kind, tz_name, now=now)
     # Clamp the end to `now` for every window: "today" / "this week" span
     # future hours whose day-ahead prices already exist and would otherwise
     # inflate the baseline average against past-only sessions. Fully-past
     # windows (yesterday / last week / last month) already end <= now, so
     # the clamp is a no-op there.
     return SavingsWindow(kind=kind, label=label, period_start=start, period_end=min(end, now))
-
-
-def _relative_bounds(
-    relative: str, tz_name: Optional[str], now: datetime
-) -> tuple[datetime, datetime]:
-    """Resolve a ``TimeWindow.relative`` literal to UTC bounds in one tz.
-
-    An unknown / invalid ``tz_name`` degrades to UTC rather than raising —
-    ``resolve_time_window`` calls ``ZoneInfo(tz_name)`` directly, so without
-    this guard a malformed ``sites.timezone`` would 500 the whole turn (the
-    ``overnight`` path already degrades gracefully via ``overnight_window_utc``).
-    """
-    tz = tz_name or "UTC"
-    try:
-        ZoneInfo(tz)
-    except Exception:  # noqa: BLE001 - any bad zone name → UTC fallback
-        tz = "UTC"
-    window = TimeWindow(kind="relative", relative=relative)  # type: ignore[arg-type]
-    resolved = resolve_time_window(window, [_TZ_SENTINEL], {_TZ_SENTINEL: tz}, now=now)
-    return resolved.start_utc, resolved.end_utc
 
 
 def _fmt_eur(amount: float) -> str:

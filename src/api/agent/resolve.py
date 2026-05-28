@@ -439,6 +439,40 @@ def resolve_time_window(
     )
 
 
+def resolve_relative_bounds(
+    relative: str,
+    tz_name: Optional[str],
+    *,
+    now: Optional[datetime] = None,
+) -> tuple[datetime, datetime]:
+    """Resolve a relative literal to UTC ``[start, end)`` bounds for one tz.
+
+    The single-timezone counterpart to :func:`resolve_time_window` (which
+    takes the depot-scope machinery). Callers that already hold one depot's
+    timezone — e.g. the chat agent's savings intent — use this directly
+    instead of faking a ``(visible_depot_ids, depot_timezones)`` pair.
+
+    An unknown / invalid ``tz_name`` (or ``None``) degrades to UTC rather
+    than raising, so a malformed ``sites.timezone`` never 500s the turn.
+
+    Args:
+        relative: One of the :class:`TimeWindow` relative literals
+            (``today`` / ``yesterday`` / ``this_week`` / ``last_week`` /
+            ``this_month`` / ``last_month``).
+        tz_name: Depot IANA timezone.
+        now: Optional UTC-aware "current time" override (tests).
+
+    Returns:
+        ``(start_utc, end_utc)`` — timezone-aware UTC datetimes.
+    """
+    try:
+        tz = ZoneInfo(tz_name) if tz_name else ZoneInfo("UTC")
+    except Exception:  # noqa: BLE001 - any bad zone name → UTC fallback
+        tz = ZoneInfo("UTC")
+    start_local, end_local = _resolve_relative(relative, tz, now=now)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
 def _resolve_relative(
     rel: str, tz: ZoneInfo, *, now: Optional[datetime]
 ) -> tuple[datetime, datetime]:

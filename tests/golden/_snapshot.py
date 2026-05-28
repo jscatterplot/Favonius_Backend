@@ -27,12 +27,19 @@ _DURATION_RE = re.compile(r"^([+-])(\d+)([smhd])$")
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
-def coerce_uuid(value: Any) -> UUID:
-    return value if isinstance(value, UUID) else UUID(str(value))
+def coerce_uuid(value: Any, *, field_name: str = "") -> UUID:
+    """Coerce ``value`` to ``UUID``; ``field_name`` adds context on a bad value."""
+    if isinstance(value, UUID):
+        return value
+    try:
+        return UUID(str(value))
+    except (ValueError, AttributeError) as exc:
+        loc = f"{field_name}: " if field_name else ""
+        raise ValueError(f"{loc}invalid UUID {value!r}") from exc
 
 
-def maybe_uuid(value: Any) -> Optional[UUID]:
-    return None if value is None else coerce_uuid(value)
+def maybe_uuid(value: Any, *, field_name: str = "") -> Optional[UUID]:
+    return None if value is None else coerce_uuid(value, field_name=field_name)
 
 
 def parse_scenario_now(raw: Any) -> datetime:

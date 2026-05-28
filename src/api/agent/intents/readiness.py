@@ -31,10 +31,11 @@ Reuse:
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Optional
+
+from src.api.agent_workflows.plan_parsing import extract_vehicle_plan
 
 # PRD §8.1 hard constraint: vehicles must leave at ≥99% SoC. Used when a
 # schedule row leaves required_soc NULL.
@@ -67,47 +68,10 @@ DEPARTURES_SQL = """
     ORDER BY s.departure_time
 """
 
-# Freshest SoC per vehicle, merging the OCPP charger feed (`telemetry`) and
-# the telematics feed (`vehicle_telemetry`). Mirrors
-# StateAssembler._get_vehicle_socs but (a) returns the reading `time` so the
-# caller can apply the MAX_TELEMETRY_AGE staleness check, and (b) takes the
-# 24h scan floor as a parameter ($2) rather than DB now(), so the result is
-# deterministic under an injected clock (golden tests). On an exact tie,
-# src_priority makes charger telemetry win (ground truth when plugged in).
-MERGED_SOC_SQL = """
-    SELECT DISTINCT ON (vehicle_id)
-        vehicle_id::text AS vehicle_id,
-        soc,
-        time
-    FROM (
-        SELECT vehicle_id, soc, time, 0 AS src_priority
-        FROM telemetry
-        WHERE vehicle_id = ANY($1::uuid[])
-          AND soc IS NOT NULL
-          AND time > $2
-        UNION ALL
-        SELECT vehicle_id, soc, time, 1 AS src_priority
-        FROM vehicle_telemetry
-        WHERE vehicle_id = ANY($1::uuid[])
-          AND soc IS NOT NULL
-          AND time > $2
-    ) merged
-    ORDER BY vehicle_id, time DESC, src_priority
-"""
-
-# Fallback when vehicle_telemetry is absent (migration 044 not yet applied /
-# rollout skew) — same guard StateAssembler uses.
-TELEMETRY_ONLY_SOC_SQL = """
-    SELECT DISTINCT ON (vehicle_id)
-        vehicle_id::text AS vehicle_id,
-        soc,
-        time
-    FROM telemetry
-    WHERE vehicle_id = ANY($1::uuid[])
-      AND soc IS NOT NULL
-      AND time > $2
-    ORDER BY vehicle_id, time DESC
-"""
+# The freshest-SoC-per-vehicle merge (telemetry + vehicle_telemetry, with the
+# vehicle_telemetry-missing fallback) is shared with the optimizer's
+# StateAssembler via src.db.queries.fetch_freshest_vehicle_socs — the
+# controller's _fetch_readiness_socs calls it.
 
 # Latest *usable* optimization run per depot — its schedule_json carries the
 # per-vehicle projected SoC trajectory. Restricted to statuses that actually
@@ -182,26 +146,18 @@ def projected_soc_from_plan(schedule_json: Any, vehicle_id: str) -> Optional[flo
     """Best projected SoC for one vehicle from an optimization run's plan.
 
     ``schedule_json`` may arrive as a JSONB ``dict`` or a serialized
-    ``str`` (asyncpg leaves JSONB as text unless a codec is set), matching
-    ``readiness_tools._make_get_charging_plan``. Returns the **maximum**
-    projected SoC over the trajectory as a v1 proxy for "SoC reached by
-    departure": a feasible plan charges to ≥ required by departure, so the
-    peak is the most charitable estimate and avoids a false "at risk" from
-    a post-departure discharge tail. ``None`` when the vehicle has no plan.
+    ``str`` (asyncpg leaves JSONB as text unless a codec is set); the
+    str-vs-dict / schedule / per-vehicle walk is shared with
+    ``readiness_tools._make_get_charging_plan`` via
+    :func:`~src.api.agent_workflows.plan_parsing.extract_vehicle_plan`.
+    Returns the **maximum** projected SoC over the trajectory as a v1 proxy
+    for "SoC reached by departure": a feasible plan charges to ≥ required by
+    departure, so the peak is the most charitable estimate and avoids a false
+    "at risk" from a post-departure discharge tail. ``None`` when the vehicle
+    has no plan.
     """
-    payload = schedule_json
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except json.JSONDecodeError:
-            return None
-    if not isinstance(payload, dict):
-        return None
-    schedule = payload.get("schedule")
-    if not isinstance(schedule, dict):
-        return None
-    per_vehicle = schedule.get(vehicle_id)
-    if not isinstance(per_vehicle, dict):
+    per_vehicle = extract_vehicle_plan(schedule_json, vehicle_id)
+    if per_vehicle is None:
         return None
     socs = per_vehicle.get("soc")
     if not isinstance(socs, list) or not socs:

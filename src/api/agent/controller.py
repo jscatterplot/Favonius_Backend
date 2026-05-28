@@ -35,7 +35,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Protocol
 from uuid import UUID
 
-import asyncpg
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.api.agent import budget
@@ -55,8 +54,6 @@ from src.api.agent.intents.consumption_by_user import (
 from src.api.agent.intents.readiness import (
     DEPARTURES_SQL,
     LATEST_PLAN_SQL,
-    MERGED_SOC_SQL,
-    TELEMETRY_ONLY_SOC_SQL,
     ReadinessVerdict,
     SocReading,
     render_readiness_answer,
@@ -87,6 +84,7 @@ from src.api.agent.view_context import AgentViewContext, build_page_context_payl
 from src.api.agent_workflows.runtime import ToolNotAllowedError, run_qa_turn
 from src.api.agent_workflows.tools import ToolNotRegisteredError
 from src.api.savings import SavingsSummary, compute_savings_for_window
+from src.db.queries import fetch_freshest_vehicle_socs
 from src.monitoring.metrics import (
     AGENT_RESOLVER_MISSES,
     AGENT_SQL_BUDGET_REFUSED,
@@ -450,26 +448,46 @@ async def _fetch_readiness_socs(
     vehicle_ids: list[UUID],
     recency_floor: datetime,
 ) -> dict[str, SocReading]:
-    """Freshest SoC per vehicle from the merged telemetry feeds.
+    """Freshest SoC per vehicle, keyed for the readiness verdict.
 
-    Mirrors ``StateAssembler._get_vehicle_socs``: tries the merged
-    ``telemetry`` + ``vehicle_telemetry`` query and falls back to
-    charger-telemetry-only when ``vehicle_telemetry`` is absent (migration
-    044 not yet applied). One query, set-based over the vehicle set.
+    Thin adapter over the shared
+    :func:`src.db.queries.fetch_freshest_vehicle_socs` (the same merge the
+    optimizer's ``StateAssembler`` uses), mapping its rows to
+    ``{vehicle_id: SocReading}``.
     """
-    if not vehicle_ids:
-        return {}
-    try:
-        rows = await ts_pool.fetch(MERGED_SOC_SQL, vehicle_ids, recency_floor)
-    except asyncpg.exceptions.UndefinedTableError:
-        logger.warning("vehicle_telemetry missing; readiness using charger telemetry only")
-        rows = await ts_pool.fetch(TELEMETRY_ONLY_SOC_SQL, vehicle_ids, recency_floor)
+    rows = await fetch_freshest_vehicle_socs(ts_pool, vehicle_ids, recency_floor=recency_floor)
     socs: dict[str, SocReading] = {}
     for row in rows:
         if row["soc"] is None:
             continue
         socs[str(row["vehicle_id"])] = SocReading(soc=float(row["soc"]), time=row["time"])
     return socs
+
+
+async def _finish_intent_success(
+    ts_pool: Any,
+    sse: Optional[SSEEventStream],
+    run_id: UUID,
+    *,
+    auth: Any,
+    intent: str,
+    text: str,
+    row_count: int,
+    target_type: str,
+) -> AgentReply:
+    """Shared success bookend for the deterministic fast-path intents.
+
+    Mirrors a query into the admin audit feed, builds the success reply,
+    closes the ``agent_runs`` row, and emits the final SSE answer. Each
+    deterministic intent handler ends with this so the
+    audit/close/emit plumbing lives in one place (the consumption and
+    sql_general paths have their own richer flows and don't use it).
+    """
+    await write_agent_query_audit(ts_pool, auth, run_id, intent, row_count, target_type=target_type)
+    reply = AgentReply.success(run_id=run_id, intent=intent, text=text)
+    await agent_runs_close(ts_pool, run_id, "success", reply)
+    await _emit_answer_safe(sse, reply, run_id)
+    return reply
 
 
 async def _run_readiness_turn(
@@ -480,9 +498,14 @@ async def _run_readiness_turn(
     ts_pool: Any,
     sse: Optional[SSEEventStream],
     emit_step: Any,
+    message: str = "",
     now: Optional[datetime] = None,
 ) -> AgentReply:
     """Answer "are we ready to depart?" deterministically (no LLM call).
+
+    ``message`` is accepted for a uniform deterministic-intent handler
+    signature (see ``_DETERMINISTIC_INTENT_HANDLERS``) but unused — the
+    readiness window is always the next 24 hours.
 
     Three set-based queries — upcoming departures (static), freshest SoC per
     departing vehicle (TS), latest plan per depot (TS) — reduced to a depot
@@ -537,13 +560,16 @@ async def _run_readiness_turn(
         },
     )
     text = render_readiness_answer(verdict)
-    await write_agent_query_audit(
-        ts_pool, auth, run_id, "readiness", verdict.total, target_type="schedules"
+    return await _finish_intent_success(
+        ts_pool,
+        sse,
+        run_id,
+        auth=auth,
+        intent="readiness",
+        text=text,
+        row_count=verdict.total,
+        target_type="schedules",
     )
-    reply = AgentReply.success(run_id=run_id, intent="readiness", text=text)
-    await agent_runs_close(ts_pool, run_id, "success", reply)
-    await _emit_answer_safe(sse, reply, run_id)
-    return reply
 
 
 # ── Savings fast-path intent ───────────────────────────────────────────────
@@ -656,13 +682,26 @@ async def _run_savings_turn(
         depot_count=depot_count,
         baseline_known=baseline_known,
     )
-    await write_agent_query_audit(
-        ts_pool, auth, run_id, "savings", depot_count, target_type="charging_sessions"
+    return await _finish_intent_success(
+        ts_pool,
+        sse,
+        run_id,
+        auth=auth,
+        intent="savings",
+        text=text,
+        row_count=depot_count,
+        target_type="charging_sessions",
     )
-    reply = AgentReply.success(run_id=run_id, intent="savings", text=text)
-    await agent_runs_close(ts_pool, run_id, "success", reply)
-    await _emit_answer_safe(sse, reply, run_id)
-    return reply
+
+
+# Deterministic fast-path intents share one handler signature; the orchestrator
+# dispatches by route through this registry so adding intent #3 is a handler +
+# one entry here (no new branch). The consumption fast path and sql_general have
+# their own richer flows and are dispatched explicitly in run_turn.
+_DETERMINISTIC_INTENT_HANDLERS: dict[str, Any] = {
+    "savings": _run_savings_turn,
+    "readiness": _run_readiness_turn,
+}
 
 
 # ── Orchestrator ───────────────────────────────────────────────────────────
@@ -749,20 +788,11 @@ async def run_turn(
             await _emit_answer_safe(sse, reply, run_id)
             return reply
 
-        if decision.route == "savings":
-            return await _run_savings_turn(
+        deterministic_handler = _DETERMINISTIC_INTENT_HANDLERS.get(decision.route)
+        if deterministic_handler is not None:
+            return await deterministic_handler(
                 run_id=run_id,
                 message=message,
-                auth=auth,
-                static_pool=static_pool,
-                ts_pool=ts_pool,
-                sse=sse,
-                emit_step=_emit_step,
-            )
-
-        if decision.route == "readiness":
-            return await _run_readiness_turn(
-                run_id=run_id,
                 auth=auth,
                 static_pool=static_pool,
                 ts_pool=ts_pool,
