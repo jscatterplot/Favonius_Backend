@@ -36,6 +36,17 @@ logger = logging.getLogger(__name__)
 _SENTINEL = object()
 
 
+def _as_aware_utc(value: datetime) -> datetime:
+    """Coerce a datetime to timezone-aware UTC.
+
+    ``get_current_state`` works in naive UTC (``datetime.utcnow()``) while
+    schedule rows come back tz-aware from Postgres ``timestamptz``; comparing
+    the two raises ``TypeError: can't compare offset-naive and offset-aware
+    datetimes``. Naive inputs are assumed to already be UTC.
+    """
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
 class StateAssembler:
     """Assembles current depot state for optimization.
 
@@ -860,6 +871,10 @@ class StateAssembler:
             Dictionary mapping vehicle_id to list of availability booleans
         """
         delta_t = timedelta(hours=self.config.delta_t)
+        # Schedule datetimes are tz-aware (Postgres timestamptz) while ``start``
+        # may be naive UTC (datetime.utcnow()); coerce both so the comparison
+        # below can't raise on a naive/aware mismatch.
+        start = _as_aware_utc(start)
 
         # Initialize all vehicles as available
         availability = {vid: [True] * n_steps for vid in self.config.vehicle_capacities.keys()}
@@ -870,8 +885,8 @@ class StateAssembler:
                 # Ignore unknown vehicles not in depot config
                 continue
 
-            dep = sched["departure_time"]
-            ret = sched["return_time"]
+            dep = _as_aware_utc(sched["departure_time"])
+            ret = _as_aware_utc(sched["return_time"])
 
             for t in range(n_steps):
                 step_time = start + t * delta_t
@@ -892,11 +907,14 @@ class StateAssembler:
             Dictionary mapping vehicle_id to timestep index
         """
         delta_t = timedelta(hours=self.config.delta_t)
+        # See _compute_availability: coerce to tz-aware UTC so a naive ``start``
+        # and tz-aware schedule rows can be subtracted without raising.
+        start = _as_aware_utc(start)
         departures = {}
 
         for sched in schedules:
             vid = sched["vehicle_id"]
-            dep = sched["departure_time"]
+            dep = _as_aware_utc(sched["departure_time"])
             t_idx = int((dep - start) / delta_t)
 
             # Keep earliest departure for each vehicle

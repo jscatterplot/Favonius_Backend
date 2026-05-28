@@ -221,7 +221,12 @@ def build_upload_url(
         )
     token_value = token if token is not None else mint_token(import_id)
     query = urlencode({"token": token_value, "import_id": str(import_id)})
-    return f"{base}?{query}"
+    # Strip a trailing slash so the charger POSTs to the exact route
+    # (``/internal/charger_logs/upload``, no slash). With a trailing slash
+    # FastAPI 307-redirects, and embedded charger HTTP clients frequently
+    # drop the POST body across the redirect — the upload then silently
+    # never lands and the import is stuck at ``requested``.
+    return f"{base.rstrip('/')}?{query}"
 
 
 __all__ = [
