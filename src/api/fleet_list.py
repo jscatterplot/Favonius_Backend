@@ -128,8 +128,12 @@ def derive_vehicle_state(
       2. ``charging`` — open ``charging_sessions`` row exists.
       3. ``in_route`` — within an active schedule window.
       4. ``ready`` — ``current_soc >= required_soc`` (default 0.95 if none).
-      5. ``at_risk`` — SoC below threshold, OR SoC unknown (conservative fallback
-         so the operator sees the vehicle in the FleetReadiness card).
+      5. ``at_risk`` — SoC is known and below threshold.
+
+    A vehicle with recent telemetry but no SoC reading (e.g. Navirec sent a
+    position update without a battery reading) is treated as ``offline`` — the
+    data gap makes it unschedulable, and ``at_risk`` should only fire when we
+    have a confirmed low reading.
     """
     age = _age_seconds(last_seen_at, now)
     if age is None or age > VEHICLE_OFFLINE_AGE_S:
@@ -142,7 +146,7 @@ def derive_vehicle_state(
         return "in_route"
 
     if current_soc is None:
-        return "at_risk"
+        return "offline"
 
     threshold = required_soc if required_soc is not None else DEFAULT_DEPARTURE_SOC
     if current_soc >= threshold:
