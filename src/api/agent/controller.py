@@ -635,6 +635,17 @@ async def _run_savings_turn(
         return_exceptions=True,
     )
     summaries = [r for r in results if isinstance(r, SavingsSummary)]
+    failures = [r for r in results if isinstance(r, BaseException)]
+    if failures and not summaries:
+        # Every depot computation failed — surface the failure (run_turn closes
+        # the run as 'error') rather than returning a misleading "no charging".
+        raise failures[0]
+    if failures:
+        logger.warning(
+            "savings: %d/%d depot computations failed; reporting partial aggregate",
+            len(failures),
+            len(results),
+        )
 
     # Aggregate ONLY depots with a priceable baseline. A depot with no
     # bidding zone / no prices (baseline_known=False) is excluded from BOTH
@@ -668,6 +679,7 @@ async def _run_savings_turn(
             "kind": kind,
             "label": label,
             "depots": depot_count,
+            "failed_depots": len(failures),
             "baseline_known": baseline_known,
             "actual_eur": actual,
             "baseline_eur": baseline,

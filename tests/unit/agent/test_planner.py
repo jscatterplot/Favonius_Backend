@@ -344,6 +344,11 @@ _NOT_READINESS = (
     "Are the new chargers ready to install?",
     "Is the data ready for export?",
     "Is the firmware update ready?",
+    # Optimization-readiness / input-checklist flow — belongs in SQL mode, not
+    # the departure-SoC handler.
+    "What is blocking optimization readiness?",
+    "Show me the optimization readiness checklist",
+    "Are the solver inputs ready?",
 )
 _IS_READINESS = (
     "Are we ready?",

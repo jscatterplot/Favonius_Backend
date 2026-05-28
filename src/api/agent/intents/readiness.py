@@ -74,17 +74,19 @@ DEPARTURES_SQL = """
 # controller's _fetch_readiness_socs calls it.
 
 # Latest *usable* optimization run per depot — its schedule_json carries the
-# per-vehicle projected SoC trajectory. Restricted to statuses that actually
-# produce a plan we can trust ('optimal'/'feasible'/'degraded'); an
-# 'infeasible'/'timeout' run can still write a partial/warm-start trajectory
-# whose max SoC would falsely clear the readiness bar.
+# per-vehicle projected SoC trajectory. We EXCLUDE the two failure markers
+# ('infeasible'/'timeout') rather than allow-listing success values: the
+# codebase persists successful runs as 'completed' (milp_model.py) — and
+# sometimes 'optimal'/'feasible'/'degraded' — so an allow-list would wrongly
+# drop the real plans (optimization_runs.status has no CHECK; the vocabulary
+# is inconsistent, so a denylist of the genuine failures is the robust filter).
 LATEST_PLAN_SQL = """
     SELECT DISTINCT ON (depot_id)
         depot_id::text AS depot_id,
         schedule_json
     FROM optimization_runs
     WHERE depot_id = ANY($1::uuid[])
-      AND status IN ('optimal', 'feasible', 'degraded')
+      AND status NOT IN ('infeasible', 'timeout')
     ORDER BY depot_id, run_time DESC
 """
 

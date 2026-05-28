@@ -105,6 +105,17 @@ _READINESS_TRIGGERS: tuple[re.Pattern[str], ...] = (
     ),
 )
 
+# Pull a "readiness" match back out of the departure-readiness fast path when
+# it is really about the *optimization* readiness / input-checklist flow
+# (GET /depots/{id}/optimization/readiness), e.g. "what is blocking
+# optimization readiness?" — those belong in SQL mode, not the departure-SoC
+# handler.
+_READINESS_ANTIPATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\boptim(?:al|ize|ise|izer|iser|ization|isation)\b"),
+    re.compile(r"\binput"),
+    re.compile(r"\bsolver\b"),
+)
+
 
 @lru_cache(maxsize=1)
 def is_sql_mode_enabled() -> bool:
@@ -174,7 +185,9 @@ def classify(
     # otherwise match the consumption trigger.
     if any(p.search(text) for p in _SAVINGS_TRIGGERS):
         return PlannerDecision(route="savings", reason="matched_savings_trigger")
-    if any(p.search(text) for p in _READINESS_TRIGGERS):
+    if any(p.search(text) for p in _READINESS_TRIGGERS) and not any(
+        p.search(text) for p in _READINESS_ANTIPATTERNS
+    ):
         return PlannerDecision(route="readiness", reason="matched_readiness_trigger")
 
     consumption_match = any(p.search(text) for p in _CONSUMPTION_TRIGGERS)
