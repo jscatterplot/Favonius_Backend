@@ -365,6 +365,22 @@ def test_non_departure_ready_questions_not_routed_to_readiness(monkeypatch, mess
     assert classify(message, sql_mode_allowed=True).route != "readiness", message
 
 
+_NOT_SAVINGS = (
+    "Can you save this configuration?",
+    "I want to save an export",
+    "Is there a way to save the schedule?",
+    "How do I save the report as PDF?",
+    "Please save my settings",
+)
+
+
+@pytest.mark.parametrize("message", _NOT_SAVINGS, ids=[m[:25] for m in _NOT_SAVINGS])
+def test_non_financial_save_questions_not_routed_to_savings(monkeypatch, message):
+    monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
+    is_sql_mode_enabled.cache_clear()
+    assert classify(message, sql_mode_allowed=True).route != "savings", message
+
+
 @pytest.mark.parametrize("message", _IS_READINESS, ids=[m[:25] for m in _IS_READINESS])
 def test_fleet_ready_questions_route_to_readiness(monkeypatch, message):
     monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")

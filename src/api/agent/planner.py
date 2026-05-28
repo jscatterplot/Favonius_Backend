@@ -87,6 +87,17 @@ _CONSUMPTION_ANTIPATTERNS: tuple[re.Pattern[str], ...] = (
 # overwhelmingly means cost savings vs an unmanaged baseline.
 _SAVINGS_TRIGGERS: tuple[re.Pattern[str], ...] = (re.compile(r"\bsav(?:e|ed|ing|ings)\b"),)
 
+# Pull non-financial "save" phrasing back to SQL mode (save a report,
+# configuration, export, schedule, etc.).
+_SAVINGS_ANTIPATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\bsav(?:e|ing)\s+(?:this|the|an?|my|a)\s+"
+        r"(?:config(?:uration)?|settings?|export|schedule|report|file|draft)\b"
+    ),
+    re.compile(r"\bsav(?:e|ing)\s+(?:to|as)\b"),
+    re.compile(r"\bsave\s+(?:changes?|draft|settings?)\b"),
+)
+
 # Departure-readiness phrasing. Kept tight so ops/status questions that merely
 # say "active" or "available" — or unrelated "is the report ready?" — do not
 # get pulled in. The bare "are/is … ready" form requires a fleet/vehicle/we/
@@ -183,7 +194,9 @@ def classify(
     # Deterministic fast-path intents win first (independent of SQL mode).
     # Savings precedes consumption: "how much did we save by charging…" would
     # otherwise match the consumption trigger.
-    if any(p.search(text) for p in _SAVINGS_TRIGGERS):
+    if any(p.search(text) for p in _SAVINGS_TRIGGERS) and not any(
+        p.search(text) for p in _SAVINGS_ANTIPATTERNS
+    ):
         return PlannerDecision(route="savings", reason="matched_savings_trigger")
     if any(p.search(text) for p in _READINESS_TRIGGERS) and not any(
         p.search(text) for p in _READINESS_ANTIPATTERNS
