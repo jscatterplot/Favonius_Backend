@@ -7869,32 +7869,42 @@ async def get_report(
 @app.get(
     "/depots/{depot_id}/reports/{report_id}/export",
     tags=["depots"],
-    summary="Export an approved report as CSV",
+    summary="Export an approved report as PDF or CSV",
     description=(
-        "Streams the report as CSV. Only available for approved reports with stored data. "
+        "Renders the report. `?format=pdf` (default) returns a PDF; `?format=csv` streams "
+        "the aggregated rows as CSV. Only available for approved reports with stored data. "
         "Returns 404 for draft/pending reports or kinds without stored data."
     ),
     responses={
-        200: {"content": {"text/csv": {}}, "description": "CSV export"},
+        200: {
+            "content": {"application/pdf": {}, "text/csv": {}},
+            "description": "Rendered report (PDF or CSV)",
+        },
         401: {"model": ErrorResponse, "description": "Unauthorized"},
         403: {"model": ErrorResponse, "description": "Access denied"},
         404: {"model": ErrorResponse, "description": "Report not found or not yet approved"},
+        422: {"model": ErrorResponse, "description": "Invalid format"},
         503: {"model": ErrorResponse, "description": "Database not available"},
     },
 )
 async def export_report(
     report_id: str,
+    format: str = Query("pdf", description="Export format: pdf (default) or csv"),
     depot_id: str = Depends(_require_depot_access),
     user: dict = Depends(ensure_tenant_mirrored),
-) -> StreamingResponse:
-    """GET /depots/{depot_id}/reports/{report_id}/export — stream report as CSV."""
+) -> Response:
+    """GET /depots/{depot_id}/reports/{report_id}/export — render report as PDF/CSV."""
     validate_uuid(report_id, "report_id")
+    fmt = format.lower()
+    if fmt not in ("pdf", "csv"):
+        raise HTTPException(status_code=422, detail="format must be 'pdf' or 'csv'")
     if not db_pools:
         raise DatabaseError("Database not available")
 
     async with db_pools.ts.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT kind, status, group_by, data FROM reports WHERE id = $1::uuid AND depot_id = $2::uuid",
+            "SELECT id, depot_id, title, kind, status, group_by, period_start, period_end, data "
+            "FROM reports WHERE id = $1::uuid AND depot_id = $2::uuid",
             report_id,
             depot_id,
         )
@@ -7912,19 +7922,18 @@ async def export_report(
             detail=f"No export data available for {row['kind']} reports",
         )
 
-    stored = row["data"] if isinstance(row["data"], dict) else json.loads(row["data"])
-    agg_rows: list[dict] = stored.get("rows", [])
-    totals: Optional[dict] = stored.get("totals")
-    group_by: Optional[str] = row["group_by"]
-
-    filename = f"report_{report_id}.csv"
-    headers_resp = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    rows_for_stream = agg_rows
-
-    def _generate() -> Iterator[str]:
-        yield from stream_rows_as_csv(rows_for_stream, group_by=group_by, totals=totals)
-
-    return StreamingResponse(_generate(), media_type="text/csv", headers=headers_resp)
+    parsed_data = _report_schedules._parse_report_data(row["data"])
+    # Render through the same path the email delivery uses (one renderer for both).
+    attachment = _report_schedules.render_attachment(fmt, row, parsed_data)
+    # Use the report id for a stable, per-report unique download filename
+    # (render_attachment's kind+period name is fine for email but collides
+    # across reports of the same kind+period as an HTTP download).
+    filename = f"report_{report_id}.{fmt}"
+    return Response(
+        content=attachment.content,
+        media_type=attachment.content_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ── Report schedules (read endpoints) ─────────────────────────────────────────
@@ -8117,6 +8126,40 @@ class AutonomySettings(BaseModel):
     model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)
 
 
+class AutonomySettingsReplaceRequest(BaseModel):
+    """Body for PUT /depots/{id}/autonomy-settings — the full row set to persist."""
+
+    rows: list[AutonomySettingsRow]
+
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)
+
+
+async def _load_autonomy_settings(conn: "asyncpg.Connection", depot_id: str) -> AutonomySettings:
+    """Read the depot autonomy matrix, layering defaults for unset action classes."""
+    rows = await conn.fetch(
+        """
+        SELECT action_class, level, updated_at
+        FROM agent_autonomy_settings
+        WHERE depot_id = $1::uuid
+        """,
+        depot_id,
+    )
+    stored: dict[str, str] = {r["action_class"]: r["level"] for r in rows}
+    latest_update: Optional[datetime] = max((r["updated_at"] for r in rows), default=None)
+
+    merged: dict[str, str] = {
+        cls: _DEFAULT_AGENT_AUTONOMY_LEVEL for cls in _DEFAULT_AGENT_AUTONOMY_CLASSES
+    }
+    merged.update(stored)
+    matrix_rows = [
+        AutonomySettingsRow(action_class=cls, level=level) for cls, level in sorted(merged.items())
+    ]
+    return AutonomySettings(
+        rows=matrix_rows,
+        as_of=latest_update or datetime.now(timezone.utc),
+    )
+
+
 @app.get(
     "/depots/{depot_id}/autonomy-settings",
     response_model=AutonomySettings,
@@ -8127,7 +8170,8 @@ class AutonomySettings(BaseModel):
         "Returns the per-depot autonomy matrix: one row per action_class with the "
         "current level (shadow | proposed | auto_notify | auto_silent). "
         "Defaults are returned for known action classes that have not yet been written. "
-        "Writes go through the `agents.autonomy.set` command on POST /commands/execute."
+        "Single-row writes go through the `agents.autonomy.set` command; a full-matrix "
+        "replace goes through PUT on this same path."
     ),
     responses={
         401: {"model": ErrorResponse, "description": "Unauthorized"},
@@ -8144,32 +8188,83 @@ async def get_autonomy_settings(
         raise DatabaseError("Database not available")
 
     async with db_pools.ts.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT action_class, level, updated_at
-            FROM agent_autonomy_settings
-            WHERE depot_id = $1::uuid
-            """,
-            depot_id,
-        )
+        return await _load_autonomy_settings(conn, depot_id)
 
-    stored: dict[str, str] = {r["action_class"]: r["level"] for r in rows}
-    latest_update: Optional[datetime] = max((r["updated_at"] for r in rows), default=None)
 
-    # Layer defaults so the matrix is fully populated even for fresh depots.
-    merged: dict[str, str] = {
-        cls: _DEFAULT_AGENT_AUTONOMY_LEVEL for cls in _DEFAULT_AGENT_AUTONOMY_CLASSES
-    }
-    merged.update(stored)
+@app.put(
+    "/depots/{depot_id}/autonomy-settings",
+    response_model=AutonomySettings,
+    response_model_by_alias=True,
+    tags=["depots"],
+    summary="Replace the depot agent autonomy matrix",
+    description=(
+        "Replaces ALL persisted autonomy rows for the depot with the supplied set, "
+        "atomically. Unspecified action classes fall back to defaults in the response. "
+        "Each level must be one of shadow | proposed | auto_notify | auto_silent. "
+        "Requires depot:manage (operator+)."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Access denied"},
+        422: {"model": ErrorResponse, "description": "Invalid level or duplicate action_class"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def replace_autonomy_settings(
+    payload: AutonomySettingsReplaceRequest,
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> AutonomySettings:
+    """PUT /depots/{depot_id}/autonomy-settings — replace the whole matrix."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
 
-    matrix_rows = [
-        AutonomySettingsRow(action_class=cls, level=level) for cls, level in sorted(merged.items())
-    ]
+    role = get_user_role(user)
+    if not has_permission(role, Permission.DEPOT_MANAGE):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
 
-    return AutonomySettings(
-        rows=matrix_rows,
-        as_of=latest_update or datetime.now(timezone.utc),
-    )
+    cleaned: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for row in payload.rows:
+        action_class = (row.action_class or "").strip()
+        if not action_class:
+            raise HTTPException(status_code=422, detail="action_class must be a non-empty string")
+        if row.level not in _AGENT_AUTONOMY_LEVELS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"level must be one of {list(_AGENT_AUTONOMY_LEVELS)}; got {row.level!r}",
+            )
+        if action_class in seen:
+            raise HTTPException(status_code=422, detail=f"duplicate action_class '{action_class}'")
+        seen.add(action_class)
+        cleaned.append((action_class, row.level))
+
+    actor_id: Optional[UUID] = None
+    actor_raw = user.get("sub") if isinstance(user, dict) else None
+    if actor_raw:
+        try:
+            actor_id = UUID(str(actor_raw))
+        except (TypeError, ValueError):
+            actor_id = None
+
+    async with db_pools.ts.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM agent_autonomy_settings WHERE depot_id = $1::uuid", depot_id
+            )
+            for action_class, level in cleaned:
+                await conn.execute(
+                    """
+                    INSERT INTO agent_autonomy_settings
+                        (depot_id, action_class, level, updated_at, updated_by)
+                    VALUES ($1::uuid, $2, $3, NOW(), $4)
+                    """,
+                    depot_id,
+                    action_class,
+                    level,
+                    actor_id,
+                )
+            return await _load_autonomy_settings(conn, depot_id)
 
 
 @app.get(
@@ -12373,13 +12468,71 @@ async def _handle_reports_generate(
     }
 
 
+async def _mark_report_approved(
+    conn: asyncpg.Connection,
+    *,
+    depot_id: str,
+    report_id: str,
+    approved_by: Optional[str],
+) -> Optional[dict]:
+    """Flip a draft/pending report to approved within ``conn``'s transaction.
+
+    Sets export_url for monthly_consumption reports that carry stored data.
+    Returns ``{"kind", "exportUrl", "approvedAt", "reportRow"}`` or None when the
+    report is absent or not in an approvable status. ``reportRow`` is the locked
+    row (all columns delivery needs), so the post-commit emailer can reuse it
+    instead of re-reading.
+    """
+    report_row = await conn.fetchrow(
+        """
+        SELECT id, depot_id, title, kind, group_by, period_start, period_end, data
+        FROM reports
+        WHERE id = $1::uuid AND depot_id = $2::uuid AND status IN ('draft', 'pending')
+        FOR UPDATE
+        """,
+        report_id,
+        depot_id,
+    )
+    if not report_row:
+        return None
+
+    export_url: Optional[str] = None
+    if report_row["kind"] == "monthly_consumption" and report_row["data"] is not None:
+        export_url = f"/depots/{depot_id}/reports/{report_id}/export"
+
+    updated = await conn.fetchrow(
+        """
+        UPDATE reports
+        SET status = 'approved', approved_at = NOW(), approved_by = $3, export_url = $4
+        WHERE id = $1::uuid AND depot_id = $2::uuid AND status IN ('draft', 'pending')
+        RETURNING approved_at
+        """,
+        report_id,
+        depot_id,
+        approved_by,
+        export_url,
+    )
+    return {
+        "kind": report_row["kind"],
+        "exportUrl": export_url,
+        "approvedAt": updated["approved_at"],
+        "reportRow": report_row,
+    }
+
+
 async def _handle_reports_approve(
     params: dict,
     depot_id: str,
     dry_run: bool,
     user: Optional[dict] = None,
 ) -> dict:
-    """Approve a draft report: set status='approved', stamp approved_at/by, set export_url."""
+    """Approve a draft report: set status='approved', stamp approved_at/by, set export_url.
+
+    For monthly_consumption the rendered PDF is additionally emailed to the
+    approving user (the only 'relevant recipient' a standalone report has).
+    Delivery is best-effort and post-commit: a send failure never undoes a
+    committed approval. The send outcome is surfaced under ``delivery``.
+    """
     report_id = params.get("reportId") or params.get("report_id")
     if not report_id:
         raise HTTPException(status_code=400, detail="params.reportId is required")
@@ -12395,51 +12548,82 @@ async def _handle_reports_approve(
 
     async with db_pools.ts.acquire() as conn:
         async with conn.transaction():
-            report_row = await conn.fetchrow(
-                """
-                SELECT kind, data
-                FROM reports
-                WHERE id = $1::uuid
-                  AND depot_id = $2::uuid
-                  AND status IN ('draft', 'pending')
-                FOR UPDATE
-                """,
-                report_id,
-                depot_id,
+            approved = await _mark_report_approved(
+                conn, depot_id=depot_id, report_id=report_id, approved_by=approved_by
             )
-            if not report_row:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Report {report_id} not found or not in approvable status",
-                )
+    if approved is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Report {report_id} not found or not in approvable status",
+        )
 
-            export_url: Optional[str] = None
-            if report_row["kind"] == "monthly_consumption" and report_row["data"] is not None:
-                export_url = f"/depots/{depot_id}/reports/{report_id}/export"
-
-            updated = await conn.fetchrow(
-                """
-                UPDATE reports
-                SET status      = 'approved',
-                    approved_at = NOW(),
-                    approved_by = $3,
-                    export_url  = $4
-                WHERE id = $1::uuid
-                  AND depot_id = $2::uuid
-                  AND status IN ('draft', 'pending')
-                RETURNING id::text, approved_at
-                """,
-                report_id,
-                depot_id,
-                approved_by,
-                export_url,
-            )
+    delivery = await _deliver_report_to_approver(
+        report_row=approved["reportRow"],
+        kind=approved["kind"],
+        export_url=approved["exportUrl"],
+        to_email=(user or {}).get("email"),
+    )
 
     return {
         "reportId": report_id,
         "status": "approved",
-        "exportUrl": export_url,
-        "approvedAt": updated["approved_at"].isoformat(),
+        "exportUrl": approved["exportUrl"],
+        "approvedAt": approved["approvedAt"].isoformat(),
+        "delivery": delivery,
+    }
+
+
+async def _deliver_report_to_approver(
+    *,
+    report_row: "asyncpg.Record",
+    kind: str,
+    export_url: Optional[str],
+    to_email: Optional[str],
+) -> Optional[dict]:
+    """Email the rendered monthly_consumption report to the approving user.
+
+    ``report_row`` is the row already read (and depot-scoped) by
+    ``_mark_report_approved`` — reused here so there is no second DB read.
+    Fully best-effort: any render/send/DB error is caught and surfaced as a
+    failed delivery so a committed approval is never turned into a 500.
+
+    Returns a delivery dict ``{emailAddress, format, status, providerMessageId,
+    error}`` or None when nothing was sent (non-consumption kind, no stored data,
+    no recipient email, or no configured email client).
+    """
+    if (
+        kind != "monthly_consumption"
+        or export_url is None
+        or not to_email
+        or report_email_client is None
+        or report_row is None
+        or report_row["data"] is None
+    ):
+        return None
+
+    try:
+        status_, provider_message_id, error = await _report_schedules.deliver_report_to_email(
+            report_email_client,
+            report_row=report_row,
+            to_email=to_email,
+            fmt="pdf",
+            default_from=report_email_from,
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort: never 500 a committed approval
+        logger.warning("report approve delivery to %s failed: %s", to_email, exc)
+        return {
+            "emailAddress": to_email,
+            "format": "pdf",
+            "status": "failed",
+            "providerMessageId": None,
+            "error": str(exc),
+        }
+    return {
+        "emailAddress": to_email,
+        "format": "pdf",
+        "status": status_,
+        "providerMessageId": provider_message_id,
+        "error": error,
     }
 
 

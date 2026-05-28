@@ -399,7 +399,15 @@ class TestAgentActionCommands:
         pool, conn = mock_db_pool
         action_id = str(uuid4())
         conn.fetchval = AsyncMock(return_value=True)
-        conn.fetchrow = AsyncMock(return_value={"id": action_id})
+        # The reject handler SELECTs action_class/status/payload FOR UPDATE before
+        # flipping status, so the row must carry those columns.
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "action_class": "charger_restart",
+                "status": "pending",
+                "payload": None,
+            }
+        )
 
         with patch("src.api.main.db_pools", pool):
             response = client.post(
@@ -587,3 +595,175 @@ class TestAlertCommands:
             )
         assert response.status_code == http_status.HTTP_200_OK, response.text
         assert resolve.await_args.kwargs["user_email"] == "operator@corp.com"
+
+
+# ── PUT /depots/{id}/autonomy-settings ────────────────────────────────────────
+
+
+class TestReplaceAutonomySettings:
+    """Replace the whole autonomy matrix atomically (depot:manage)."""
+
+    def test_replace_persists_rows_and_layers_defaults(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        now = datetime.now(timezone.utc)
+        conn.fetch = AsyncMock(
+            return_value=[
+                {"action_class": "charger_restart", "level": "auto_notify", "updated_at": now},
+                {"action_class": "report_draft", "level": "shadow", "updated_at": now},
+            ]
+        )
+        with patch("src.api.main.db_pools", pool):
+            resp = client.put(
+                f"/depots/{DEPOT_ID}/autonomy-settings",
+                json={
+                    "rows": [
+                        {"actionClass": "charger_restart", "level": "auto_notify"},
+                        {"actionClass": "report_draft", "level": "shadow"},
+                    ]
+                },
+                headers=AUTH_HDR,
+            )
+        assert resp.status_code == http_status.HTTP_200_OK, resp.text
+        levels = {r["actionClass"]: r["level"] for r in resp.json()["rows"]}
+        assert levels["charger_restart"] == "auto_notify"
+        assert levels["report_draft"] == "shadow"
+        # Untouched known classes still appear at the default level.
+        assert levels["soc_guardrail"] == "proposed"
+        # The replace deletes existing rows first, then INSERTs one per supplied row.
+        assert any(
+            "DELETE FROM agent_autonomy_settings" in c.args[0]
+            for c in conn.execute.await_args_list
+        )
+        inserts = [
+            c
+            for c in conn.execute.await_args_list
+            if "INSERT INTO agent_autonomy_settings" in c.args[0]
+        ]
+        assert len(inserts) == 2
+
+    def test_replace_empty_clears_to_defaults(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        conn.fetch = AsyncMock(return_value=[])
+        with patch("src.api.main.db_pools", pool):
+            resp = client.put(
+                f"/depots/{DEPOT_ID}/autonomy-settings", json={"rows": []}, headers=AUTH_HDR
+            )
+        assert resp.status_code == http_status.HTTP_200_OK, resp.text
+        levels = {r["actionClass"]: r["level"] for r in resp.json()["rows"]}
+        assert {
+            "charger_restart",
+            "session_reassign",
+            "price_reoptimize",
+            "soc_guardrail",
+            "report_draft",
+        } <= set(levels)
+        assert all(v == "proposed" for v in levels.values())
+        assert any(
+            "DELETE FROM agent_autonomy_settings" in c.args[0]
+            for c in conn.execute.await_args_list
+        )
+
+    def test_replace_rejects_invalid_level(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        with patch("src.api.main.db_pools", pool):
+            resp = client.put(
+                f"/depots/{DEPOT_ID}/autonomy-settings",
+                json={"rows": [{"actionClass": "charger_restart", "level": "bogus"}]},
+                headers=AUTH_HDR,
+            )
+        assert resp.status_code == http_status.HTTP_422_UNPROCESSABLE_ENTITY
+        conn.execute.assert_not_called()
+
+    def test_replace_rejects_duplicate_action_class(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        with patch("src.api.main.db_pools", pool):
+            resp = client.put(
+                f"/depots/{DEPOT_ID}/autonomy-settings",
+                json={
+                    "rows": [
+                        {"actionClass": "charger_restart", "level": "shadow"},
+                        {"actionClass": "charger_restart", "level": "proposed"},
+                    ]
+                },
+                headers=AUTH_HDR,
+            )
+        assert resp.status_code == http_status.HTTP_422_UNPROCESSABLE_ENTITY
+        conn.execute.assert_not_called()
+
+    def test_replace_requires_depot_manage(self, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+            _valid_user(role="viewer")
+        )
+        with patch("src.api.main.db_pools", pool):
+            resp = client.put(
+                f"/depots/{DEPOT_ID}/autonomy-settings",
+                json={"rows": [{"actionClass": "charger_restart", "level": "shadow"}]},
+                headers=AUTH_HDR,
+            )
+        assert resp.status_code == http_status.HTTP_403_FORBIDDEN
+        conn.execute.assert_not_called()
+
+
+# ── agents.action.approve — one-off report_draft generates the report only ────
+
+
+class TestApproveOneOffReportDraft:
+    """Approving a one-off report_draft generates the report and marks it executed.
+
+    The recurring schedule (for monthly_consumption) is created by the FRONTEND
+    via a separate reports.schedule.create command — which owns the idempotency
+    check and the auto_notify autonomy — so the backend must NOT create one in
+    the approve handler (that would double-create with a mismatched autonomy).
+    """
+
+    @patch("src.api.main.get_audit_logger", return_value=None)
+    def test_command_approve_generates_report_without_creating_schedule(
+        self, _audit, client, mock_db_pool
+    ):
+        from src.api import report_schedules as rs
+
+        pool, conn = mock_db_pool
+        action_id = str(uuid4())
+        payload = {"kind": "monthly_consumption", "groupBy": "card", "title": "Energy"}
+
+        async def _fetchrow(query, *args):
+            if "FROM agent_actions" in query and "FOR UPDATE" in query:
+                return {
+                    "id": action_id,
+                    "action_class": "report_draft",
+                    "status": "pending",
+                    "payload": payload,
+                }
+            if "UPDATE agent_actions" in query:
+                return {"id": action_id}
+            return None
+
+        conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main._handle_reports_generate",
+                new_callable=AsyncMock,
+                return_value={"reportId": "rep-1", "status": "draft"},
+            ) as gen,
+            patch.object(rs, "insert_schedule", new_callable=AsyncMock) as insert_sched,
+        ):
+            resp = client.post(
+                "/commands/execute",
+                json={
+                    "command": "agents.action.approve",
+                    "depot_id": DEPOT_ID,
+                    "params": {"actionId": action_id},
+                    "dry_run": False,
+                },
+                headers=AUTH_HDR,
+            )
+        assert resp.status_code == http_status.HTTP_200_OK, resp.text
+        gen.assert_awaited_once()
+        # The backend must NOT create a schedule on approval — the frontend owns it.
+        insert_sched.assert_not_called()
+        result = resp.json()["result"]
+        assert result["actionStatus"] == "executed"
+        assert result["report"]["reportId"] == "rep-1"
+        assert "scheduleCreated" not in result["report"]

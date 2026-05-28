@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import csv
 import io
-import uuid
 from datetime import date, datetime
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +23,7 @@ import pytest
 from fastapi import HTTPException, status
 from fastapi.testclient import TestClient
 
+from src.api import main as _main
 from src.api.main import app
 from src.api.reports import (
     SessionRow,
@@ -32,6 +32,7 @@ from src.api.reports import (
     csv_columns,
     stream_rows_as_csv,
 )
+from src.notifications.email_client import FakeEmailClient
 from src.security.tenant_mirror import ensure_tenant_mirrored
 
 
@@ -1887,3 +1888,250 @@ def timedelta_minutes(n: int):
     from datetime import timedelta
 
     return timedelta(minutes=n)
+
+
+# ── reports.approve delivery + report export (PDF/CSV) ───────────────────────
+
+
+def _approved_report_row(kind: str = "monthly_consumption", *, status: str = "approved"):
+    return {
+        "id": str(uuid4()),
+        "depot_id": str(uuid4()),
+        "title": "Monthly electricity consumption — 2026-04",
+        "kind": kind,
+        "status": status,
+        "group_by": "card",
+        "period_start": datetime(2026, 4, 1, tzinfo=ZoneInfo("UTC")),
+        "period_end": datetime(2026, 5, 1, tzinfo=ZoneInfo("UTC")),
+        "data": {"group_by": "card", "rows": [], "totals": None, "depot_name": "HRX"},
+    }
+
+
+def _single_conn_pool(fetchrow_row):
+    pool = MagicMock()
+    conn = AsyncMock()
+    conn.fetchrow = AsyncMock(return_value=fetchrow_row)
+    conn.transaction = MagicMock()
+    conn.transaction.return_value.__aenter__.return_value = None
+    conn.transaction.return_value.__aexit__.return_value = None
+    pool.acquire.return_value.__aenter__.return_value = conn
+    pool.acquire.return_value.__aexit__.return_value = None
+    pool.ts = pool
+    pool.static = pool
+    return pool
+
+
+class TestMarkReportApproved:
+    """_mark_report_approved flips status and resolves export_url."""
+
+    def test_monthly_consumption_sets_export_url(self):
+        import asyncio
+
+        approved_at = datetime(2026, 5, 2, tzinfo=ZoneInfo("UTC"))
+        conn = AsyncMock()
+
+        async def _fetchrow(query, *args):
+            if "FOR UPDATE" in query:
+                return {"kind": "monthly_consumption", "data": {"rows": []}}
+            return {"approved_at": approved_at}
+
+        conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        out = asyncio.run(
+            _main._mark_report_approved(
+                conn, depot_id="dep", report_id="rep-1", approved_by="u@x.com"
+            )
+        )
+        assert out["kind"] == "monthly_consumption"
+        assert out["exportUrl"] == "/depots/dep/reports/rep-1/export"
+        assert out["approvedAt"] == approved_at
+
+    def test_non_consumption_has_no_export_url(self):
+        import asyncio
+
+        conn = AsyncMock()
+
+        async def _fetchrow(query, *args):
+            if "FOR UPDATE" in query:
+                return {"kind": "incident", "data": None}
+            return {"approved_at": datetime(2026, 5, 2, tzinfo=ZoneInfo("UTC"))}
+
+        conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        out = asyncio.run(
+            _main._mark_report_approved(conn, depot_id="dep", report_id="rep-1", approved_by=None)
+        )
+        assert out["exportUrl"] is None
+
+    def test_missing_report_returns_none(self):
+        import asyncio
+
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(return_value=None)
+        out = asyncio.run(
+            _main._mark_report_approved(conn, depot_id="dep", report_id="rep-1", approved_by=None)
+        )
+        assert out is None
+
+
+class TestDeliverReportToApprover:
+    """_deliver_report_to_approver emails monthly_consumption reports to the approver."""
+
+    def test_monthly_consumption_sends_to_approver(self):
+        import asyncio
+
+        email = FakeEmailClient()
+        with patch.object(_main, "report_email_client", email), patch.object(
+            _main, "report_email_from", "noreply@favonius.io"
+        ):
+            out = asyncio.run(
+                _main._deliver_report_to_approver(
+                    report_row=_approved_report_row(),
+                    kind="monthly_consumption",
+                    export_url="/depots/dep/reports/rep-1/export",
+                    to_email="boss@depot.example",
+                )
+            )
+        assert out["status"] == "sent"
+        assert out["emailAddress"] == "boss@depot.example"
+        assert out["format"] == "pdf"
+        assert len(email.sent) == 1
+
+    def test_non_consumption_returns_none(self):
+        import asyncio
+
+        with patch.object(_main, "report_email_client", FakeEmailClient()):
+            out = asyncio.run(
+                _main._deliver_report_to_approver(
+                    report_row=_approved_report_row(kind="incident"),
+                    kind="incident",
+                    export_url=None,
+                    to_email="boss@depot.example",
+                )
+            )
+        assert out is None
+
+    def test_no_email_returns_none(self):
+        import asyncio
+
+        with patch.object(_main, "report_email_client", FakeEmailClient()):
+            out = asyncio.run(
+                _main._deliver_report_to_approver(
+                    report_row=_approved_report_row(),
+                    kind="monthly_consumption",
+                    export_url="/x",
+                    to_email=None,
+                )
+            )
+        assert out is None
+
+    def test_no_email_client_returns_none(self):
+        import asyncio
+
+        with patch.object(_main, "report_email_client", None):
+            out = asyncio.run(
+                _main._deliver_report_to_approver(
+                    report_row=_approved_report_row(),
+                    kind="monthly_consumption",
+                    export_url="/x",
+                    to_email="boss@depot.example",
+                )
+            )
+        assert out is None
+
+    def test_delivery_failure_is_caught_not_raised(self):
+        import asyncio
+
+        def _boom(_message, _n):
+            raise RuntimeError("provider exploded")
+
+        with (
+            patch.object(_main, "report_email_client", FakeEmailClient(script=_boom)),
+            patch.object(_main, "report_email_from", "noreply@favonius.io"),
+        ):
+            out = asyncio.run(
+                _main._deliver_report_to_approver(
+                    report_row=_approved_report_row(),
+                    kind="monthly_consumption",
+                    export_url="/depots/dep/reports/rep-1/export",
+                    to_email="boss@depot.example",
+                )
+            )
+        # Best-effort: the exception is swallowed and surfaced as a failed delivery.
+        assert out["status"] == "failed"
+        assert out["error"]
+
+
+class TestReportsApproveCommand:
+    """reports.approve flips status and (monthly_consumption) reports a delivery."""
+
+    @patch("src.api.main.get_audit_logger", return_value=None)
+    def test_approve_returns_delivery_for_monthly_consumption(self, _audit, client):
+        report_id = str(uuid4())
+        depot_id = str(uuid4())
+        approved_at = datetime(2026, 5, 2, tzinfo=ZoneInfo("UTC"))
+        pool = _single_conn_pool(None)
+        with patch("src.api.main.db_pools", pool), patch(
+            "src.api.main._mark_report_approved",
+            new_callable=AsyncMock,
+            return_value={
+                "kind": "monthly_consumption",
+                "exportUrl": f"/depots/{depot_id}/reports/{report_id}/export",
+                "approvedAt": approved_at,
+                "reportRow": _approved_report_row(),
+            },
+        ), patch(
+            "src.api.main._deliver_report_to_approver",
+            new_callable=AsyncMock,
+            return_value={
+                "emailAddress": "a@x.com",
+                "format": "pdf",
+                "status": "sent",
+                "providerMessageId": "fake-1",
+                "error": None,
+            },
+        ):
+            resp = client.post(
+                "/commands/execute",
+                json={
+                    "command": "reports.approve",
+                    "depot_id": depot_id,
+                    "params": {"reportId": report_id},
+                    "dry_run": False,
+                },
+                headers={"Authorization": "Bearer test"},
+            )
+        assert resp.status_code == status.HTTP_200_OK, resp.text
+        result = resp.json()["result"]
+        assert result["status"] == "approved"
+        assert result["exportUrl"].endswith("/export")
+        assert result["delivery"]["status"] == "sent"
+
+
+class TestExportReportFormat:
+    """GET /depots/{id}/reports/{id}/export — PDF (default) or CSV."""
+
+    def test_default_format_is_pdf(self, client):
+        row = _approved_report_row()
+        with patch("src.api.main.db_pools", _single_conn_pool(row)):
+            resp = client.get(f"/depots/{row['depot_id']}/reports/{row['id']}/export")
+        assert resp.status_code == status.HTTP_200_OK, resp.text
+        assert resp.headers["content-type"].startswith("application/pdf")
+        assert resp.content[:4] == b"%PDF"
+
+    def test_csv_format(self, client):
+        row = _approved_report_row()
+        with patch("src.api.main.db_pools", _single_conn_pool(row)):
+            resp = client.get(f"/depots/{row['depot_id']}/reports/{row['id']}/export?format=csv")
+        assert resp.status_code == status.HTTP_200_OK, resp.text
+        assert resp.headers["content-type"].startswith("text/csv")
+
+    def test_invalid_format_returns_422(self, client):
+        row = _approved_report_row()
+        with patch("src.api.main.db_pools", _single_conn_pool(row)):
+            resp = client.get(f"/depots/{row['depot_id']}/reports/{row['id']}/export?format=xml")
+        assert resp.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+    def test_not_approved_returns_404(self, client):
+        row = _approved_report_row(status="draft")
+        with patch("src.api.main.db_pools", _single_conn_pool(row)):
+            resp = client.get(f"/depots/{row['depot_id']}/reports/{row['id']}/export")
+        assert resp.status_code == status.HTTP_404_NOT_FOUND

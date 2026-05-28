@@ -681,3 +681,62 @@ def test_wait_for_run_finalized_returns_when_completed():
     pools = FakePools(conn)
     # Returns promptly because completed_at is already set.
     run(rs.wait_for_run_finalized(pools, "run-1", poll_interval_s=0.01, timeout_s=1.0))
+
+
+# ── deliver_report_to_email (ad-hoc single recipient, no ledger) ──────────────
+
+
+def test_deliver_report_to_email_sends_pdf_and_returns_sent():
+    client = FakeEmailClient()
+    status, msg_id, error = run(
+        rs.deliver_report_to_email(
+            client,
+            report_row=_report_row(),
+            to_email="ops@depot.example",
+            fmt="pdf",
+            default_from="noreply@favonius.io",
+        )
+    )
+    assert status == "sent"
+    assert msg_id == "fake-000001"
+    assert error is None
+    assert len(client.sent) == 1
+    msg = client.sent[0]
+    assert msg.to == "ops@depot.example"
+    assert msg.from_address == "noreply@favonius.io"
+    assert len(msg.attachments) == 1
+    assert msg.attachments[0].content_type == "application/pdf"
+
+
+def test_deliver_report_to_email_csv_attachment():
+    client = FakeEmailClient()
+    status, _msg_id, _error = run(
+        rs.deliver_report_to_email(
+            client,
+            report_row=_report_row(),
+            to_email="ops@depot.example",
+            fmt="csv",
+            default_from="noreply@favonius.io",
+        )
+    )
+    assert status == "sent"
+    assert client.sent[0].attachments[0].content_type == "text/csv"
+
+
+def test_deliver_report_to_email_surfaces_provider_failure():
+    def _script(_message, _n):
+        return DeliveryResult(status="failed", provider_message_id=None, detail={"code": 500})
+
+    client = FakeEmailClient(script=_script)
+    status, msg_id, error = run(
+        rs.deliver_report_to_email(
+            client,
+            report_row=_report_row(),
+            to_email="ops@depot.example",
+            fmt="pdf",
+            default_from="noreply@favonius.io",
+        )
+    )
+    assert status == "failed"
+    assert msg_id is None
+    assert error and "500" in error

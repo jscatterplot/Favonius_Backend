@@ -625,8 +625,13 @@ def _parse_report_data(raw: Any) -> Optional[dict]:
         return None
 
 
-def _render_attachment(fmt: str, report_row: "asyncpg.Record", parsed_data: Optional[dict]):
-    """Render the report into an EmailAttachment for the requested format."""
+def render_attachment(fmt: str, report_row: "asyncpg.Record", parsed_data: Optional[dict]):
+    """Render the report into an EmailAttachment for the requested format.
+
+    The returned EmailAttachment carries (filename, content, content_type); the
+    HTTP export endpoint reuses it directly so email and download render through
+    one path.
+    """
     from ..notifications.email_client import EmailAttachment  # lazy: keep import local
 
     kind = report_row["kind"]
@@ -663,6 +668,77 @@ def _render_attachment(fmt: str, report_row: "asyncpg.Record", parsed_data: Opti
     )
 
 
+def _build_report_message(
+    report_row: "asyncpg.Record",
+    *,
+    to_email: str,
+    attachment,
+    default_from: str,
+    scheduled: bool = False,
+):
+    """Build the EmailMessage that carries a rendered report to one recipient.
+
+    ``scheduled`` selects the lead-in copy: cron deliveries read "Your scheduled
+    report …"; ad-hoc (approve-triggered) deliveries read "Your report …".
+    """
+    from ..notifications.email_client import EmailMessage  # lazy
+
+    title = report_row["title"]
+    period_label = ""
+    if report_row["period_start"] is not None and report_row["period_end"] is not None:
+        period_label = (
+            f"{report_row['period_start'].date().isoformat()} – "
+            f"{report_row['period_end'].date().isoformat()}"
+        )
+    lead = "Your scheduled report" if scheduled else "Your report"
+    body_text = f"{lead} '{title}' is attached.\n\nPeriod: {period_label}\n"
+    body_html = (
+        f"<p>{lead} <strong>{title}</strong> is attached.</p>"
+        f"<p>Period: {period_label}</p>"
+    )
+    return EmailMessage(
+        to=to_email,
+        subject=title,
+        html=body_html,
+        text=body_text,
+        from_address=default_from,
+        attachments=[attachment],
+    )
+
+
+async def deliver_report_to_email(
+    email_client: "EmailDeliveryClient",
+    *,
+    report_row: "asyncpg.Record",
+    to_email: str,
+    fmt: str,
+    default_from: str,
+) -> tuple[str, Optional[str], Optional[str]]:
+    """Render + send one report to a single ad-hoc email address.
+
+    Unlike :func:`_deliver_to_recipients` this is not tied to a schedule_run, so
+    it writes no schedule_run_deliveries ledger row — it just sends and returns
+    the outcome for the caller to surface. Used by the ``reports.approve``
+    command, which delivers a standalone report to the approving user.
+
+    Returns (status, provider_message_id, error) where status is 'sent' or
+    'failed'.
+    """
+    parsed_data = _parse_report_data(report_row["data"])
+    try:
+        attachment = render_attachment(fmt, report_row, parsed_data)
+        message = _build_report_message(
+            report_row, to_email=to_email, attachment=attachment, default_from=default_from
+        )
+        result = await email_client.send(message)
+    except Exception as exc:  # noqa: BLE001 - any render/send error is a failed delivery
+        logger.warning("ad-hoc report delivery to %s failed: %s", to_email, exc)
+        return "failed", None, str(exc)
+    if result.ok:
+        return "sent", result.provider_message_id, None
+    return "failed", None, (json.dumps(result.detail) if result.detail else "send_failed")
+
+
 async def _deliver_to_recipients(
     pools: "DatabasePools",
     *,
@@ -681,21 +757,7 @@ async def _deliver_to_recipients(
     Returns True when every recipient was sent successfully (or there are no
     recipients to deliver to).
     """
-    from ..notifications.email_client import EmailMessage  # lazy
-
     parsed_data = _parse_report_data(report_row["data"])
-    title = report_row["title"]
-    period_label = ""
-    if report_row["period_start"] is not None and report_row["period_end"] is not None:
-        period_label = (
-            f"{report_row['period_start'].date().isoformat()} – "
-            f"{report_row['period_end'].date().isoformat()}"
-        )
-    body_text = f"Your scheduled report '{title}' is attached.\n\nPeriod: {period_label}\n"
-    body_html = (
-        f"<p>Your scheduled report <strong>{title}</strong> is attached.</p>"
-        f"<p>Period: {period_label}</p>"
-    )
 
     # Recipients already delivered for this run (e.g. a prior approve attempt that
     # partially succeeded) must not be emailed again on retry.
@@ -716,14 +778,13 @@ async def _deliver_to_recipients(
         provider_message_id: Optional[str] = None
         error: Optional[str] = None
         try:
-            attachment = _render_attachment(fmt, report_row, parsed_data)
-            message = EmailMessage(
-                to=rec["email_address"],
-                subject=title,
-                html=body_html,
-                text=body_text,
-                from_address=default_from,
-                attachments=[attachment],
+            attachment = render_attachment(fmt, report_row, parsed_data)
+            message = _build_report_message(
+                report_row,
+                to_email=rec["email_address"],
+                attachment=attachment,
+                default_from=default_from,
+                scheduled=True,
             )
             result = await email_client.send(message)
             if result.ok:
