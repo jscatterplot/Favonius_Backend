@@ -90,6 +90,7 @@ async def _run_scenario(scenario, *, ts_pool, static_pool, kind: str):
             if kind == "readiness":
                 reply = await _run_readiness_turn(
                     run_id=run_id,
+                    message=message,
                     auth=auth,
                     static_pool=stf,
                     ts_pool=tsf,
