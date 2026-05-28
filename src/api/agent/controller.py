@@ -32,7 +32,7 @@ import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Protocol
+from typing import Any, Awaitable, Callable, Optional, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -54,9 +54,11 @@ from src.api.agent.intents.consumption_by_user import (
 from src.api.agent.intents.readiness import (
     DEPARTURES_SQL,
     LATEST_PLAN_SQL,
+    PlanContext,
     ReadinessVerdict,
     SocReading,
     render_readiness_answer,
+    resolve_readiness_window,
     summarize_readiness,
 )
 from src.api.agent.intents.savings import (
@@ -440,6 +442,31 @@ async def _depot_wide_consumption_rows(
     return rows_list, window, len(tz_depots)
 
 
+# ── Deterministic-intent shared helpers ────────────────────────────────────
+
+
+async def _resolve_scoped_depots(message: str, auth: Any, static_pool: Any) -> list[UUID]:
+    """Scope a deterministic-intent turn to a depot named in the message.
+
+    The planner routes readiness/savings before entity resolution, so a
+    "…at Vilnius" / "Is Vilnius ready?" question would otherwise span every
+    visible depot. LLM-free: when the caller sees more than one depot and one
+    or more of their names appears as a whole word/phrase (case-insensitive)
+    in the message, scope to those; otherwise return all visible depots.
+    """
+    visible = list(auth.visible_depot_ids)
+    if len(visible) <= 1:
+        return visible
+    rows = await static_pool.fetch("SELECT id, name FROM sites WHERE id = ANY($1::uuid[])", visible)
+    text = (message or "").lower()
+    matched = [
+        UUID(str(row["id"]))
+        for row in rows
+        if row["name"] and re.search(r"\b" + re.escape(row["name"].lower()) + r"\b", text)
+    ]
+    return matched or visible
+
+
 # ── Readiness fast-path intent ─────────────────────────────────────────────
 
 
@@ -503,29 +530,35 @@ async def _run_readiness_turn(
 ) -> AgentReply:
     """Answer "are we ready to depart?" deterministically (no LLM call).
 
-    ``message`` is accepted for a uniform deterministic-intent handler
-    signature (see ``_DETERMINISTIC_INTENT_HANDLERS``) but unused — the
-    readiness window is always the next 24 hours.
-
     Three set-based queries — upcoming departures (static), freshest SoC per
     departing vehicle (TS), latest plan per depot (TS) — reduced to a depot
-    verdict by :func:`summarize_readiness`. Scope is ``visible_depot_ids``;
-    the window is the next 24 hours from ``now`` (forward-looking, so it is
-    timezone-robust across a multi-depot org without a per-depot "today").
+    verdict by :func:`summarize_readiness`, which aligns each vehicle's plan
+    SoC to its departure instant. Scope honours a named depot in the message
+    (``_resolve_scoped_depots``) and the look-ahead honours a day phrase
+    (``resolve_readiness_window``: "tomorrow" / "today" / default next-24h);
+    both fall back to all visible depots / next-24h when absent.
     """
     as_of = now if now is not None else datetime.now(timezone.utc)
     await emit_step("readiness")
 
-    depot_ids = list(auth.visible_depot_ids)
-    window_label = "in the next 24 hours"
-    window_end = as_of + timedelta(hours=24)
+    depot_ids = await _resolve_scoped_depots(message, auth, static_pool)
+    # A day phrase ("tomorrow"/"today") is anchored in the depot's timezone only
+    # when exactly one depot is in scope; otherwise the window stays the
+    # tz-agnostic next-24h.
+    tz_name = None
+    if len(depot_ids) == 1:
+        tz_name = (await load_depot_timezones(static_pool, depot_ids)).get(depot_ids[0])
+    window_start, window_end, window_label = resolve_readiness_window(message, as_of, tz_name)
 
     departures: list[dict[str, Any]] = []
     if depot_ids:
-        rows = await static_pool.fetch(DEPARTURES_SQL, depot_ids, as_of, window_end)
+        rows = await static_pool.fetch(DEPARTURES_SQL, depot_ids, window_start, window_end)
         departures = [dict(r) for r in rows]
     await agent_runs_step(
-        ts_pool, run_id, "readiness_departures", {"count": len(departures), "window_hours": 24}
+        ts_pool,
+        run_id,
+        "readiness_departures",
+        {"count": len(departures), "depots": len(depot_ids), "window": window_label},
     )
 
     if not departures:
@@ -535,9 +568,19 @@ async def _run_readiness_turn(
     else:
         vehicle_ids = sorted({UUID(d["vehicle_id"]) for d in departures})
         depot_uuids = sorted({UUID(d["depot_id"]) for d in departures})
-        socs = await _fetch_readiness_socs(ts_pool, vehicle_ids, as_of - timedelta(hours=24))
+        # Scan-floor for the SoC merge: 24h before the earliest thing we care
+        # about (now, or the window start if it is in the past).
+        soc_floor = min(as_of, window_start) - timedelta(hours=24)
+        socs = await _fetch_readiness_socs(ts_pool, vehicle_ids, soc_floor)
         plan_rows = await ts_pool.fetch(LATEST_PLAN_SQL, depot_uuids)
-        plans_by_depot = {str(r["depot_id"]): r["schedule_json"] for r in plan_rows}
+        plans_by_depot = {
+            str(r["depot_id"]): PlanContext(
+                schedule_json=r["schedule_json"],
+                horizon_start=r["horizon_start"],
+                horizon_end=r["horizon_end"],
+            )
+            for r in plan_rows
+        }
         verdict = summarize_readiness(
             departures,
             socs,
@@ -588,16 +631,17 @@ async def _run_savings_turn(
 ) -> AgentReply:
     """Answer "how much did we save (overnight / this month / …)?" — no LLM.
 
-    Resolves the window from the message + each depot's timezone
-    (:func:`resolve_savings_window`), reuses
-    :func:`src.api.savings.compute_savings_for_window` per visible depot, and
+    Scope honours a depot named in the message (``_resolve_scoped_depots``),
+    else all visible depots. Resolves the window from the message + each
+    depot's timezone (:func:`resolve_savings_window`), reuses
+    :func:`src.api.savings.compute_savings_for_window` per depot, and
     aggregates the euro figures. Each depot computes its own window in its own
     timezone, so a multi-timezone org's "overnight" is correct per site.
     """
     as_of = now if now is not None else datetime.now(timezone.utc)
     await emit_step("savings")
 
-    depot_ids = list(auth.visible_depot_ids)
+    depot_ids = await _resolve_scoped_depots(message, auth, static_pool)
     if not depot_ids:
         reply = AgentReply(
             run_id=run_id,
@@ -710,7 +754,7 @@ async def _run_savings_turn(
 # dispatches by route through this registry so adding intent #3 is a handler +
 # one entry here (no new branch). The consumption fast path and sql_general have
 # their own richer flows and are dispatched explicitly in run_turn.
-_DETERMINISTIC_INTENT_HANDLERS: dict[str, Any] = {
+_DETERMINISTIC_INTENT_HANDLERS: dict[str, Callable[..., Awaitable[AgentReply]]] = {
     "savings": _run_savings_turn,
     "readiness": _run_readiness_turn,
 }

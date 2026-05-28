@@ -31,9 +31,11 @@ Reuse:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from src.api.agent_workflows.plan_parsing import extract_vehicle_plan
 
@@ -83,7 +85,9 @@ DEPARTURES_SQL = """
 LATEST_PLAN_SQL = """
     SELECT DISTINCT ON (depot_id)
         depot_id::text AS depot_id,
-        schedule_json
+        schedule_json,
+        horizon_start,
+        horizon_end
     FROM optimization_runs
     WHERE depot_id = ANY($1::uuid[])
       AND status NOT IN ('infeasible', 'timeout')
@@ -100,6 +104,20 @@ class SocReading:
 
     soc: float
     time: datetime
+
+
+@dataclass(frozen=True)
+class PlanContext:
+    """One depot's latest optimization plan plus the horizon it covers.
+
+    ``horizon_start`` / ``horizon_end`` let the reader align a per-timestep
+    SoC trajectory to a departure instant (and reject a plan whose horizon
+    doesn't cover the departure — a stale run).
+    """
+
+    schedule_json: Any
+    horizon_start: Optional[datetime]
+    horizon_end: Optional[datetime]
 
 
 @dataclass(frozen=True)
@@ -144,28 +162,43 @@ class ReadinessVerdict:
         return STATUS_READY
 
 
-def projected_soc_from_plan(schedule_json: Any, vehicle_id: str) -> Optional[float]:
-    """Best projected SoC for one vehicle from an optimization run's plan.
+def projected_soc_at_departure(
+    plan: Optional[PlanContext],
+    vehicle_id: str,
+    departure_time: datetime,
+) -> Optional[float]:
+    """Projected SoC for one vehicle AT its departure instant.
 
-    ``schedule_json`` may arrive as a JSONB ``dict`` or a serialized
-    ``str`` (asyncpg leaves JSONB as text unless a codec is set); the
-    str-vs-dict / schedule / per-vehicle walk is shared with
+    Aligns the per-timestep ``soc`` trajectory to ``departure_time`` using the
+    run's horizon, rather than taking the trajectory peak — ``max(soc)`` would
+    credit charge scheduled *after* the vehicle has already left, marking a
+    near-term departure ready on the strength of a late-horizon charge.
+
+    Returns ``None`` (→ caller falls back to current SoC) when the vehicle has
+    no plan, the plan carries no usable horizon, or the horizon does not cover
+    ``departure_time`` (a stale / out-of-range run). The str-vs-dict /
+    schedule / per-vehicle walk is shared with
     ``readiness_tools._make_get_charging_plan`` via
     :func:`~src.api.agent_workflows.plan_parsing.extract_vehicle_plan`.
-    Returns the **maximum** projected SoC over the trajectory as a v1 proxy
-    for "SoC reached by departure": a feasible plan charges to ≥ required by
-    departure, so the peak is the most charitable estimate and avoids a false
-    "at risk" from a post-departure discharge tail. ``None`` when the vehicle
-    has no plan.
     """
-    per_vehicle = extract_vehicle_plan(schedule_json, vehicle_id)
+    if plan is None:
+        return None
+    per_vehicle = extract_vehicle_plan(plan.schedule_json, vehicle_id)
     if per_vehicle is None:
         return None
     socs = per_vehicle.get("soc")
     if not isinstance(socs, list) or not socs:
         return None
-    numeric = [float(s) for s in socs if isinstance(s, (int, float))]
-    return max(numeric) if numeric else None
+    hs, he = plan.horizon_start, plan.horizon_end
+    if hs is None or he is None:
+        return None
+    span = (he - hs).total_seconds()
+    if span <= 0 or departure_time < hs or departure_time >= he:
+        return None
+    frac = (departure_time - hs).total_seconds() / span
+    idx = min(int(frac * len(socs)), len(socs) - 1)
+    value = socs[idx]
+    return float(value) if isinstance(value, (int, float)) else None
 
 
 def summarize_readiness(
@@ -194,7 +227,7 @@ def summarize_readiness(
             ``vehicle_id``, ``depot_id``, ``route_id``, ``departure_time``,
             ``required_soc``).
         socs: ``vehicle_id`` → :class:`SocReading` (freshest reading).
-        plans_by_depot: ``depot_id`` → raw ``schedule_json`` for the depot's
+        plans_by_depot: ``depot_id`` → :class:`PlanContext` for the depot's
             latest optimization run.
         now: Current instant (UTC-aware) — the staleness anchor.
         max_age: Telemetry staleness threshold (``MAX_TELEMETRY_AGE``).
@@ -205,30 +238,26 @@ def summarize_readiness(
     Returns:
         A :class:`ReadinessVerdict`.
     """
-    # A vehicle can have several departures inside the window (e.g. a return
-    # then an outbound leg). Judge each vehicle ONCE against its most binding
-    # (earliest) upcoming departure so the verdict counts unique vehicles, not
-    # schedule rows — otherwise total/ready/at_risk inflate and the answer
-    # lists the same vehicle twice.
-    earliest: dict[str, dict[str, Any]] = {}
+    # Evaluate EVERY in-window departure against its own departure-time SoC,
+    # then collapse to ONE verdict per vehicle = its WORST departure. This
+    # counts unique vehicles (not schedule rows) while still flagging a vehicle
+    # that is fine for an early low-SoC trip but at risk for a later trip that
+    # needs a higher SoC.
+    worst: dict[str, VehicleReadiness] = {}
     for row in departures:
-        vid = str(row["vehicle_id"])
-        prior = earliest.get(vid)
-        if prior is None or row["departure_time"] < prior["departure_time"]:
-            earliest[vid] = row
-
-    vehicles: list[VehicleReadiness] = []
-    for row in earliest.values():
         vehicle_id = str(row["vehicle_id"])
         depot_id = str(row["depot_id"])
         route_id = row.get("route_id")
         required = row.get("required_soc")
         required_soc = float(required) if required is not None else required_soc_default
+        departure_time = row["departure_time"]
 
         reading = socs.get(vehicle_id)
         fresh = reading is not None and (now - reading.time) <= max_age
         current_soc = reading.soc if reading is not None else None
-        projected = projected_soc_from_plan(plans_by_depot.get(depot_id), vehicle_id)
+        projected = projected_soc_at_departure(
+            plans_by_depot.get(depot_id), vehicle_id, departure_time
+        )
 
         status, reason = _judge_vehicle(
             required_soc=required_soc,
@@ -236,20 +265,22 @@ def summarize_readiness(
             current_soc=current_soc,
             fresh=fresh,
         )
-        vehicles.append(
-            VehicleReadiness(
-                vehicle_id=vehicle_id,
-                depot_id=depot_id,
-                route_id=route_id,
-                departure_time=row["departure_time"],
-                required_soc=required_soc,
-                status=status,
-                reason=reason,
-                current_soc=current_soc,
-                projected_soc=projected,
-            )
+        candidate = VehicleReadiness(
+            vehicle_id=vehicle_id,
+            depot_id=depot_id,
+            route_id=route_id,
+            departure_time=departure_time,
+            required_soc=required_soc,
+            status=status,
+            reason=reason,
+            current_soc=current_soc,
+            projected_soc=projected,
         )
+        incumbent = worst.get(vehicle_id)
+        if incumbent is None or _STATUS_SEVERITY[status] > _STATUS_SEVERITY[incumbent.status]:
+            worst[vehicle_id] = candidate
 
+    vehicles = list(worst.values())
     ready = sum(1 for v in vehicles if v.status == STATUS_READY)
     at_risk = sum(1 for v in vehicles if v.status == STATUS_AT_RISK)
     unknown = sum(1 for v in vehicles if v.status == STATUS_UNKNOWN)
@@ -318,3 +349,50 @@ def render_readiness_answer(verdict: ReadinessVerdict) -> str:
         lines.append(f"{len(uncertain)} {verb} a check: {details}.")
 
     return " ".join(lines)
+
+
+_READINESS_DEFAULT_HOURS = 24
+
+
+def _safe_zone(tz_name: Optional[str]) -> ZoneInfo:
+    """IANA tz name → ``ZoneInfo``, degrading to UTC on missing/invalid input."""
+    if tz_name:
+        try:
+            return ZoneInfo(tz_name)
+        except Exception:  # noqa: BLE001 - any bad zone name → UTC
+            return ZoneInfo("UTC")
+    return ZoneInfo("UTC")
+
+
+def resolve_readiness_window(
+    message: str,
+    now: datetime,
+    tz_name: Optional[str],
+) -> tuple[datetime, datetime, str]:
+    """Resolve the readiness look-ahead window + label from the message.
+
+    Honours the day phrase the planner already routes here:
+      * ``tomorrow`` → all of tomorrow (depot-local calendar day);
+      * ``today`` / ``this morning|afternoon|evening`` / ``tonight`` →
+        ``now`` → end of today (depot-local);
+      * otherwise → ``[now, now + 24h)`` labelled "in the next 24 hours".
+
+    ``tz_name`` (the depot's timezone, when a single depot is in scope)
+    anchors the calendar-day boundaries; ``None`` degrades to UTC.
+    """
+    text = (message or "").lower()
+    tz = _safe_zone(tz_name)
+    local_now = now.astimezone(tz)
+
+    if re.search(r"\btomorrow\b", text):
+        d = (local_now + timedelta(days=1)).date()
+        start_local = datetime(d.year, d.month, d.day, tzinfo=tz)
+        end_local = start_local + timedelta(days=1)
+        return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc), "tomorrow"
+
+    if re.search(r"\b(today|this morning|this afternoon|this evening|tonight)\b", text):
+        d = local_now.date()
+        end_local = datetime(d.year, d.month, d.day, tzinfo=tz) + timedelta(days=1)
+        return now, end_local.astimezone(timezone.utc), "for the rest of today"
+
+    return now, now + timedelta(hours=_READINESS_DEFAULT_HOURS), "in the next 24 hours"
