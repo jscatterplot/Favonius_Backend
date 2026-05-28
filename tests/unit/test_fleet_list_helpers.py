@@ -247,9 +247,9 @@ class TestDeriveVehicleState:
             == "at_risk"
         )
 
-    def test_missing_current_soc_falls_through_to_at_risk(self):
-        # No SoC means we can't claim "ready"; default to the conservative
-        # at_risk so the operator sees the row in the FleetReadiness card.
+    def test_missing_current_soc_is_offline(self):
+        # No SoC means we can't assess the vehicle; treat as offline rather
+        # than at_risk so operators see a data-gap, not a false alarm.
         assert (
             derive_vehicle_state(
                 last_seen_at=_ago(10),
@@ -259,7 +259,7 @@ class TestDeriveVehicleState:
                 required_soc=1.0,
                 now=NOW,
             )
-            == "at_risk"
+            == "offline"
         )
 
 
