@@ -332,7 +332,29 @@ Per-depot autonomy matrix. Defaults are returned for the five known action class
 }
 ```
 
-`level` values: `shadow | proposed | auto_notify | auto_silent`. Writes go through `agents.autonomy.set` on `POST /commands/execute`.
+`level` values: `shadow | proposed | auto_notify | auto_silent`. Single-row writes go through `agents.autonomy.set` on `POST /commands/execute`; a full-matrix replace goes through `PUT` below.
+
+---
+
+### PUT /depots/{depot_id}/autonomy-settings
+Replace the **entire** persisted autonomy matrix for the depot, atomically. Requires `depot:manage` (operator+). The request body is the row set to persist; unspecified action classes fall back to defaults in the response (the response shape matches `GET`). Each `level` must be one of `shadow | proposed | auto_notify | auto_silent`; a missing/invalid level or a duplicate `actionClass` returns `422`.
+
+**Request:**
+```json
+{
+    "rows": [
+        {"actionClass": "charger_restart", "level": "auto_notify"},
+        {"actionClass": "report_draft", "level": "shadow"}
+    ]
+}
+```
+
+An empty `rows` array clears all persisted overrides (the matrix returns to defaults).
+
+---
+
+### GET /depots/{depot_id}/reports/{report_id}/export
+Render an approved report. `?format=pdf` (default) returns `application/pdf`; `?format=csv` streams the aggregated rows as `text/csv`. Only available for `approved` reports that carry stored data (404 otherwise); an unknown `format` returns `422`. `Content-Disposition` carries the filename.
 
 ---
 
@@ -346,7 +368,7 @@ Unified command dispatcher (see CLAUDE.md endpoint table for the full command li
 | `agents.action.rollback` | `{actionId}` | `depot:manage` |
 | `agents.autonomy.set` | `{actionClass, level}` | `depot:manage` |
 
-`agents.action.approve` on a `report_draft` action triggers a `reports.generate` with the action's `payload` and flips the action to `executed`. `agents.autonomy.set` upserts a row in `agent_autonomy_settings`; `level` must be one of `shadow | proposed | auto_notify | auto_silent`. Set `dry_run: true` to validate without writes. Every execution writes `COMMAND_EXECUTED` to the security audit log.
+`agents.action.approve` on a schedule-originated `report_draft` (payload carries `runId`+`scheduleId`) delivers the already-generated report and flips the originating run to `succeeded`. On a **one-off** `report_draft` (no `scheduleId`) it generates the report and flips the action to `executed`. It does **not** create a recurring schedule — the frontend does that by firing a separate `reports.schedule.create` (monthly, `auto_notify`, recipient = the approving user) right after the approve, and owns the "is one already active?" idempotency check. `agents.autonomy.set` upserts a single row in `agent_autonomy_settings`; `level` must be one of `shadow | proposed | auto_notify | auto_silent` (use `PUT /depots/{id}/autonomy-settings` to replace the whole matrix). Set `dry_run: true` to validate without writes. Every execution writes `COMMAND_EXECUTED` to the security audit log.
 
 **Request:**
 ```json
