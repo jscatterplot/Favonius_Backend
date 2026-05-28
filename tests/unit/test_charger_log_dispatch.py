@@ -202,6 +202,70 @@ async def test_dispatch_refuses_when_base_url_unset(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_uses_derived_base_url_when_env_unset(monkeypatch):
+    """With the env var unset, a caller-derived base_url drives the URL."""
+    monkeypatch.delenv("CHARGER_LOG_UPLOAD_BASE_URL", raising=False)
+    from src.adapters.ocpp.dispatch import dispatch_get_diagnostics
+
+    conn = _FakeConn()
+    pool = _FakePool(conn)
+
+    await dispatch_get_diagnostics(
+        pool,
+        station_id="OCPP-DERIVE",
+        base_url="https://derived.example/internal/charger_logs/upload",
+    )
+
+    payload = json.loads(conn.calls[1][2][2])
+    assert payload["location"].startswith(
+        "https://derived.example/internal/charger_logs/upload?"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_env_base_url_wins_over_derived(monkeypatch):
+    """Explicit CHARGER_LOG_UPLOAD_BASE_URL overrides a derived base_url.
+
+    The env var is the operator's escape hatch for split-ingress setups,
+    so it must take precedence over the request-derived value.
+    """
+    monkeypatch.setenv(
+        "CHARGER_LOG_UPLOAD_BASE_URL",
+        "https://explicit.example/internal/charger_logs/upload",
+    )
+    from src.adapters.ocpp.dispatch import dispatch_get_diagnostics
+
+    conn = _FakeConn()
+    pool = _FakePool(conn)
+
+    await dispatch_get_diagnostics(
+        pool,
+        station_id="OCPP-OVERRIDE",
+        base_url="https://derived.example/internal/charger_logs/upload",
+    )
+
+    payload = json.loads(conn.calls[1][2][2])
+    assert payload["location"].startswith(
+        "https://explicit.example/internal/charger_logs/upload?"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_refuses_when_neither_env_nor_derived(monkeypatch):
+    """No env var and no derived base_url → RuntimeError, no DB writes."""
+    monkeypatch.delenv("CHARGER_LOG_UPLOAD_BASE_URL", raising=False)
+    from src.adapters.ocpp.dispatch import dispatch_get_diagnostics
+
+    conn = _FakeConn()
+    pool = _FakePool(conn)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await dispatch_get_diagnostics(pool, station_id="OCPP-NONE", base_url=None)
+    assert "CHARGER_LOG_UPLOAD_BASE_URL" in str(excinfo.value)
+    assert conn.calls == []
+
+
+@pytest.mark.asyncio
 async def test_dispatch_propagates_unique_violation():
     """Idempotency-key collision must surface so the endpoint can 409."""
     import asyncpg
