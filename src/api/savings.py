@@ -110,7 +110,9 @@ def overnight_window_utc(now_utc: datetime, tz_name: Optional[str]) -> tuple[dat
     tz = _safe_zone(tz_name)
     local_now = now_utc.astimezone(tz)
     end_local = local_now.replace(hour=OVERNIGHT_END_HOUR, minute=0, second=0, microsecond=0)
-    start_local = (local_now - timedelta(days=1)).replace(
+    if local_now < end_local:
+        end_local -= timedelta(days=1)
+    start_local = (end_local - timedelta(days=1)).replace(
         hour=OVERNIGHT_START_HOUR, minute=0, second=0, microsecond=0
     )
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)

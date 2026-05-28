@@ -45,6 +45,14 @@ def test_overnight_winter_window_edges_and_duration():
     assert start < end
 
 
+def test_overnight_before_end_hour_returns_last_completed_night():
+    # 03:00 local (UTC+2 winter) should return the previous completed window.
+    now = datetime(2026, 1, 15, 1, 0, tzinfo=timezone.utc)
+    start, end = overnight_window_utc(now, "Europe/Vilnius")
+    assert _local(start) == datetime(2026, 1, 13, 17, 0, tzinfo=VILNIUS)
+    assert _local(end) == datetime(2026, 1, 14, 7, 0, tzinfo=VILNIUS)
+
+
 def test_overnight_summer_window_edges():
     now = datetime(2026, 7, 15, 9, 0, tzinfo=timezone.utc)
     start, end = overnight_window_utc(now, "Europe/Vilnius")
