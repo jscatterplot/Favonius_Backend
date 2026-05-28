@@ -1092,7 +1092,7 @@ test(api): add coverage for handoff rate limiting
 Consumed only by `scripts/onboard_depot_from_kempower.py` — the running API does not call ChargEye.
 | Variable | Default | Description |
 |---|---|---|
-| `KEMPOWER_API_BASE_URL` | `https://api.chargeye.com` | ChargEye REST API base URL. Override for sandbox / on-prem deployments. |
+| `KEMPOWER_API_BASE_URL` | `https://kempower.io/api` | ChargEye REST API base URL. Override for sandbox / on-prem deployments. |
 | `KEMPOWER_USERNAME` | — | ChargEye account login. The CLI exchanges this + password for a JWT cached for the documented 8 h TTL. |
 | `KEMPOWER_PASSWORD` | — | ChargEye account password. Runtime-only secret (never bake into a Docker build arg). If absent and a username is set, the CLI prompts on stdin. |
 

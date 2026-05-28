@@ -42,7 +42,10 @@ class KempowerClientError(RestClientError):
 class KempowerClient(BaseRestClient):
     """Async client for the Kempower ChargEye REST API."""
 
-    DEFAULT_BASE_URL = "https://api.chargeye.com"
+    # ChargEye's REST API shares the kempower.io host with the auth endpoint
+    # above (``…/api/auth/refreshAccessToken``); resource paths hang off ``/api``.
+    # (The old ``api.chargeye.com`` default does not resolve in public DNS.)
+    DEFAULT_BASE_URL = "https://kempower.io/api"
 
     def __init__(
         self,

@@ -274,6 +274,25 @@ async def test_missing_credentials_raises():
 
 
 @pytest.mark.asyncio
+async def test_default_base_url_is_live_kempower_host(monkeypatch):
+    # api.chargeye.com does not resolve in public DNS; the live ChargEye API
+    # shares the kempower.io host with the auth endpoint and hangs off /api.
+    monkeypatch.delenv("KEMPOWER_API_BASE_URL", raising=False)
+    c = KempowerClient(refresh_token="tok")
+    assert c._base_url == "https://kempower.io/api"
+    await c.aclose()
+
+
+@pytest.mark.asyncio
+async def test_env_base_url_overrides_default(monkeypatch):
+    monkeypatch.setenv("KEMPOWER_API_BASE_URL", "https://sandbox.example/api/")
+    c = KempowerClient(refresh_token="tok")
+    # Trailing slash is stripped by the base client.
+    assert c._base_url == "https://sandbox.example/api"
+    await c.aclose()
+
+
+@pytest.mark.asyncio
 async def test_explicit_basic_auth_not_overridden_by_env_refresh_token(monkeypatch):
     monkeypatch.setenv("KEMPOWER_REFRESH_TOKEN", "env-refresh-tok")
     c = KempowerClient(username="u", password="p", base_url=_BASE)
