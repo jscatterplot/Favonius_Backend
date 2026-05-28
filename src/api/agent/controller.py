@@ -31,9 +31,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Protocol
 from uuid import UUID
 
+import asyncpg
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.api.agent import budget
@@ -49,6 +51,21 @@ from src.api.agent.auth_context import ResolvedEntity, ResolvedTimeWindow, build
 from src.api.agent.intents.consumption_by_user import (
     compile_consumption_by_user,
     summarize_consumption_rows,
+)
+from src.api.agent.intents.readiness import (
+    DEPARTURES_SQL,
+    LATEST_PLAN_SQL,
+    MERGED_SOC_SQL,
+    TELEMETRY_ONLY_SOC_SQL,
+    ReadinessVerdict,
+    SocReading,
+    render_readiness_answer,
+    summarize_readiness,
+)
+from src.api.agent.intents.savings import (
+    classify_savings_window,
+    render_savings_answer,
+    resolve_savings_window,
 )
 from src.api.agent.llm_router import (
     configured_default_model,
@@ -70,11 +87,13 @@ from src.api.agent.stream import SSEEventStream
 from src.api.agent.view_context import AgentViewContext, build_page_context_payload
 from src.api.agent_workflows.runtime import ToolNotAllowedError, run_qa_turn
 from src.api.agent_workflows.tools import ToolNotRegisteredError
+from src.api.savings import compute_savings_for_window
 from src.monitoring.metrics import (
     AGENT_RESOLVER_MISSES,
     AGENT_SQL_BUDGET_REFUSED,
     AGENT_SQL_TOOL_TURNS,
 )
+from src.security.data_freshness import MAX_TELEMETRY_AGE
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +300,9 @@ _STEP_LABELS: dict[str, str] = {
     "resolve_entities": "Finding who and what you mentioned",
     "compile": "Preparing the query",
     "execute": "Fetching the data",
+    # Readiness + savings deterministic fast-path intents.
+    "readiness": "Checking departure readiness",
+    "savings": "Calculating your savings",
     # SQL-mode tools. The SSE event name stays "tool_call"; the tool name is
     # the label key.
     "list_tables": "Reviewing the available data",
@@ -421,6 +443,207 @@ async def _depot_wide_consumption_rows(
     return rows_list, window, len(tz_depots)
 
 
+# ── Readiness fast-path intent ─────────────────────────────────────────────
+
+
+async def _fetch_readiness_socs(
+    ts_pool: Any,
+    vehicle_ids: list[UUID],
+    recency_floor: datetime,
+) -> dict[str, SocReading]:
+    """Freshest SoC per vehicle from the merged telemetry feeds.
+
+    Mirrors ``StateAssembler._get_vehicle_socs``: tries the merged
+    ``telemetry`` + ``vehicle_telemetry`` query and falls back to
+    charger-telemetry-only when ``vehicle_telemetry`` is absent (migration
+    044 not yet applied). One query, set-based over the vehicle set.
+    """
+    if not vehicle_ids:
+        return {}
+    try:
+        rows = await ts_pool.fetch(MERGED_SOC_SQL, vehicle_ids, recency_floor)
+    except asyncpg.exceptions.UndefinedTableError:
+        logger.warning("vehicle_telemetry missing; readiness using charger telemetry only")
+        rows = await ts_pool.fetch(TELEMETRY_ONLY_SOC_SQL, vehicle_ids, recency_floor)
+    socs: dict[str, SocReading] = {}
+    for row in rows:
+        if row["soc"] is None:
+            continue
+        socs[str(row["vehicle_id"])] = SocReading(soc=float(row["soc"]), time=row["time"])
+    return socs
+
+
+async def _run_readiness_turn(
+    *,
+    run_id: UUID,
+    auth: Any,
+    static_pool: Any,
+    ts_pool: Any,
+    sse: Optional[SSEEventStream],
+    emit_step: Any,
+    now: Optional[datetime] = None,
+) -> AgentReply:
+    """Answer "are we ready to depart?" deterministically (no LLM call).
+
+    Three set-based queries — upcoming departures (static), freshest SoC per
+    departing vehicle (TS), latest plan per depot (TS) — reduced to a depot
+    verdict by :func:`summarize_readiness`. Scope is ``visible_depot_ids``;
+    the window is the next 24 hours from ``now`` (forward-looking, so it is
+    timezone-robust across a multi-depot org without a per-depot "today").
+    """
+    as_of = now if now is not None else datetime.now(timezone.utc)
+    await emit_step("readiness")
+
+    depot_ids = list(auth.visible_depot_ids)
+    window_label = "in the next 24 hours"
+    window_end = as_of + timedelta(hours=24)
+
+    departures: list[dict[str, Any]] = []
+    if depot_ids:
+        rows = await static_pool.fetch(DEPARTURES_SQL, depot_ids, as_of, window_end)
+        departures = [dict(r) for r in rows]
+    await agent_runs_step(
+        ts_pool, run_id, "readiness_departures", {"count": len(departures), "window_hours": 24}
+    )
+
+    if not departures:
+        verdict = ReadinessVerdict(
+            window_label=window_label, total=0, ready=0, at_risk=0, unknown=0, vehicles=[]
+        )
+    else:
+        vehicle_ids = sorted({UUID(d["vehicle_id"]) for d in departures})
+        depot_uuids = sorted({UUID(d["depot_id"]) for d in departures})
+        socs = await _fetch_readiness_socs(ts_pool, vehicle_ids, as_of - timedelta(hours=24))
+        plan_rows = await ts_pool.fetch(LATEST_PLAN_SQL, depot_uuids)
+        plans_by_depot = {str(r["depot_id"]): r["schedule_json"] for r in plan_rows}
+        verdict = summarize_readiness(
+            departures,
+            socs,
+            plans_by_depot,
+            now=as_of,
+            max_age=MAX_TELEMETRY_AGE,
+            window_label=window_label,
+        )
+
+    await agent_runs_step(
+        ts_pool,
+        run_id,
+        "readiness_verdict",
+        {
+            "total": verdict.total,
+            "ready": verdict.ready,
+            "at_risk": verdict.at_risk,
+            "unknown": verdict.unknown,
+            "overall": verdict.overall,
+        },
+    )
+    text = render_readiness_answer(verdict)
+    await write_agent_query_audit(
+        ts_pool, auth, run_id, "readiness", verdict.total, target_type="schedules"
+    )
+    reply = AgentReply.success(run_id=run_id, intent="readiness", text=text)
+    await agent_runs_close(ts_pool, run_id, "success", reply)
+    await _emit_answer_safe(sse, reply, run_id)
+    return reply
+
+
+# ── Savings fast-path intent ───────────────────────────────────────────────
+
+
+async def _run_savings_turn(
+    *,
+    run_id: UUID,
+    message: str,
+    auth: Any,
+    static_pool: Any,
+    ts_pool: Any,
+    sse: Optional[SSEEventStream],
+    emit_step: Any,
+    now: Optional[datetime] = None,
+) -> AgentReply:
+    """Answer "how much did we save (overnight / this month / …)?" — no LLM.
+
+    Resolves the window from the message + each depot's timezone
+    (:func:`resolve_savings_window`), reuses
+    :func:`src.api.savings.compute_savings_for_window` per visible depot, and
+    aggregates the euro figures. Each depot computes its own window in its own
+    timezone, so a multi-timezone org's "overnight" is correct per site.
+    """
+    as_of = now if now is not None else datetime.now(timezone.utc)
+    await emit_step("savings")
+
+    depot_ids = list(auth.visible_depot_ids)
+    if not depot_ids:
+        reply = AgentReply(
+            run_id=run_id,
+            status="not_found",
+            text="I couldn't find any depots in your account to calculate savings for.",
+            intent="savings",
+        )
+        await agent_runs_close(ts_pool, run_id, "not_found", reply)
+        await _emit_answer_safe(sse, reply, run_id)
+        return reply
+
+    depot_tzs = await load_depot_timezones(static_pool, depot_ids)
+    kind = classify_savings_window(message)
+
+    total_actual = 0.0
+    total_baseline = 0.0
+    label = "this month so far"
+    succeeded = 0
+    for depot_id in depot_ids:
+        window = resolve_savings_window(message, as_of, depot_tzs.get(depot_id))
+        label = window.label
+        try:
+            summary = await compute_savings_for_window(
+                static_pool,
+                ts_pool,
+                str(depot_id),
+                period_start=window.period_start,
+                period_end=window.period_end,
+                now=as_of,
+            )
+        except ValueError:
+            # Depot vanished between auth scope and lookup — skip, don't abort.
+            continue
+        total_actual += summary.current_month_eur
+        total_baseline += summary.baseline_month_eur
+        succeeded += 1
+
+    actual = round(total_actual, 2)
+    baseline = round(total_baseline, 2)
+    saved = round(baseline - actual, 2)
+    saved_pct = round((saved / abs(baseline)) * 100.0, 1) if baseline != 0 else 0.0
+
+    await agent_runs_step(
+        ts_pool,
+        run_id,
+        "savings_window",
+        {
+            "kind": kind,
+            "label": label,
+            "depots": succeeded,
+            "actual_eur": actual,
+            "baseline_eur": baseline,
+        },
+    )
+    text = render_savings_answer(
+        actual_eur=actual,
+        baseline_eur=baseline,
+        saved_eur=saved,
+        saved_pct=saved_pct,
+        label=label,
+        depot_count=succeeded,
+    )
+    await write_agent_query_audit(
+        ts_pool, auth, run_id, "savings", succeeded, target_type="charging_sessions"
+    )
+    reply = AgentReply.success(run_id=run_id, intent="savings", text=text)
+    await agent_runs_close(ts_pool, run_id, "success", reply)
+    await _emit_answer_safe(sse, reply, run_id)
+    return reply
+
+
 # ── Orchestrator ───────────────────────────────────────────────────────────
 
 
@@ -504,6 +727,27 @@ async def run_turn(
             await agent_runs_close(ts_pool, run_id, "not_found", reply)
             await _emit_answer_safe(sse, reply, run_id)
             return reply
+
+        if decision.route == "savings":
+            return await _run_savings_turn(
+                run_id=run_id,
+                message=message,
+                auth=auth,
+                static_pool=static_pool,
+                ts_pool=ts_pool,
+                sse=sse,
+                emit_step=_emit_step,
+            )
+
+        if decision.route == "readiness":
+            return await _run_readiness_turn(
+                run_id=run_id,
+                auth=auth,
+                static_pool=static_pool,
+                ts_pool=ts_pool,
+                sse=sse,
+                emit_step=_emit_step,
+            )
 
         if decision.route == "sql_general":
             return await _run_sql_general_turn(

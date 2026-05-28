@@ -32,7 +32,7 @@ from uuid import UUID
 logger = logging.getLogger(__name__)
 
 
-Route = Literal["consumption_by_user", "sql_general", "refuse"]
+Route = Literal["consumption_by_user", "readiness", "savings", "sql_general", "refuse"]
 
 
 @dataclass(frozen=True)
@@ -75,6 +75,27 @@ _CONSUMPTION_ANTIPATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bfault"),
     re.compile(r"\bschedule"),
     re.compile(r"\bopt(imization|imisation) (run|trigger)"),
+)
+
+# Deterministic fast-path intents that pre-empt the consumption / SQL routes.
+# Both are precision-first and checked BEFORE consumption so a "how much did
+# we save by charging…" question lands on savings rather than the consumption
+# trigger it would otherwise match. Neither depends on SQL mode — like the
+# consumption fast path, they answer with their own deterministic handler.
+
+# "save / saved / saving / savings" — in a depot-analytics chat this
+# overwhelmingly means cost savings vs an unmanaged baseline.
+_SAVINGS_TRIGGERS: tuple[re.Pattern[str], ...] = (re.compile(r"\bsav(?:e|ed|ing|ings)\b"),)
+
+# Departure-readiness phrasing. Kept tight so ops/status questions that merely
+# say "active" or "available" do not get pulled in.
+_READINESS_TRIGGERS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\breadiness\b"),
+    re.compile(
+        r"\bready\s+(?:to\s+(?:depart|leave|roll|go)|"
+        r"for\s+(?:departure|departures|tomorrow|today|the\s+morning|service))\b"
+    ),
+    re.compile(r"\b(?:are|is)\b[^?]*\bready\b"),
 )
 
 
@@ -128,7 +149,10 @@ def classify(
 
     Returns:
         A :class:`PlannerDecision` whose ``route`` is one of
-        ``consumption_by_user`` / ``sql_general`` / ``refuse``.
+        ``savings`` / ``readiness`` / ``consumption_by_user`` /
+        ``sql_general`` / ``refuse``. ``savings`` and ``readiness`` are
+        deterministic fast-path intents matched first, independent of SQL
+        mode.
 
         ``refuse`` is returned when SQL mode is disabled (globally or
         for this org) AND the message does not look like a consumption
@@ -137,6 +161,14 @@ def classify(
     text = (message or "").strip().lower()
     if not text:
         return PlannerDecision(route="refuse", reason="empty_message")
+
+    # Deterministic fast-path intents win first (independent of SQL mode).
+    # Savings precedes consumption: "how much did we save by charging…" would
+    # otherwise match the consumption trigger.
+    if any(p.search(text) for p in _SAVINGS_TRIGGERS):
+        return PlannerDecision(route="savings", reason="matched_savings_trigger")
+    if any(p.search(text) for p in _READINESS_TRIGGERS):
+        return PlannerDecision(route="readiness", reason="matched_readiness_trigger")
 
     consumption_match = any(p.search(text) for p in _CONSUMPTION_TRIGGERS)
     anti_match = any(p.search(text) for p in _CONSUMPTION_ANTIPATTERNS)

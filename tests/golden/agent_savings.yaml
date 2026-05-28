@@ -1,0 +1,62 @@
+# Savings fast-path golden scenarios (deterministic intent — no LLM).
+#
+# Replayed by tests/golden/test_agent_intents_golden.py::test_savings_golden:
+# each graph_snapshot is loaded into a rolled-back savepoint on the TS+static
+# test pair, then src.api.agent.controller._run_savings_turn is called with
+# scenario_now injected and the rendered answer is asserted.
+#
+# Savings reuses src.api.savings.compute_savings_for_window per visible depot.
+# Baseline = total_energy_kwh × AVG(day-ahead price) over the window; saved =
+# baseline − actual cost_total. Prices are EUR/MWh (÷1000 → EUR/kWh), keyed by
+# the depot's bidding zone (sites.tariff_config.entsoe_zone). Sessions match by
+# site_id (no chargers needed). Window maths/DST are unit-tested in
+# tests/unit/agent/test_savings_window.py; this gate proves the aggregation
+# runs against the real schema.
+#
+# Depot tz Europe/Vilnius (summer = UTC+3): overnight window for
+# scenario_now 2026-05-28T09:00Z is [2026-05-27T14:00Z, 2026-05-28T04:00Z).
+
+- id: savings_overnight_saved
+  scenario_now: "2026-05-28T09:00:00Z"
+  message: "How much did we save charging overnight?"
+  graph_snapshot:
+    depots:
+      - { depot_id: "11111111-1111-4111-8111-111111111111", name: "Vilnius", timezone: "Europe/Vilnius", entsoe_zone: "10YLT-1001A0008Q" }
+    sessions:
+      - { depot_id: "11111111-1111-4111-8111-111111111111", station_id: "CP-01", start_time: "2026-05-27T20:00:00Z", energy_kwh: 400, cost_total: 80, cost_total_source: "granular" }
+    electricity_prices:
+      - { time: "2026-05-27T20:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 250 }
+      - { time: "2026-05-28T00:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 250 }
+  expected:
+    status: success
+    answer_must_include: ["overnight", "€20.00", "20.0%", "€80.00", "€100.00"]
+    answer_must_not_include: ["UUID"]
+
+- id: savings_month_to_date_saved
+  scenario_now: "2026-05-28T09:00:00Z"
+  message: "How much have we saved this month?"
+  graph_snapshot:
+    depots:
+      - { depot_id: "11111111-1111-4111-8111-111111111111", name: "Vilnius", timezone: "Europe/Vilnius", entsoe_zone: "10YLT-1001A0008Q" }
+    sessions:
+      - { depot_id: "11111111-1111-4111-8111-111111111111", station_id: "CP-01", start_time: "2026-05-10T12:00:00Z", energy_kwh: 1000, cost_total: 200, cost_total_source: "granular" }
+    electricity_prices:
+      - { time: "2026-05-10T12:00:00Z", node_id: "10YLT-1001A0008Q", lmp_price_mwh: 250 }
+  expected:
+    status: success
+    answer_must_include: ["this month so far", "€50.00", "20.0%", "€200.00", "€250.00"]
+    answer_must_not_include: ["UUID"]
+
+- id: savings_overnight_no_prices
+  scenario_now: "2026-05-28T09:00:00Z"
+  message: "How much did we save overnight?"
+  graph_snapshot:
+    depots:
+      - { depot_id: "11111111-1111-4111-8111-111111111111", name: "Vilnius", timezone: "Europe/Vilnius", entsoe_zone: "10YLT-1001A0008Q" }
+    sessions:
+      - { depot_id: "11111111-1111-4111-8111-111111111111", station_id: "CP-01", start_time: "2026-05-27T20:00:00Z", energy_kwh: 150, cost_total: 30, cost_total_source: "granular" }
+    # No electricity_prices rows → unknown baseline → spend-only answer.
+  expected:
+    status: success
+    answer_must_include: ["€30.00", "can't estimate the savings", "overnight"]
+    answer_must_not_include: ["saved about", "UUID"]

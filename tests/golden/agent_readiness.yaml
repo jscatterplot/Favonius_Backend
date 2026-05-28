@@ -1,0 +1,94 @@
+# Readiness fast-path golden scenarios (deterministic intent — no LLM).
+#
+# Replayed by tests/golden/test_agent_intents_golden.py::test_readiness_golden:
+# each graph_snapshot is loaded into a rolled-back savepoint on the TS+static
+# test pair, then src.api.agent.controller._run_readiness_turn is called with
+# scenario_now injected and the rendered answer is asserted.
+#
+# The handler's window is [scenario_now, scenario_now + 24h); departures must
+# fall inside it. Telemetry `time` may be a "-5m"/"-45m" offset from
+# scenario_now (the 15-min MAX_TELEMETRY_AGE staleness check is applied in
+# Python). A plan's schedule_json keys are vehicle UUIDs; projected SoC = max
+# of the soc trajectory.
+#
+# One depot (Vilnius) is reused. Per-vehicle verdict branches and exact
+# wording are unit-tested in tests/unit/agent/test_readiness_intent.py — this
+# gate proves the three set-based queries run against the real schema.
+
+- id: readiness_all_clear
+  scenario_now: "2026-05-28T06:00:00Z"
+  question: "Are we ready to depart?"
+  graph_snapshot:
+    depots:
+      - { depot_id: "11111111-1111-4111-8111-111111111111", name: "Vilnius", timezone: "Europe/Vilnius" }
+    vehicles:
+      - { vehicle_id: "a1111111-1111-4111-8111-111111111111", depot_id: "11111111-1111-4111-8111-111111111111" }
+    schedules:
+      - { vehicle_id: "a1111111-1111-4111-8111-111111111111", route_id: "R-1", departure_time: "+2h", required_soc: 0.99 }
+    optimization_runs:
+      - depot_id: "11111111-1111-4111-8111-111111111111"
+        run_time: "-1h"
+        schedule_json:
+          schedule:
+            "a1111111-1111-4111-8111-111111111111": { soc: [0.55, 0.80, 0.99], charging_power: [40, 40, 0] }
+  expected:
+    status: success
+    answer_must_include: ["1 of 1 vehicles are ready to depart"]
+    answer_must_not_include: ["at risk", "need a check"]
+
+- id: readiness_at_risk_low_plan
+  scenario_now: "2026-05-28T06:00:00Z"
+  question: "Are all vehicles ready to depart tomorrow?"
+  graph_snapshot:
+    depots:
+      - { depot_id: "11111111-1111-4111-8111-111111111111", name: "Vilnius", timezone: "Europe/Vilnius" }
+    vehicles:
+      - { vehicle_id: "a2222222-2222-4222-8222-222222222222", depot_id: "11111111-1111-4111-8111-111111111111" }
+    schedules:
+      - { vehicle_id: "a2222222-2222-4222-8222-222222222222", route_id: "R-2", departure_time: "+3h", required_soc: 0.99 }
+    optimization_runs:
+      - depot_id: "11111111-1111-4111-8111-111111111111"
+        run_time: "-1h"
+        schedule_json:
+          schedule:
+            "a2222222-2222-4222-8222-222222222222": { soc: [0.50, 0.78, 0.92], charging_power: [40, 40, 40] }
+  expected:
+    status: success
+    answer_must_include: ["0 of 1 vehicles are ready", "at risk", "route R-2", "92%", "99%"]
+    answer_must_not_include: ["UUID"]
+
+- id: readiness_stale_telemetry_no_plan
+  scenario_now: "2026-05-28T06:00:00Z"
+  question: "Is the fleet ready to depart?"
+  graph_snapshot:
+    depots:
+      - { depot_id: "11111111-1111-4111-8111-111111111111", name: "Vilnius", timezone: "Europe/Vilnius" }
+    vehicles:
+      - { vehicle_id: "a3333333-3333-4333-8333-333333333333", depot_id: "11111111-1111-4111-8111-111111111111" }
+    schedules:
+      - { vehicle_id: "a3333333-3333-4333-8333-333333333333", route_id: "R-3", departure_time: "+4h", required_soc: 0.99 }
+    telemetry:
+      # 45 minutes old → beyond the 15-min freshness threshold, and no plan.
+      - { vehicle_id: "a3333333-3333-4333-8333-333333333333", time: "-45m", soc: 0.99, is_plugged: true }
+  expected:
+    status: success
+    answer_must_include: ["0 of 1 vehicles are ready", "route R-3", "stale"]
+    answer_must_not_include: ["at risk"]
+
+- id: readiness_no_plan_fresh_soc_ready
+  scenario_now: "2026-05-28T06:00:00Z"
+  question: "Are we ready for the morning?"
+  graph_snapshot:
+    depots:
+      - { depot_id: "11111111-1111-4111-8111-111111111111", name: "Vilnius", timezone: "Europe/Vilnius" }
+    vehicles:
+      - { vehicle_id: "a4444444-4444-4444-8444-444444444444", depot_id: "11111111-1111-4111-8111-111111111111" }
+    schedules:
+      - { vehicle_id: "a4444444-4444-4444-8444-444444444444", route_id: "R-4", departure_time: "+5h", required_soc: 0.99 }
+    telemetry:
+      # Fresh (5 min old) and already at target — ready on current SoC, no plan.
+      - { vehicle_id: "a4444444-4444-4444-8444-444444444444", time: "-5m", soc: 0.99, is_plugged: true }
+  expected:
+    status: success
+    answer_must_include: ["1 of 1 vehicles are ready to depart"]
+    answer_must_not_include: ["at risk", "need a check"]

@@ -461,9 +461,9 @@ async def _load_ts_snapshot(
         await conn.execute(
             """
             INSERT INTO notification_alerts (
-                id, organization_id, depot_id, alert_type, severity, title, dedup_key,
+                id, organization_id, depot_id, alert_type, severity, title, detail, dedup_key,
                 status, first_occurrence_at, last_occurrence_at, created_at, updated_at)
-            VALUES (COALESCE($1, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9, $9, $9, $9)
+            VALUES (COALESCE($1, gen_random_uuid()), $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $10, $10, $10)
             """,
             alert_id,
             org,
@@ -471,6 +471,7 @@ async def _load_ts_snapshot(
             a["alert_type"],
             a["severity"],
             a.get("title", a["alert_type"]),
+            json.dumps(a.get("detail") or {}),
             a.get("dedup_key", f"eval-{a['alert_type']}-{i}"),
             a.get("status", "active"),
             created,
@@ -734,21 +735,26 @@ def test_every_scenario_has_tone_gate() -> None:
 
 
 def test_suite_size_and_distribution() -> None:
-    """Gate the full 20-question shape (7 energy / 7 ops / 6 pricing)."""
+    """Gate the full 21-question shape (7 energy / 8 ops / 6 pricing).
+
+    Was 20 (7/7/6); ops_status gained one scenario (``ops_21``) exercising
+    the alerts-cause columns (``title`` / ``detail``) added to
+    ``agent_views.alerts`` by migration 047.
+    """
     from tests.golden.conftest import _ci_requires_db
 
     n = len(_ALL_SCENARIOS)
-    if n < 20:
-        msg = f"agent_sql suite has {n}/20 scenarios (expected 20)"
+    if n < 21:
+        msg = f"agent_sql suite has {n}/21 scenarios (expected 21)"
         if _ci_requires_db():
             pytest.fail(msg)
         pytest.skip(msg)
     by_cat: dict[str, int] = {}
     for s in _ALL_SCENARIOS:
         by_cat[s.get("category", "?")] = by_cat.get(s.get("category", "?"), 0) + 1
-    assert n == 20, f"expected exactly 20 scenarios, got {n}"
+    assert n == 21, f"expected exactly 21 scenarios, got {n}"
     assert by_cat.get("energy_cost") == 7, f"energy_cost: {by_cat.get('energy_cost')} (want 7)"
-    assert by_cat.get("ops_status") == 7, f"ops_status: {by_cat.get('ops_status')} (want 7)"
+    assert by_cat.get("ops_status") == 8, f"ops_status: {by_cat.get('ops_status')} (want 8)"
     assert (
         by_cat.get("pricing_market") == 6
     ), f"pricing_market: {by_cat.get('pricing_market')} (want 6)"

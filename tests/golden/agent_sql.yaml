@@ -858,3 +858,60 @@
     sql_validator_rejected: false
     final_answer_must_include: ["0.25", "19 May"]
     final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
+
+# ════════════════════════ ops status — alert cause (1) ═════════════════════
+# Exercises the title / detail columns added to agent_views.alerts by
+# migration 047 so the agent can explain WHY a charger faulted, not just THAT
+# it did. detail->>'error_code' surfaces the OCPP error the 022 fault trigger
+# stored in notification_alerts.detail.
+
+- id: ops_21
+  category: ops_status
+  question: "Why are the chargers faulted right now?"
+  description: >
+    SELECT title, detail->>'error_code' FROM agent_views.alerts WHERE
+    status='active'. A resolved fault with a different error code is a decoy
+    confirming the status filter applies; the answer must name the active
+    fault's OCPP error code (carried in detail JSONB), not just its type.
+  scenario_now: "2026-05-25T12:00:00Z"
+  graph_snapshot:
+    depots:
+      - *dep_vil
+    alerts:
+      - depot_id: "11111111-1111-4111-8111-111111111111"
+        created_at: "2026-05-25T07:30:00Z"
+        severity: "critical"
+        status: "active"
+        alert_type: "charger_fault"
+        title: "Charger CP-07 connector 1: Faulted"
+        detail: { station_id: "CP-07", connector_id: 1, error_code: "GroundFailure" }
+      - depot_id: "11111111-1111-4111-8111-111111111111"
+        created_at: "2026-05-24T09:00:00Z"
+        severity: "warning"
+        status: "resolved"
+        alert_type: "charger_fault"
+        title: "Charger CP-02 connector 1: Faulted"
+        detail: { station_id: "CP-02", connector_id: 1, error_code: "OverCurrentFailure" }
+  llm_trace:
+    - content:
+        - type: tool_use
+          id: "ops21_q"
+          name: run_select_ts
+          input:
+            sql: >-
+              SELECT title, detail->>'error_code' AS error_code
+              FROM agent_views.alerts($1)
+              WHERE status = 'active' AND alert_type = 'charger_fault'
+    - content:
+        - type: tool_use
+          id: "ops21_a"
+          name: emit_final_answer
+          input:
+            text: "Charger CP-07 (connector 1) is faulted with OCPP error GroundFailure."
+            row_evidence: 1
+  expected:
+    status: success
+    agent_views_used: ["alerts"]
+    sql_validator_rejected: false
+    final_answer_must_include: ["CP-07", "GroundFailure"]
+    final_answer_must_not_include: ["SELECT", "UUID", "agent_views"]
