@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from src.api.agent.plan import TimeWindow
 from src.api.agent.resolve import resolve_time_window
@@ -64,6 +65,7 @@ _WINDOW_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     ("today", re.compile(r"\btoday\b")),
 )
+
 
 @dataclass(frozen=True)
 class SavingsWindow:
@@ -121,14 +123,29 @@ def resolve_savings_window(
         return SavingsWindow(kind=kind, label=label, period_start=start, period_end=now)
 
     start, end = _relative_bounds(kind, tz_name, now)
-    return SavingsWindow(kind=kind, label=label, period_start=start, period_end=end)
+    # Clamp the end to `now` for every window: "today" / "this week" span
+    # future hours whose day-ahead prices already exist and would otherwise
+    # inflate the baseline average against past-only sessions. Fully-past
+    # windows (yesterday / last week / last month) already end <= now, so
+    # the clamp is a no-op there.
+    return SavingsWindow(kind=kind, label=label, period_start=start, period_end=min(end, now))
 
 
 def _relative_bounds(
     relative: str, tz_name: Optional[str], now: datetime
 ) -> tuple[datetime, datetime]:
-    """Resolve a ``TimeWindow.relative`` literal to UTC bounds in one tz."""
+    """Resolve a ``TimeWindow.relative`` literal to UTC bounds in one tz.
+
+    An unknown / invalid ``tz_name`` degrades to UTC rather than raising —
+    ``resolve_time_window`` calls ``ZoneInfo(tz_name)`` directly, so without
+    this guard a malformed ``sites.timezone`` would 500 the whole turn (the
+    ``overnight`` path already degrades gracefully via ``overnight_window_utc``).
+    """
     tz = tz_name or "UTC"
+    try:
+        ZoneInfo(tz)
+    except Exception:  # noqa: BLE001 - any bad zone name → UTC fallback
+        tz = "UTC"
     window = TimeWindow(kind="relative", relative=relative)  # type: ignore[arg-type]
     resolved = resolve_time_window(window, [_TZ_SENTINEL], {_TZ_SENTINEL: tz}, now=now)
     return resolved.start_utc, resolved.end_utc
@@ -147,13 +164,17 @@ def render_savings_answer(
     saved_pct: float,
     label: str,
     depot_count: int = 1,
+    baseline_known: bool = True,
 ) -> str:
     """Render the aggregated savings figures as a natural-language reply.
 
-    Mirrors the route's degraded-data semantics: a zero baseline means we
-    have no day-ahead prices for the window (or no bidding zone), so we
-    report spend only and say the saving is unavailable rather than printing
-    a misleading "0% saved".
+    Mirrors the route's degraded-data semantics: when the baseline is
+    *unknown* (no day-ahead prices / no bidding zone) we report spend only
+    and say the saving is unavailable rather than printing a misleading
+    "0% saved". This is driven by the explicit ``baseline_known`` flag, not
+    inferred from ``baseline_eur == 0`` — after multi-depot aggregation a
+    genuine baseline can sum to 0 (negative prices cancelling), which must
+    NOT be mistaken for "no price data".
 
     Args:
         actual_eur: What the depot(s) actually spent charging in the window.
@@ -162,14 +183,16 @@ def render_savings_answer(
         saved_pct: Signed percentage saved vs the baseline magnitude.
         label: Human window label (e.g. "overnight", "this month so far").
         depot_count: Number of depots aggregated (annotated when > 1).
+        baseline_known: False when no contributing depot had a priceable
+            baseline (no zone / no prices / no energy) — report spend only.
 
     Returns:
         A single-sentence operator-facing answer.
     """
     scope = "" if depot_count <= 1 else f" across {depot_count} depots"
 
-    # No baseline → unknown savings (no prices / no zone). Report spend only.
-    if baseline_eur == 0:
+    # Unknown baseline → report spend only (do not infer from baseline_eur==0).
+    if not baseline_known:
         if actual_eur == 0:
             return (
                 f"No charging was recorded {label}{scope}, so there was nothing " "spent or saved."

@@ -86,7 +86,7 @@ from src.api.agent.stream import SSEEventStream
 from src.api.agent.view_context import AgentViewContext, build_page_context_payload
 from src.api.agent_workflows.runtime import ToolNotAllowedError, run_qa_turn
 from src.api.agent_workflows.tools import ToolNotRegisteredError
-from src.api.savings import compute_savings_for_window
+from src.api.savings import SavingsSummary, compute_savings_for_window
 from src.monitoring.metrics import (
     AGENT_RESOLVER_MISSES,
     AGENT_SQL_BUDGET_REFUSED,
@@ -584,31 +584,50 @@ async def _run_savings_turn(
         return reply
 
     depot_tzs = await load_depot_timezones(static_pool, depot_ids)
+    # Window is resolved per depot (each in its own tz); the label + kind are
+    # constant across depots (they depend only on the message), so we read them
+    # off any resolved window rather than re-classifying the message.
+    windows = {d: resolve_savings_window(message, as_of, depot_tzs.get(d)) for d in depot_ids}
+    first_window = next(iter(windows.values()))
+    label = first_window.label
+    kind = first_window.kind
 
-    total_actual = 0.0
-    total_baseline = 0.0
-    label = "this month so far"
-    kind = "month_to_date"
-    succeeded = 0
-    for depot_id in depot_ids:
-        window = resolve_savings_window(message, as_of, depot_tzs.get(depot_id))
-        label = window.label
-        kind = window.kind
-        try:
-            summary = await compute_savings_for_window(
+    # Compute every depot concurrently — the calls are independent (3 DB hits
+    # each) and `load_depot_timezones` already ran, so there's no shared state.
+    results = await asyncio.gather(
+        *(
+            compute_savings_for_window(
                 static_pool,
                 ts_pool,
-                str(depot_id),
-                period_start=window.period_start,
-                period_end=window.period_end,
+                str(d),
+                period_start=w.period_start,
+                period_end=w.period_end,
                 now=as_of,
             )
-        except ValueError:
-            # Depot vanished between auth scope and lookup — skip, don't abort.
-            continue
-        total_actual += summary.current_month_eur
-        total_baseline += summary.baseline_month_eur
-        succeeded += 1
+            for d, w in windows.items()
+        ),
+        return_exceptions=True,
+    )
+    summaries = [r for r in results if isinstance(r, SavingsSummary)]
+
+    # Aggregate ONLY depots with a priceable baseline. A depot with no
+    # bidding zone / no prices (baseline_known=False) is excluded from BOTH
+    # sides of the comparison so its unpriced spend can't dilute the saving;
+    # this also means a genuine baseline that sums to 0 (negative prices
+    # cancelling) is still reported as a known baseline, not "no price data".
+    priced = [s for s in summaries if s.baseline_known]
+    if priced:
+        total_actual = sum(s.current_month_eur for s in priced)
+        total_baseline = sum(s.baseline_month_eur for s in priced)
+        baseline_known = True
+        depot_count = len(priced)
+    else:
+        # Nothing priceable — report total spend across the depots that
+        # computed, with no baseline (render says "can't estimate").
+        total_actual = sum(s.current_month_eur for s in summaries)
+        total_baseline = 0.0
+        baseline_known = False
+        depot_count = len(summaries)
 
     actual = round(total_actual, 2)
     baseline = round(total_baseline, 2)
@@ -622,7 +641,8 @@ async def _run_savings_turn(
         {
             "kind": kind,
             "label": label,
-            "depots": succeeded,
+            "depots": depot_count,
+            "baseline_known": baseline_known,
             "actual_eur": actual,
             "baseline_eur": baseline,
         },
@@ -633,10 +653,11 @@ async def _run_savings_turn(
         saved_eur=saved,
         saved_pct=saved_pct,
         label=label,
-        depot_count=succeeded,
+        depot_count=depot_count,
+        baseline_known=baseline_known,
     )
     await write_agent_query_audit(
-        ts_pool, auth, run_id, "savings", succeeded, target_type="charging_sessions"
+        ts_pool, auth, run_id, "savings", depot_count, target_type="charging_sessions"
     )
     reply = AgentReply.success(run_id=run_id, intent="savings", text=text)
     await agent_runs_close(ts_pool, run_id, "success", reply)

@@ -143,6 +143,21 @@ def test_overall_rollup_at_risk_dominates():
     assert v.vehicles[0].status == STATUS_AT_RISK
 
 
+def test_duplicate_departures_counted_once_using_earliest():
+    # Same vehicle, two departures in the window: an early one needing 99% and
+    # a later one needing 90%. The plan reaches 95%. Dedup must keep the
+    # earliest (most binding) departure → at_risk (95% < 99%), counted once.
+    deps = [
+        _dep("v1", route_id="EARLY", required_soc=0.99, depart_h=8),
+        _dep("v1", route_id="LATE", required_soc=0.90, depart_h=18),
+    ]
+    v = _summarize(deps, {}, {DEPOT: _plan("v1", [0.5, 0.95])})
+    assert v.total == 1, "duplicate departures for one vehicle must collapse to a single verdict"
+    assert v.at_risk == 1 and v.ready == 0
+    assert v.vehicles[0].route_id == "EARLY"
+    assert v.vehicles[0].required_soc == 0.99
+
+
 def test_empty_departures():
     v = _summarize([], {}, {})
     assert v.total == 0 and v.overall == STATUS_READY

@@ -88,14 +88,21 @@ _CONSUMPTION_ANTIPATTERNS: tuple[re.Pattern[str], ...] = (
 _SAVINGS_TRIGGERS: tuple[re.Pattern[str], ...] = (re.compile(r"\bsav(?:e|ed|ing|ings)\b"),)
 
 # Departure-readiness phrasing. Kept tight so ops/status questions that merely
-# say "active" or "available" do not get pulled in.
+# say "active" or "available" — or unrelated "is the report ready?" — do not
+# get pulled in. The bare "are/is … ready" form requires a fleet/vehicle/we/
+# depot subject between the verb and "ready" so it cannot steal questions about
+# a report, a charger install, a data export, etc.
 _READINESS_TRIGGERS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\breadiness\b"),
     re.compile(
         r"\bready\s+(?:to\s+(?:depart|leave|roll|go)|"
         r"for\s+(?:departure|departures|tomorrow|today|the\s+morning|service))\b"
     ),
-    re.compile(r"\b(?:are|is)\b[^?]*\bready\b"),
+    re.compile(
+        r"\b(?:are|is)\b[^?]*"
+        r"\b(?:we|fleet|vehicles?|buses|bus|vans?|trucks?|cars?|depot|everything|all)\b"
+        r"[^?]*\bready\b"
+    ),
 )
 
 

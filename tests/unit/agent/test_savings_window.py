@@ -154,6 +154,25 @@ def test_resolve_missing_tz_does_not_crash():
     assert win.period_start < win.period_end
 
 
+def test_resolve_today_clamps_end_to_now():
+    # 'today' spans future hours; period_end must be clamped to now so the
+    # baseline price-average doesn't include not-yet-charged hours.
+    now = datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc)
+    win = resolve_savings_window("how much did we save today?", now, "Europe/Vilnius")
+    assert win.kind == "today"
+    assert win.period_end == now
+    assert win.period_start < now
+
+
+def test_resolve_invalid_tz_relative_window_does_not_crash():
+    # A bad sites.timezone must degrade to UTC for relative windows too, not
+    # just for overnight (regression: month_to_date used to 500).
+    now = datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc)
+    for message in ("how much have we saved this month?", "savings last week", "save today"):
+        win = resolve_savings_window(message, now, "Not/AZone")
+        assert win.period_start < win.period_end
+
+
 # ── render_savings_answer ────────────────────────────────────────────────────
 
 
@@ -172,9 +191,14 @@ def test_render_negative_saving_reads_as_more():
     assert "€20.00 (20.0%) more" in text
 
 
-def test_render_zero_baseline_reports_spend_only():
+def test_render_unknown_baseline_reports_spend_only():
     text = render_savings_answer(
-        actual_eur=12.0, baseline_eur=0.0, saved_eur=0.0, saved_pct=0.0, label="overnight"
+        actual_eur=12.0,
+        baseline_eur=0.0,
+        saved_eur=0.0,
+        saved_pct=0.0,
+        label="overnight",
+        baseline_known=False,
     )
     assert "€12.00" in text
     assert "can't estimate the savings" in text
@@ -182,9 +206,29 @@ def test_render_zero_baseline_reports_spend_only():
 
 def test_render_no_activity():
     text = render_savings_answer(
-        actual_eur=0.0, baseline_eur=0.0, saved_eur=0.0, saved_pct=0.0, label="overnight"
+        actual_eur=0.0,
+        baseline_eur=0.0,
+        saved_eur=0.0,
+        saved_pct=0.0,
+        label="overnight",
+        baseline_known=False,
     )
     assert "No charging was recorded overnight" in text
+
+
+def test_render_known_zero_baseline_is_not_spend_only():
+    # Multi-depot baselines can cancel to 0 (negative prices) — a KNOWN
+    # baseline of 0 must NOT render as "no price data".
+    text = render_savings_answer(
+        actual_eur=50.0,
+        baseline_eur=0.0,
+        saved_eur=-50.0,
+        saved_pct=0.0,
+        label="overnight",
+        baseline_known=True,
+    )
+    assert "can't estimate" not in text
+    assert "€50.00" in text
 
 
 def test_render_multi_depot_scope():

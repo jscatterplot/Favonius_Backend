@@ -335,3 +335,33 @@ def test_consumption_overnight_not_stolen_by_savings(monkeypatch):
     is_sql_mode_enabled.cache_clear()
     d = classify("How much power did the renault vans consume last night?", sql_mode_allowed=True)
     assert d.route == "consumption_by_user"
+
+
+# Non-departure "is X ready?" questions must NOT be stolen by the readiness
+# intent — they need a fleet/vehicle/we/depot subject to qualify.
+_NOT_READINESS = (
+    "Is the report ready?",
+    "Are the new chargers ready to install?",
+    "Is the data ready for export?",
+    "Is the firmware update ready?",
+)
+_IS_READINESS = (
+    "Are we ready?",
+    "Is the fleet ready?",
+    "Are the vehicles ready?",
+    "Is everything ready?",
+)
+
+
+@pytest.mark.parametrize("message", _NOT_READINESS, ids=[m[:25] for m in _NOT_READINESS])
+def test_non_departure_ready_questions_not_routed_to_readiness(monkeypatch, message):
+    monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
+    is_sql_mode_enabled.cache_clear()
+    assert classify(message, sql_mode_allowed=True).route != "readiness", message
+
+
+@pytest.mark.parametrize("message", _IS_READINESS, ids=[m[:25] for m in _IS_READINESS])
+def test_fleet_ready_questions_route_to_readiness(monkeypatch, message):
+    monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
+    is_sql_mode_enabled.cache_clear()
+    assert classify(message, sql_mode_allowed=True).route == "readiness", message

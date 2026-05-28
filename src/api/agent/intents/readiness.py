@@ -109,14 +109,18 @@ TELEMETRY_ONLY_SOC_SQL = """
     ORDER BY vehicle_id, time DESC
 """
 
-# Latest optimization run per depot — its schedule_json carries the per-vehicle
-# projected SoC trajectory.
+# Latest *usable* optimization run per depot — its schedule_json carries the
+# per-vehicle projected SoC trajectory. Restricted to statuses that actually
+# produce a plan we can trust ('optimal'/'feasible'/'degraded'); an
+# 'infeasible'/'timeout' run can still write a partial/warm-start trajectory
+# whose max SoC would falsely clear the readiness bar.
 LATEST_PLAN_SQL = """
     SELECT DISTINCT ON (depot_id)
         depot_id::text AS depot_id,
         schedule_json
     FROM optimization_runs
     WHERE depot_id = ANY($1::uuid[])
+      AND status IN ('optimal', 'feasible', 'degraded')
     ORDER BY depot_id, run_time DESC
 """
 
@@ -243,8 +247,20 @@ def summarize_readiness(
     Returns:
         A :class:`ReadinessVerdict`.
     """
-    vehicles: list[VehicleReadiness] = []
+    # A vehicle can have several departures inside the window (e.g. a return
+    # then an outbound leg). Judge each vehicle ONCE against its most binding
+    # (earliest) upcoming departure so the verdict counts unique vehicles, not
+    # schedule rows — otherwise total/ready/at_risk inflate and the answer
+    # lists the same vehicle twice.
+    earliest: dict[str, dict[str, Any]] = {}
     for row in departures:
+        vid = str(row["vehicle_id"])
+        prior = earliest.get(vid)
+        if prior is None or row["departure_time"] < prior["departure_time"]:
+            earliest[vid] = row
+
+    vehicles: list[VehicleReadiness] = []
+    for row in earliest.values():
         vehicle_id = str(row["vehicle_id"])
         depot_id = str(row["depot_id"])
         route_id = row.get("route_id")
