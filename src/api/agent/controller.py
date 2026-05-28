@@ -63,7 +63,6 @@ from src.api.agent.intents.readiness import (
     summarize_readiness,
 )
 from src.api.agent.intents.savings import (
-    classify_savings_window,
     render_savings_answer,
     resolve_savings_window,
 )
@@ -585,15 +584,16 @@ async def _run_savings_turn(
         return reply
 
     depot_tzs = await load_depot_timezones(static_pool, depot_ids)
-    kind = classify_savings_window(message)
 
     total_actual = 0.0
     total_baseline = 0.0
     label = "this month so far"
+    kind = "month_to_date"
     succeeded = 0
     for depot_id in depot_ids:
         window = resolve_savings_window(message, as_of, depot_tzs.get(depot_id))
         label = window.label
+        kind = window.kind
         try:
             summary = await compute_savings_for_window(
                 static_pool,
