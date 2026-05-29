@@ -101,27 +101,28 @@ async def test_auth_response_missing_token_raises(client):
 
 
 @pytest.mark.asyncio
-async def test_pagination_across_two_pages(client):
+async def test_iter_charging_stations_returns_stations(client):
+    # ChargEye /stations is single-page (no pagination keys in OpenAPI spec).
     with respx.mock(assert_all_called=False) as mock:
         _route_login(mock)
-        page1 = {
-            "items": [{"stationId": "s1"}, {"stationId": "s2"}],
-            "nextPage": "cursor-a",
-        }
-        page2 = {
-            "items": [{"stationId": "s3"}],
-            "nextPage": None,
-        }
-        mock.get(f"{_BASE}/v1/charging-stations").mock(
-            side_effect=[
-                httpx.Response(200, json=page1),
-                httpx.Response(200, json=page2),
-            ]
+        route = mock.get(f"{_BASE}/stations").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "stations": [
+                        {"stationId": "s1"},
+                        {"stationId": "s2"},
+                    ]
+                },
+            )
         )
         seen: list[dict] = []
         async for item in client.iter_charging_stations("loc-1"):
             seen.append(item)
-        assert [x["stationId"] for x in seen] == ["s1", "s2", "s3"]
+        assert [x["stationId"] for x in seen] == ["s1", "s2"]
+        assert route.call_count == 1
+        params = dict(route.calls.last.request.url.params)
+        assert params["locationUid"] == "loc-1"
     await client.aclose()
 
 
@@ -184,8 +185,11 @@ async def test_retry_exhaustion_raises(client):
 async def test_iter_transactions_passes_window_params(client):
     with respx.mock(assert_all_called=False) as mock:
         _route_login(mock)
-        route = mock.get(f"{_BASE}/v1/transactions").mock(
-            return_value=httpx.Response(200, json={"items": [{"txId": "t1"}], "nextPage": None})
+        route = mock.get(f"{_BASE}/chargingStations/s-1/transactions").mock(
+            return_value=httpx.Response(
+                200,
+                json={"transactions": [{"txId": "t1"}], "lastEvaluatedKey": None},
+            )
         )
         seen = []
         async for tx in client.iter_transactions(
@@ -197,9 +201,40 @@ async def test_iter_transactions_passes_window_params(client):
         assert seen == [{"txId": "t1"}]
         assert route.call_count == 1
         params = dict(route.calls.last.request.url.params)
-        assert params["stationId"] == "s-1"
-        assert params["from"] == "2025-01-01T00:00:00Z"
-        assert params["to"] == "2025-01-02T00:00:00Z"
+        assert params["startDate"] == "2025-01-01T00:00:00Z"
+        assert params["endDate"] == "2025-01-02T00:00:00Z"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_iter_transactions_paginates_via_last_evaluated_key(client):
+    # Transactions use DynamoDB-style pagination: each page's lastEvaluatedKey
+    # becomes the next call's exclusiveStartKey until the API returns no key.
+    with respx.mock(assert_all_called=False) as mock:
+        _route_login(mock)
+        page1 = {
+            "transactions": [{"txId": "t1"}, {"txId": "t2"}],
+            "lastEvaluatedKey": {"k": "cursor-a"},
+        }
+        page2 = {"transactions": [{"txId": "t3"}], "lastEvaluatedKey": None}
+        route = mock.get(f"{_BASE}/chargingStations/s-1/transactions").mock(
+            side_effect=[
+                httpx.Response(200, json=page1),
+                httpx.Response(200, json=page2),
+            ]
+        )
+        seen: list[dict] = []
+        async for tx in client.iter_transactions(
+            station_id="s-1",
+            start_iso="2025-01-01T00:00:00Z",
+            end_iso="2025-01-02T00:00:00Z",
+        ):
+            seen.append(tx)
+        assert [x["txId"] for x in seen] == ["t1", "t2", "t3"]
+        assert route.call_count == 2
+        # The second request carries the cursor from page1's lastEvaluatedKey.
+        second_params = dict(route.calls[1].request.url.params)
+        assert "exclusiveStartKey" in second_params
     await client.aclose()
 
 
