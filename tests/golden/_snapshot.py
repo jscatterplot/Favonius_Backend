@@ -17,6 +17,7 @@ to the scenario's ``scenario_now`` (so "5 minutes ago" is ``-5m``).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -88,25 +89,40 @@ class TxPool:
     The handlers do ``async with pool.acquire() as conn`` (audit writers) and
     direct ``pool.fetch(...)`` (the intent SQL); both land on the one bound
     connection so the seeded snapshot is visible and everything rolls back.
+
+    This is morally a connection pool of size 1, so concurrent ``fetch`` /
+    ``execute`` callers are serialised through ``_lock`` — a real
+    ``asyncpg.Pool`` makes the second caller wait for the single connection
+    rather than raising. Without it, a handler that fans out queries with
+    ``asyncio.gather`` (e.g. readiness' SoC + plan reads, multi-depot savings)
+    would race two operations onto the one connection and hit asyncpg's
+    "another operation is in progress". ``acquire`` is intentionally left
+    unlocked: the audit writers use it sequentially, and locking it would
+    deadlock a ``fetch`` issued inside an ``async with acquire()`` block.
     """
 
     def __init__(self, conn: Any) -> None:
         self._conn = conn
+        self._lock = asyncio.Lock()
 
     def acquire(self) -> _AcquireCtx:
         return _AcquireCtx(self._conn)
 
     async def fetch(self, query: str, *args: Any) -> Any:
-        return await self._conn.fetch(query, *args)
+        async with self._lock:
+            return await self._conn.fetch(query, *args)
 
     async def fetchrow(self, query: str, *args: Any) -> Any:
-        return await self._conn.fetchrow(query, *args)
+        async with self._lock:
+            return await self._conn.fetchrow(query, *args)
 
     async def fetchval(self, query: str, *args: Any) -> Any:
-        return await self._conn.fetchval(query, *args)
+        async with self._lock:
+            return await self._conn.fetchval(query, *args)
 
     async def execute(self, query: str, *args: Any) -> Any:
-        return await self._conn.execute(query, *args)
+        async with self._lock:
+            return await self._conn.execute(query, *args)
 
 
 # ── Loaders ──────────────────────────────────────────────────────────────────
