@@ -63,15 +63,7 @@ async def store_template(
     existing row's id instead of inserting (double-submit safe).
     """
     async with ts_pool.acquire() as conn:
-        if idempotency_key:
-            existing = await conn.fetchval(
-                "SELECT id FROM agent_document_templates WHERE idempotency_key = $1",
-                idempotency_key,
-            )
-            if existing is not None:
-                return UUID(str(existing))
-        row = await conn.fetchval(
-            """
+        insert_sql = """
             INSERT INTO agent_document_templates (
                 organization_id, depot_id, uploaded_by, kind, pdf_form_type,
                 file_name, file_size_bytes, content_sha256, raw_payload,
@@ -82,8 +74,8 @@ async def store_template(
                 $6, $7, $8, $9,
                 $10::jsonb, $11
             )
-            RETURNING id
-            """,
+            """
+        params = (
             str(organization_id) if organization_id else None,
             str(depot_id) if depot_id else None,
             str(uploaded_by),
@@ -96,6 +88,28 @@ async def store_template(
             _jsonb(detected_fields),
             idempotency_key,
         )
+        if idempotency_key:
+            row = await conn.fetchval(
+                insert_sql
+                + """
+                ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
+                DO NOTHING
+                RETURNING id
+                """,
+                *params,
+            )
+            if row is not None:
+                return UUID(str(row))
+            existing = await conn.fetchval(
+                "SELECT id FROM agent_document_templates WHERE idempotency_key = $1",
+                idempotency_key,
+            )
+            if existing is not None:
+                return UUID(str(existing))
+            raise RuntimeError(
+                f"idempotency_key {idempotency_key!r} conflicted but no row found"
+            )
+        row = await conn.fetchval(insert_sql + " RETURNING id", *params)
     return UUID(str(row))
 
 

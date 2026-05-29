@@ -1729,6 +1729,15 @@ async def _run_document_fill_turn(
             ),
             failure=None,
         )
+    if session.get("status") == "finalized":
+        return await _terminal(
+            "error",
+            (
+                "This document session is already finalized. Download the completed "
+                "file from your previous turn."
+            ),
+            failure=None,
+        )
 
     template = await document_store.load_template(ts_pool, UUID(str(session["template_id"])))
     if template is None or template.get("raw_payload") is None:
