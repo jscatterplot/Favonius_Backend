@@ -130,3 +130,34 @@ def test_hook_not_called_on_refuse():
 
     assert reply.status == "not_found"
     hook.assert_not_awaited()
+
+
+def test_hook_failure_does_not_break_successful_turn():
+    """Defense-in-depth: a leaking post-success hook must not 502 the turn.
+
+    Even though maybe_emit_* is designed never to raise, the controller guards
+    the call locally so a hypothetical leak can't 502 the turn or re-close the
+    already-success run as error.
+    """
+    auth = _fake_auth()
+    boom = AsyncMock(side_effect=RuntimeError("hook leaked"))
+    ts_pool = SimpleNamespace(fetch=AsyncMock(return_value=[]))
+
+    with ExitStack() as stack:
+        _patches(stack, auth=auth, hook=boom)
+        reply = asyncio.run(
+            ctrl.run_turn(
+                "how much did John charge last week",
+                {"sub": str(uuid4())},
+                object(),
+                ts_pool,
+                _FakeLLM(),
+            )
+        )
+        # The turn still succeeds despite the leaking hook.
+        assert reply.status == "success"
+        boom.assert_awaited_once()
+        # The run was closed as success and never re-closed as error.
+        close_statuses = [c.args[2] for c in ctrl.agent_runs_close.await_args_list]
+        assert "success" in close_statuses
+        assert "error" not in close_statuses
