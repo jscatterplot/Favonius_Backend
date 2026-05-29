@@ -1916,6 +1916,21 @@ async def _run_document_fill_turn(
         status = (
             "not_found" if qa.status in ("no_terminator", "max_iterations", "success") else "error"
         )
+        new_log = list(message_log)
+        new_log.append({"role": "user", "text": message, "run_id": str(run_id), "ts": _now_iso()})
+        new_log.append({"role": "assistant", "text": text, "run_id": str(run_id), "ts": _now_iso()})
+        new_log = new_log[-_DOC_FILL_MAX_LOG_TURNS:]
+        latest_output = (
+            UUID(str(session["latest_output_id"])) if session.get("latest_output_id") else None
+        )
+        await document_store.update_session(
+            ts_pool,
+            session_id,
+            status=str(session.get("status") or "gathering"),
+            draft=draft,
+            message_log=new_log,
+            latest_output_id=latest_output,
+        )
         return await _terminal(status, text, failure=classify_failure(qa))
 
     args = term.arguments if isinstance(term.arguments, dict) else {}
