@@ -136,7 +136,7 @@ def build_alert_message(
     currency_symbol: str,
 ) -> str:
     """Build the operator-facing alert message verbatim per the spec."""
-    if discount is not None:
+    if discount is not None and discount > 0:
         savings = f"{currency_symbol}{_format_amount(discount)}"
         tail = f"Automate payment now to save {savings}?"
     else:
