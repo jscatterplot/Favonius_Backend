@@ -112,7 +112,7 @@ async def test_pagination_across_two_pages(client):
             "items": [{"stationId": "s3"}],
             "nextPage": None,
         }
-        mock.get(f"{_BASE}/charging-stations").mock(
+        mock.get(f"{_BASE}/v1/charging-stations").mock(
             side_effect=[
                 httpx.Response(200, json=page1),
                 httpx.Response(200, json=page2),
@@ -184,7 +184,7 @@ async def test_retry_exhaustion_raises(client):
 async def test_iter_transactions_passes_window_params(client):
     with respx.mock(assert_all_called=False) as mock:
         _route_login(mock)
-        route = mock.get(f"{_BASE}/transactions").mock(
+        route = mock.get(f"{_BASE}/v1/transactions").mock(
             return_value=httpx.Response(200, json={"items": [{"txId": "t1"}], "nextPage": None})
         )
         seen = []
