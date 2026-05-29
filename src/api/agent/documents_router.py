@@ -50,6 +50,29 @@ _PDF_MIME = "application/pdf"
 _DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MiB
 
 
+def _content_disposition(filename: str) -> str:
+    """Build an RFC 6266-safe ``Content-Disposition`` value.
+
+    ASGI header values are encoded latin-1, so a non-Latin-1 filename (very
+    common in this deployment, e.g. Lithuanian ``ataskaita_Šiaurė.docx``) would
+    raise ``UnicodeEncodeError`` at response construction → 500. A literal ``"``
+    or control char would also break or inject into the header. We therefore
+    emit an ASCII-sanitised ``filename="…"`` fallback PLUS a percent-encoded
+    ``filename*=UTF-8''…`` for clients that support it — mirroring Starlette's
+    own ``FileResponse`` behaviour. The result is pure ASCII and quote-safe.
+    """
+    from urllib.parse import quote
+
+    # ASCII fallback: drop non-ASCII, strip quote/backslash/control chars.
+    ascii_name = filename.encode("ascii", "ignore").decode("ascii")
+    ascii_name = "".join(ch for ch in ascii_name if ch >= " " and ch != "\x7f" and ch not in '"\\')
+    ascii_name = ascii_name.strip() or "document"
+    disposition = f'attachment; filename="{ascii_name}"'
+    if ascii_name != filename:
+        disposition += f"; filename*=UTF-8''{quote(filename, safe='')}"
+    return disposition
+
+
 def get_doc_upload_max_bytes() -> int:
     """Per-upload size cap (read at call time so tests can monkeypatch env)."""
     try:
@@ -170,7 +193,7 @@ async def download_document(
     return Response(
         content=bytes(row["raw_payload"]),
         media_type=media,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": _content_disposition(filename)},
     )
 
 

@@ -139,3 +139,36 @@ def test_download_returns_file_with_attachment_headers(client, monkeypatch):
     )
     assert "attachment" in resp.headers["content-disposition"]
     assert "report_filled.docx" in resp.headers["content-disposition"]
+
+
+def test_download_non_ascii_filename_does_not_500(client, monkeypatch):
+    # Regression: a non-Latin-1 filename (common in this Lithuanian deployment)
+    # previously crashed Response construction (latin-1 header encoding) → 500.
+    async def _load(ts_pool, output_id, user_id, *, is_admin):
+        return {
+            "id": output_id,
+            "kind": "docx",
+            "output_kind": "final",
+            "fidelity": "preserved",
+            "file_name": "ataskaita_Šiaurė.docx",
+            "raw_payload": _docx_bytes(),
+            "session_user_id": user_id,
+        }
+
+    monkeypatch.setattr(ds, "load_output_for_user", _load)
+    resp = client.get(f"/agent/documents/{uuid4()}/download")
+    assert resp.status_code == 200
+    cd = resp.headers["content-disposition"]
+    assert "filename*=UTF-8''" in cd  # the real (encoded) name is preserved
+    cd.encode("latin-1")  # header value must be latin-1 safe (no crash)
+
+
+def test_content_disposition_sanitizes_quotes_and_controls():
+    from src.api.agent.documents_router import _content_disposition
+
+    cd = _content_disposition('a"b\r\nc.docx')
+    cd.encode("latin-1")  # no raw control chars / crash
+    assert "\r" not in cd and "\n" not in cd
+    # the quoted ascii fallback must not contain a raw double-quote that breaks out
+    fallback = cd.split("filename=", 1)[1].split(";", 1)[0]
+    assert fallback.count('"') == 2  # exactly the surrounding quotes

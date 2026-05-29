@@ -785,9 +785,10 @@ def _body_size_limit_for_path(path: str) -> int:
         from ..adapters.chargers.upload_token import get_max_upload_bytes
 
         return get_max_upload_bytes()
-    if path == "/agent/documents":
+    if path.rstrip("/") == "/agent/documents":
         # Agent document-fill template upload — its own (larger) cap so the
-        # global 1 MiB default doesn't block a multi-MB DOCX/PDF.
+        # global 1 MiB default doesn't block a multi-MB DOCX/PDF. ``rstrip('/')``
+        # so a trailing-slash request doesn't fall back to the 1 MiB global cap.
         from .agent.documents_router import get_doc_upload_max_bytes
 
         return get_doc_upload_max_bytes()

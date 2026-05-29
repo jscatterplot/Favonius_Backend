@@ -65,6 +65,7 @@ class ExtractResult:
     text: str
     fields: list[DetectedField] = field(default_factory=list)
     pdf_form_type: Optional[str] = None  # 'acroform' | 'flat' | None (docx)
+    truncated: bool = False  # text exceeded MAX_TEXT_CHARS and was cut
 
 
 # ── Kind sniffing ──────────────────────────────────────────────────────────
@@ -97,12 +98,16 @@ def _looks_like_docx(body: bytes) -> bool:
     return any(n == "word/document.xml" for n in names)
 
 
-def _sanitize_text(text: str) -> str:
-    """Strip control chars (except tab/newline) and cap length for the LLM."""
+def _sanitize_text(text: str) -> tuple[str, bool]:
+    """Strip control chars (except tab/newline), cap length; flag if truncated.
+
+    Returns ``(cleaned_text, truncated)`` so callers can tell the agent the
+    document was longer than it can see — otherwise fields/anchors past the cap
+    are silently undetected and any fill for them is silently dropped.
+    """
     cleaned = "".join(ch for ch in text if ch in ("\t", "\n") or ord(ch) >= 32)
-    if len(cleaned) > MAX_TEXT_CHARS:
-        cleaned = cleaned[:MAX_TEXT_CHARS]
-    return cleaned
+    truncated = len(cleaned) > MAX_TEXT_CHARS
+    return (cleaned[:MAX_TEXT_CHARS] if truncated else cleaned), truncated
 
 
 # ── Extraction ───────────────────────────────────────────────────────────────
@@ -128,7 +133,7 @@ def _extract_docx(body: bytes) -> ExtractResult:
         raise DocumentRenderError(f"could not open docx: {exc}") from exc
 
     parts: list[str] = [p.text for p in _iter_docx_paragraphs(doc)]
-    text = _sanitize_text("\n".join(parts))
+    text, truncated = _sanitize_text("\n".join(parts))
 
     seen: set[str] = set()
     fields: list[DetectedField] = []
@@ -136,7 +141,9 @@ def _extract_docx(body: bytes) -> ExtractResult:
         if name not in seen:
             seen.add(name)
             fields.append(DetectedField(name=name, source="jinja"))
-    return ExtractResult(kind="docx", text=text, fields=fields, pdf_form_type=None)
+    return ExtractResult(
+        kind="docx", text=text, fields=fields, pdf_form_type=None, truncated=truncated
+    )
 
 
 def _iter_docx_paragraphs(doc: Any):
@@ -173,7 +180,7 @@ def _extract_pdf(body: bytes) -> ExtractResult:
             text_parts.append(page.extract_text() or "")
         except Exception:  # noqa: BLE001 - one bad page shouldn't sink extraction
             continue
-    text = _sanitize_text("\n".join(text_parts))
+    text, truncated = _sanitize_text("\n".join(text_parts))
 
     fields: list[DetectedField] = []
     form_type = "flat"
@@ -181,11 +188,16 @@ def _extract_pdf(body: bytes) -> ExtractResult:
         acro = reader.get_fields()
     except Exception:  # noqa: BLE001
         acro = None
-    if acro:
+    # ``is not None`` (not truthiness): a PDF carrying an AcroForm with zero
+    # fields ({}) is still a form — keep it 'acroform' so render() preserves the
+    # layout (fill is a no-op, replacements still apply) instead of re-rendering.
+    if acro is not None:
         form_type = "acroform"
         for name in acro.keys():
             fields.append(DetectedField(name=str(name), source="acroform"))
-    return ExtractResult(kind="pdf", text=text, fields=fields, pdf_form_type=form_type)
+    return ExtractResult(
+        kind="pdf", text=text, fields=fields, pdf_form_type=form_type, truncated=truncated
+    )
 
 
 # ── Rendering ────────────────────────────────────────────────────────────────
@@ -340,7 +352,13 @@ def _apply_pdf_replacements(body: bytes, replacements: list[dict[str, Any]]) -> 
                                 new_arr[j] = TextStringObject(new_item)
                                 changed = True
                     if changed:
-                        cs.operations[i] = ((new_arr,) + tuple(operands[1:]), operator)
+                        # Re-wrap as an ArrayObject (not a plain list) — pypdf's
+                        # ContentStream serializer calls write_to_stream on each
+                        # operand, which a bare list does not implement.
+                        cs.operations[i] = (
+                            (ArrayObject(new_arr),) + tuple(operands[1:]),
+                            operator,
+                        )
 
     try:
         reader = PdfReader(io.BytesIO(body))

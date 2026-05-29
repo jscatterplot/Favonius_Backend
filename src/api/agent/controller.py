@@ -1847,6 +1847,7 @@ async def _run_document_fill_turn(
             template_kind=template["kind"],
             template_pdf_form_type=template["pdf_form_type"],
             detected_fields=detected_fields,
+            template_truncated=extracted.truncated,
         )
         qa = await run_qa_turn(
             anthropic_client=client,

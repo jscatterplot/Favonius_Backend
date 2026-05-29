@@ -234,3 +234,24 @@ def test_render_acroform_pdf_applies_replacements():
     reader = pypdf.PdfReader(io.BytesIO(out))
     assert "Client:" in (reader.pages[0].extract_text() or "")
     assert reader.get_fields()["customer_name"].get("/V") == "ACME Fleet"
+
+
+def test_apply_pdf_replacements_handles_tj_array():
+    # Regression: text shown via a kerned `TJ` array (typical of Word/LibreOffice
+    # exports) must be replaced AND re-serialize — previously the operand was
+    # wrapped in a plain list and pypdf raised AttributeError on write.
+    pypdf = pytest.importorskip("pypdf")
+    from pypdf.generic import DecodedStreamObject, NameObject
+
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=300, height=200)
+    page = writer.pages[0]
+    stream = DecodedStreamObject()
+    stream.set_data(b"BT /F1 24 Tf 50 100 Td [(Hel) -50 (lo) ( World)] TJ ET")
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    buf = io.BytesIO()
+    writer.write(buf)
+
+    out = dr._apply_pdf_replacements(buf.getvalue(), [{"find": "World", "replace": "Earth"}])
+    raw = pypdf.PdfReader(io.BytesIO(out)).pages[0].get_contents().get_data()
+    assert b"Earth" in raw and b"World" not in raw
