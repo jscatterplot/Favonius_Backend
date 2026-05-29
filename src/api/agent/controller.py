@@ -542,6 +542,17 @@ async def _run_readiness_turn(
     await emit_step("readiness")
 
     depot_ids = await _resolve_scoped_depots(message, auth, static_pool)
+    if not depot_ids:
+        reply = AgentReply(
+            run_id=run_id,
+            status="not_found",
+            text="I couldn't find any depots in your account to check departure readiness for.",
+            intent="readiness",
+        )
+        await agent_runs_close(ts_pool, run_id, "not_found", reply)
+        await _emit_answer_safe(sse, reply, run_id)
+        return reply
+
     # A day phrase ("tomorrow"/"today") is anchored in the depot's timezone only
     # when exactly one depot is in scope; otherwise the window stays the
     # tz-agnostic next-24h.
@@ -571,8 +582,10 @@ async def _run_readiness_turn(
         # Scan-floor for the SoC merge: 24h before the earliest thing we care
         # about (now, or the window start if it is in the past).
         soc_floor = min(as_of, window_start) - timedelta(hours=24)
-        socs = await _fetch_readiness_socs(ts_pool, vehicle_ids, soc_floor)
-        plan_rows = await ts_pool.fetch(LATEST_PLAN_SQL, depot_uuids)
+        socs, plan_rows = await asyncio.gather(
+            _fetch_readiness_socs(ts_pool, vehicle_ids, soc_floor),
+            ts_pool.fetch(LATEST_PLAN_SQL, depot_uuids),
+        )
         plans_by_depot = {
             str(r["depot_id"]): PlanContext(
                 schedule_json=r["schedule_json"],
