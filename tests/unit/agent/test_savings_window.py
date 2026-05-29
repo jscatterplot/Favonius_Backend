@@ -19,7 +19,7 @@ from src.api.agent.intents.savings import (
 )
 from src.api.agent.plan import TimeWindow
 from src.api.agent.resolve import resolve_time_window
-from src.api.savings import overnight_window_utc
+from src.api.savings import overnight_window_utc, tonight_window_utc
 
 VILNIUS = ZoneInfo("Europe/Vilnius")
 _SENTINEL = __import__("uuid").UUID("00000000-0000-0000-0000-000000000000")
@@ -100,7 +100,7 @@ def test_overnight_invalid_tz_falls_back_to_utc():
     [
         ("how much did we save overnight?", "overnight"),
         ("savings last night", "overnight"),
-        ("what will we save tonight", "overnight"),
+        ("what will we save tonight", "tonight"),
         ("how much did we save yesterday?", "yesterday"),
         ("savings last week", "last_week"),
         ("how much saved this week", "this_week"),
@@ -116,6 +116,19 @@ def test_classify_savings_window(message, expected):
 
 
 # ── resolve_savings_window ───────────────────────────────────────────────────
+
+
+def test_tonight_after_evening_starts_today_not_yesterday():
+    # 22:00 Vilnius (19:00Z, EEST): ``tonight`` is today 17:00 → now, not the
+    # completed window that ended at 07:00 this morning.
+    now = datetime(2026, 5, 28, 19, 0, tzinfo=timezone.utc)
+    start, end = tonight_window_utc(now, "Europe/Vilnius")
+    assert _local(start) == datetime(2026, 5, 28, 17, 0, tzinfo=VILNIUS)
+    assert _local(end) == datetime(2026, 5, 29, 7, 0, tzinfo=VILNIUS)
+    win = resolve_savings_window("how much did we save tonight?", now, "Europe/Vilnius")
+    assert win.kind == "tonight" and win.label == "tonight"
+    assert win.period_start == start
+    assert win.period_end == now
 
 
 def test_resolve_overnight_matches_helper():

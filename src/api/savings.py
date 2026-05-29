@@ -117,6 +117,28 @@ def overnight_window_utc(now_utc: datetime, tz_name: Optional[str]) -> tuple[dat
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
+def tonight_window_utc(now_utc: datetime, tz_name: Optional[str]) -> tuple[datetime, datetime]:
+    """Depot-local window for ``tonight``: current or in-progress overnight cycle.
+
+    After 17:00 local, ``tonight`` is the evening that has already started
+    (today 17:00 → tomorrow 07:00). Before 07:00 local, delegates to
+    :func:`overnight_window_utc` (the night still in progress). Between
+    07:00 and 17:00, also delegates — the upcoming ``tonight`` has not
+    started yet, so the most recent completed overnight window is used.
+    """
+    tz = safe_zone(tz_name)
+    local_now = now_utc.astimezone(tz)
+    if local_now.hour >= OVERNIGHT_START_HOUR:
+        start_local = local_now.replace(
+            hour=OVERNIGHT_START_HOUR, minute=0, second=0, microsecond=0
+        )
+        end_local = (start_local + timedelta(days=1)).replace(
+            hour=OVERNIGHT_END_HOUR, minute=0, second=0, microsecond=0
+        )
+        return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+    return overnight_window_utc(now_utc, tz_name)
+
+
 async def _aggregate_priced_sessions(
     ts_conn,
     *,

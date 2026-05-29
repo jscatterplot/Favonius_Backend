@@ -30,11 +30,12 @@ from datetime import datetime
 from typing import Optional
 
 from src.api.agent.resolve import resolve_relative_bounds
-from src.api.savings import overnight_window_utc
+from src.api.savings import overnight_window_utc, tonight_window_utc
 
 # Window kind → human label used in the rendered answer.
 _WINDOW_LABELS: dict[str, str] = {
     "overnight": "overnight",
+    "tonight": "tonight",
     "month_to_date": "this month so far",
     "today": "today",
     "yesterday": "yesterday",
@@ -46,7 +47,8 @@ _WINDOW_LABELS: dict[str, str] = {
 # Ordered (specific → general) phrase patterns. The first match wins; no
 # match falls through to month-to-date (the route's default window).
 _WINDOW_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("overnight", re.compile(r"\b(overnight|last night|tonight)\b")),
+    ("tonight", re.compile(r"\btonight\b")),
+    ("overnight", re.compile(r"\b(overnight|last night)\b")),
     ("yesterday", re.compile(r"\byesterday\b")),
     ("last_week", re.compile(r"\blast week\b")),
     ("this_week", re.compile(r"\b(this week|this past week)\b")),
@@ -103,13 +105,15 @@ def resolve_savings_window(
     kind = classify_savings_window(message)
     label = _WINDOW_LABELS[kind]
 
-    if kind == "overnight":
-        start, end = overnight_window_utc(now, tz_name)
+    if kind in ("overnight", "tonight"):
+        window_fn = tonight_window_utc if kind == "tonight" else overnight_window_utc
+        start, end = window_fn(now, tz_name)
         # Clamp the end to `now` like the calendar windows below: asked between
         # local midnight and 07:00 the canonical 17:00→07:00 window ends in the
         # future, so the day-ahead price average would cover not-yet-charged
         # hours and inflate the baseline against past-only sessions. After
-        # 07:00 the window already ends <= now, so the clamp is a no-op.
+        # 17:00 on ``tonight`` (or after 07:00 for ``overnight``) the clamp
+        # shortens the window to in-progress partial data.
         return SavingsWindow(kind=kind, label=label, period_start=start, period_end=min(end, now))
 
     if kind == "month_to_date":
