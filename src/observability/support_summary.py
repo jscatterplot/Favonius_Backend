@@ -177,8 +177,11 @@ def render_logs_excerpt(records: Iterable[BufferedRecord], *, max_bytes: int) ->
     encoded = text.encode("utf-8", errors="replace")
     if len(encoded) <= max_bytes:
         return text
-    tail = encoded[-max_bytes:].decode("utf-8", errors="replace")
-    return "…(truncated)…\n" + tail
+    marker = "…(truncated)…\n"
+    marker_bytes = len(marker.encode("utf-8"))
+    tail_budget = max(0, max_bytes - marker_bytes)
+    tail = encoded[-tail_budget:].decode("utf-8", errors="replace")
+    return marker + tail
 
 
 def extract_last_error_line(record: Optional[BufferedRecord]) -> Optional[str]:

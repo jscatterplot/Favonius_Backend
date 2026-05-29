@@ -10751,23 +10751,29 @@ async def check_database_health() -> str:
     return await _check_pool_health(db_pools.static if db_pools else None, label="Database")
 
 
-async def check_ocpp_server_health() -> str:
+async def check_ocpp_server_health(server: Any | None = None) -> str:
     """Check OCPP server health.
+
+    Args:
+        server: Optional in-process server instance. When omitted, uses the
+            module-level ``ocpp_server``. Pass a captured reference to avoid
+            TOCTOU if the global is cleared between check and use.
 
     Returns:
         "healthy", "unavailable", or "unknown"
     """
     global ocpp_server
 
-    if ocpp_server is None:
+    active = ocpp_server if server is None else server
+    if active is None:
         return "unknown"
 
     try:
         # Check if server is running
-        if hasattr(ocpp_server, "_running") and ocpp_server._running:
+        if hasattr(active, "_running") and active._running:
             # Check if any charge points are connected
-            if hasattr(ocpp_server, "charge_points"):
-                connected_count = len(ocpp_server.charge_points)
+            if hasattr(active, "charge_points"):
+                connected_count = len(active.charge_points)
                 if connected_count > 0:
                     return "healthy"
                 else:
@@ -10804,8 +10810,9 @@ async def check_websocket_health() -> tuple[str, str]:
       source "http_probe";
     * else → ("unknown", "unknown").
     """
-    if ocpp_server is not None:
-        return await check_ocpp_server_health(), "in_process"
+    active = ocpp_server
+    if active is not None:
+        return await check_ocpp_server_health(active), "in_process"
 
     probe_url = os.getenv("WEBSOCKET_HEALTH_PROBE_URL", "").strip()
     if not probe_url:
