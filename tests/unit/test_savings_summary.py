@@ -128,9 +128,9 @@ class TestComputeSavingsSummary:
             result = _run(compute_savings_summary(static_pool, ts_pool, depot_id, now=now))
 
         assert isinstance(result, SavingsSummary)
-        assert result.current_month_eur == pytest.approx(2143.50)
+        assert result.actual_eur == pytest.approx(2143.50)
         # baseline = 17880 kWh × 0.15275 €/kWh = 2731.17
-        assert result.baseline_month_eur == pytest.approx(2731.17, abs=0.01)
+        assert result.baseline_eur == pytest.approx(2731.17, abs=0.01)
         # savings = baseline - actual ≈ 587.67
         assert result.saved_eur == pytest.approx(587.67, abs=0.02)
         # pct = 587.67 / 2731.17 × 100 ≈ 21.5%
@@ -195,8 +195,8 @@ class TestComputeSavingsSummary:
         ):
             result = _run(compute_savings_summary(static_pool, ts_pool, str(uuid4())))
 
-        assert result.current_month_eur == 0.0
-        assert result.baseline_month_eur == 0.0
+        assert result.actual_eur == 0.0
+        assert result.baseline_eur == 0.0
         assert result.saved_eur == 0.0
         assert result.saved_pct == 0.0
         # Price lookup must NOT happen when there's no energy to baseline against.
@@ -226,8 +226,8 @@ class TestComputeSavingsSummary:
         ):
             result = _run(compute_savings_summary(static_pool, ts_pool, str(uuid4())))
 
-        assert result.current_month_eur == 100.0
-        assert result.baseline_month_eur == 0.0
+        assert result.actual_eur == 100.0
+        assert result.baseline_eur == 0.0
         assert result.saved_eur == -100.0
         assert result.saved_pct == 0.0  # baseline 0 → forced to 0
         # No price query attempted.
@@ -260,7 +260,7 @@ class TestComputeSavingsSummary:
         ):
             result = _run(compute_savings_summary(static_pool, ts_pool, str(uuid4())))
 
-        assert result.baseline_month_eur == 0.0
+        assert result.baseline_eur == 0.0
         assert result.saved_pct == 0.0
 
     def test_imported_only_depot_no_chargers(self, pools_with_data):
@@ -291,9 +291,9 @@ class TestComputeSavingsSummary:
         ):
             result = _run(compute_savings_summary(static_pool, ts_pool, str(uuid4())))
 
-        assert result.current_month_eur == 50.0
+        assert result.actual_eur == 50.0
         # 200 kWh × 0.100 €/kWh = 20.00
-        assert result.baseline_month_eur == pytest.approx(20.00, abs=0.01)
+        assert result.baseline_eur == pytest.approx(20.00, abs=0.01)
         # Note: this scenario produces negative savings (actual > baseline) —
         # the spec doesn't say to clamp, and the frontend can render it.
 
@@ -325,7 +325,7 @@ class TestComputeSavingsSummary:
             result = _run(compute_savings_summary(static_pool, ts_pool, str(uuid4())))
 
         # baseline = 10000 kWh × 0.10 = 1000.00; saved = 1000 - 800 = 200
-        assert result.baseline_month_eur == pytest.approx(1000.0)
+        assert result.baseline_eur == pytest.approx(1000.0)
         assert result.saved_eur == pytest.approx(200.0)
         assert result.saved_pct == pytest.approx(20.0)
 
@@ -364,8 +364,8 @@ class TestComputeSavingsSummary:
             result = _run(compute_savings_summary(static_pool, ts_pool, str(uuid4())))
 
         # baseline = 1000 kWh × -0.01 €/kWh = -10.00 (NOT zeroed out)
-        assert result.baseline_month_eur == pytest.approx(-10.0)
-        assert result.current_month_eur == pytest.approx(-5.0)
+        assert result.baseline_eur == pytest.approx(-10.0)
+        assert result.actual_eur == pytest.approx(-5.0)
         # saved = -10.00 - (-5.00) = -5.00 → we did €5 worse than baseline
         assert result.saved_eur == pytest.approx(-5.0)
         # pct uses abs(baseline) denominator so the sign reflects worse(-)
@@ -405,7 +405,7 @@ class TestComputeSavingsSummary:
             result = _run(compute_savings_summary(static_pool, ts_pool, str(uuid4())))
 
         # baseline = -10.00; saved = -10.00 - (-20.00) = +10.00 (we beat it)
-        assert result.baseline_month_eur == pytest.approx(-10.0)
+        assert result.baseline_eur == pytest.approx(-10.0)
         assert result.saved_eur == pytest.approx(10.0)
         # +10 / |−10| × 100 = +100.0%
         assert result.saved_pct == pytest.approx(100.0)
@@ -429,8 +429,8 @@ class TestSavingsSummaryEndpoint:
         _override_user(_user("customer_admin"))
 
         fake_summary = SavingsSummary(
-            current_month_eur=2143.50,
-            baseline_month_eur=2731.20,
+            actual_eur=2143.50,
+            baseline_eur=2731.20,
             saved_eur=587.70,
             saved_pct=21.5,
             period_start=datetime(2026, 5, 1, 0, 0, tzinfo=timezone.utc),
@@ -478,8 +478,8 @@ class TestSavingsSummaryEndpoint:
         _override_user(_user("customer_operator"))
 
         fake_summary = SavingsSummary(
-            current_month_eur=0.0,
-            baseline_month_eur=0.0,
+            actual_eur=0.0,
+            baseline_eur=0.0,
             saved_eur=0.0,
             saved_pct=0.0,
             period_start=datetime(2026, 5, 1, 0, 0, tzinfo=timezone.utc),
@@ -511,8 +511,8 @@ class TestSavingsSummaryEndpoint:
         _override_user(_user("customer_operator"))
 
         fake_summary = SavingsSummary(
-            current_month_eur=10.0,
-            baseline_month_eur=12.0,
+            actual_eur=10.0,
+            baseline_eur=12.0,
             saved_eur=2.0,
             saved_pct=16.7,
             period_start=datetime(2026, 5, 1, tzinfo=timezone.utc),
@@ -537,8 +537,8 @@ class TestSavingsSummaryEndpoint:
         _override_user(_user("favonius_admin"))
 
         fake_summary = SavingsSummary(
-            current_month_eur=10.0,
-            baseline_month_eur=12.0,
+            actual_eur=10.0,
+            baseline_eur=12.0,
             saved_eur=2.0,
             saved_pct=16.7,
             period_start=datetime(2026, 5, 1, tzinfo=timezone.utc),

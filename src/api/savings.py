@@ -39,10 +39,17 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class SavingsSummary:
-    """Plain dataclass mirror of the response shape (snake_case)."""
+    """Savings figures for one depot over an arbitrary UTC window.
 
-    current_month_eur: float
-    baseline_month_eur: float
+    Field names are window-agnostic; :func:`compute_savings_summary` and
+    :func:`compute_savings_for_window` both populate the same shape. The
+    ``GET /depots/{id}/savings-summary`` route maps ``actual_eur`` /
+    ``baseline_eur`` to ``current_month_eur`` / ``baseline_month_eur`` on the
+    wire for the month-to-date dashboard card.
+    """
+
+    actual_eur: float
+    baseline_eur: float
     saved_eur: float
     saved_pct: float
     period_start: datetime
@@ -275,8 +282,8 @@ async def _compute_savings(
     saved_pct = round((saved / abs(baseline_cost)) * 100.0, 1) if baseline_cost != 0 else 0.0
 
     return SavingsSummary(
-        current_month_eur=actual_cost,
-        baseline_month_eur=baseline_cost,
+        actual_eur=actual_cost,
+        baseline_eur=baseline_cost,
         saved_eur=saved,
         saved_pct=saved_pct,
         period_start=period_start,

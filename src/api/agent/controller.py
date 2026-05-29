@@ -711,14 +711,14 @@ async def _run_savings_turn(
     # cancelling) is still reported as a known baseline, not "no price data".
     priced = [s for s in summaries if s.baseline_known]
     if priced:
-        total_actual = sum(s.current_month_eur for s in priced)
-        total_baseline = sum(s.baseline_month_eur for s in priced)
+        total_actual = sum(s.actual_eur for s in priced)
+        total_baseline = sum(s.baseline_eur for s in priced)
         baseline_known = True
         depot_count = len(priced)
     else:
         # Nothing priceable — report total spend across the depots that
         # computed, with no baseline (render says "can't estimate").
-        total_actual = sum(s.current_month_eur for s in summaries)
+        total_actual = sum(s.actual_eur for s in summaries)
         total_baseline = 0.0
         baseline_known = False
         depot_count = len(summaries)
