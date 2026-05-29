@@ -64,10 +64,10 @@ PlateMap = dict[str, tuple[str, str]]
 # DO NOTHING suppresses the RETURNING for duplicates) instead of overcounting.
 _UPSERT_SQL = """
     INSERT INTO vehicle_telemetry
-        (time, vehicle_id, soc, location_lat, location_lon, source, raw_fields)
+        (time, vehicle_id, soc, location_lat, location_lon, source, raw_fields, odometer_km)
     SELECT * FROM unnest(
         $1::timestamptz[], $2::uuid[], $3::float8[],
-        $4::float8[], $5::float8[], $6::text[], $7::jsonb[]
+        $4::float8[], $5::float8[], $6::text[], $7::jsonb[], $8::float8[]
     )
     ON CONFLICT (vehicle_id, time) DO NOTHING
     RETURNING 1
@@ -173,6 +173,7 @@ def _reading_to_row(vehicle_id: str, reading: VehicleTelemetryReading) -> tuple[
         reading.longitude,
         "navirec",
         json.dumps(_json_safe(reading.raw_fields)),
+        reading.odometer_km,
     )
 
 

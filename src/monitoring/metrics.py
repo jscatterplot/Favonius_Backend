@@ -301,3 +301,47 @@ NAVIREC_STALE_READINGS = Counter(
     "favonius_navirec_stale_readings_total",
     "Readings whose device timestamp already exceeded the telemetry freshness window",
 )
+
+# Diesel wholesale-price feeder metrics (→ diesel_prices hypertable).
+DIESEL_POLL_CYCLES = Counter(
+    "favonius_diesel_poll_cycles_total",
+    "Diesel price poll cycles by outcome",
+    ["outcome"],  # 'ok' | 'fetch_error' | 'skipped_disabled'
+)
+
+DIESEL_POLL_DURATION = Histogram(
+    "favonius_diesel_poll_duration_seconds",
+    "Wall-clock duration of a full diesel price poll cycle",
+    buckets=[0.1, 0.5, 1, 2, 5, 10, 30, 60],
+)
+
+DIESEL_PRICES_WRITTEN = Counter(
+    "favonius_diesel_prices_written_total",
+    "Diesel price rows upserted into diesel_prices",
+    ["region", "source"],
+)
+
+DIESEL_PRICE_FETCH_FAILURES = Counter(
+    "favonius_diesel_price_fetch_failures_total",
+    "Diesel price source fetch failures",
+    ["source", "reason"],
+)
+
+# EV-vs-diesel cost-per-km computation metrics (ev_vs_diesel_tco report).
+COST_PER_KM_COMPUTED = Counter(
+    "favonius_cost_per_km_computed_total",
+    "EV-vs-diesel cost-per-km computations by outcome",
+    ["outcome"],  # 'ok' | 'no_diesel_price' | 'no_distance' | 'error'
+)
+
+COST_PER_KM_DURATION = Histogram(
+    "favonius_cost_per_km_duration_seconds",
+    "Wall-clock time to compute one depot's EV-vs-diesel comparison",
+    buckets=[0.05, 0.1, 0.25, 0.5, 1, 2, 5],
+)
+
+COST_PER_KM_UNPRICEABLE_VEHICLES = Counter(
+    "favonius_cost_per_km_unpriceable_vehicles_total",
+    "Vehicles omitted from the % comparison (no distance or no diesel price)",
+    ["reason"],  # 'no_distance' | 'no_diesel_price' | 'zero_distance'
+)

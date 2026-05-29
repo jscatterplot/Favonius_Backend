@@ -8,7 +8,9 @@ import pytest
 from pydantic import ValidationError
 
 from src.adapters.navirec.mapping import (
+    _MAX_ODOMETER_KM,
     VehicleTelemetryReading,
+    _coerce_odometer,
     navirec_vehicle_to_reading,
     normalize_plate,
     parse_navirec_point,
@@ -165,9 +167,11 @@ def test_parse_navirec_point_plate_independent():
     assert p.time == _TS_DT
 
 
-def test_parse_navirec_point_requires_soc_and_time():
-    assert parse_navirec_point({"timestamp": _TS}) is None  # no soc
+def test_parse_navirec_point_requires_signal_and_time():
+    # A timestamp plus at least one signal (soc OR odometer) is required.
+    assert parse_navirec_point({"timestamp": _TS}) is None  # no soc, no odometer
     assert parse_navirec_point({"soc": 50}) is None  # no timestamp
+    assert parse_navirec_point({"odometer": 1000}) is None  # no timestamp
 
 
 def test_blank_higher_priority_field_falls_through():
@@ -185,3 +189,91 @@ def test_model_rejects_out_of_range_soc():
         VehicleTelemetryReading(vehicle_plate="X", soc=2.0, time=_TS_DT)
     with pytest.raises(ValidationError):
         VehicleTelemetryReading(vehicle_plate="", soc=0.5, time=_TS_DT)
+
+
+# ── Odometer (CAN-bus mileage) ────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (12345.6, pytest.approx(12345.6)),
+        (0, pytest.approx(0.0)),
+        ("98765", pytest.approx(98765.0)),  # string-encoded numeric
+        (-1, None),  # negative odometer is impossible
+        (float("nan"), None),  # non-finite never fabricates a reading
+        (float("inf"), None),
+        (True, None),  # bool must not read as 1.0 km
+        (False, None),
+        (_MAX_ODOMETER_KM + 1, None),  # above sanity ceiling → garbage
+        ("n/a", None),  # unparseable
+        (None, None),
+    ],
+)
+def test_coerce_odometer(raw, expected):
+    assert _coerce_odometer(raw) == expected
+
+
+def test_reading_with_odometer():
+    r = navirec_vehicle_to_reading(
+        {"plate": "X1", "soc": 80, "odometer": 54321.0, "timestamp": _TS}
+    )
+    assert r is not None
+    assert r.soc == pytest.approx(0.80)
+    assert r.odometer_km == pytest.approx(54321.0)
+
+
+def test_reading_odometer_only_no_soc_is_kept():
+    # The key decoupling: an odometer-only record (no SoC) must survive so
+    # distance reporting works even when the device omits SoC.
+    r = navirec_vehicle_to_reading({"plate": "X1", "odometer": 12000, "timestamp": _TS})
+    assert r is not None
+    assert r.soc is None
+    assert r.odometer_km == pytest.approx(12000.0)
+
+
+def test_reading_soc_only_no_odometer_is_kept():
+    # And the reverse: a SoC-only record (no odometer) is still kept, with
+    # odometer_km left None.
+    r = navirec_vehicle_to_reading({"plate": "X1", "soc": 55, "timestamp": _TS})
+    assert r is not None
+    assert r.soc == pytest.approx(0.55)
+    assert r.odometer_km is None
+
+
+def test_reading_neither_soc_nor_odometer_returns_none():
+    assert navirec_vehicle_to_reading({"plate": "X1", "timestamp": _TS}) is None
+
+
+def test_reading_bad_odometer_with_valid_soc_keeps_reading_drops_odometer():
+    # A garbage odometer must not discard an otherwise-valid SoC reading.
+    r = navirec_vehicle_to_reading({"plate": "X1", "soc": 60, "odometer": -99, "timestamp": _TS})
+    assert r is not None
+    assert r.soc == pytest.approx(0.60)
+    assert r.odometer_km is None
+
+
+def test_reading_odometer_key_aliases():
+    for key in ("odometerKm", "totalOdometer", "mileage", "totalDistance"):
+        r = navirec_vehicle_to_reading({"plate": "X1", key: 4242, "timestamp": _TS})
+        assert r is not None, key
+        assert r.odometer_km == pytest.approx(4242.0), key
+
+
+def test_parse_navirec_point_odometer_only():
+    # History rows may carry only an odometer (no SoC); keep them.
+    p = parse_navirec_point({"odometer": 8000, "timestamp": _TS})
+    assert p is not None
+    assert p.soc is None
+    assert p.odometer_km == pytest.approx(8000.0)
+
+
+def test_model_accepts_none_soc_with_odometer():
+    # soc is now optional on the model; an odometer-only reading is valid.
+    m = VehicleTelemetryReading(vehicle_plate="X", time=_TS_DT, odometer_km=100.0)
+    assert m.soc is None and m.odometer_km == pytest.approx(100.0)
+
+
+def test_model_rejects_negative_odometer():
+    with pytest.raises(ValidationError):
+        VehicleTelemetryReading(vehicle_plate="X", time=_TS_DT, odometer_km=-1.0)

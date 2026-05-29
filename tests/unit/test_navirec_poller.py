@@ -15,6 +15,8 @@ import pytest
 
 from src.adapters.navirec.mapping import VehicleTelemetryReading
 from src.adapters.navirec.poller import (
+    _UPSERT_SQL,
+    _reading_to_row,
     build_plate_map,
     poll_once,
     resolve_readings,
@@ -88,6 +90,34 @@ class FakeClient:
 
 def _reading(plate, soc=0.5, *, time=_NOW):
     return VehicleTelemetryReading(vehicle_plate=plate, soc=soc, time=time)
+
+
+# --------------------------------------------------------------------------
+# _reading_to_row / upsert column contract
+# --------------------------------------------------------------------------
+def test_reading_to_row_includes_odometer_last():
+    r = VehicleTelemetryReading(vehicle_plate="X", soc=0.5, time=_NOW, odometer_km=12345.0)
+    row = _reading_to_row("vX", r)
+    # (time, vehicle_id, soc, lat, lon, source, raw_fields, odometer_km)
+    assert len(row) == 8
+    assert row[0] == _NOW
+    assert row[1] == "vX"
+    assert row[2] == 0.5
+    assert row[5] == "navirec"
+    assert row[7] == 12345.0
+
+
+def test_reading_to_row_odometer_none_when_absent():
+    r = VehicleTelemetryReading(vehicle_plate="X", soc=0.5, time=_NOW)
+    assert _reading_to_row("vX", r)[7] is None
+
+
+def test_upsert_sql_column_and_array_counts_match():
+    # The unnest() array count must match the column list, or the insert fails
+    # at runtime. Guard the 8-column / 8-array contract here.
+    assert _UPSERT_SQL.count("::") == 8  # eight typed unnest arrays
+    assert "odometer_km" in _UPSERT_SQL
+    assert _UPSERT_SQL.count("$") == 8
 
 
 # --------------------------------------------------------------------------

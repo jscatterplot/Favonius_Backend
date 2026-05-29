@@ -27,6 +27,23 @@ _LAT_KEYS = ("latitude", "lat")
 _LON_KEYS = ("longitude", "lon", "lng")
 _TIME_KEYS = ("timestamp", "time", "recordedAt", "lastUpdate", "gpsTime", "positionTime")
 _ID_KEYS = ("id", "vehicleId", "deviceId", "objectId", "imei")
+# CAN-bus odometer. Drives weekly distance (src/core/billing/distance.py) via
+# per-vehicle deltas. Pin the exact key AND its unit (m vs km) after running
+# scripts/probe_navirec_api.py against the live account — see _coerce_odometer.
+_ODOMETER_KEYS = (
+    "odometer",
+    "odometerKm",
+    "totalOdometer",
+    "mileage",
+    "totalDistance",
+    "canOdometer",
+    "obdOdometer",
+)
+
+# Upper sanity bound (km): an odometer above this is taken as a garbage CAN
+# value, not a real reading. Commercial vehicles rarely exceed ~2M km lifetime;
+# 5M leaves generous headroom while still rejecting obvious corruption.
+_MAX_ODOMETER_KM = 5_000_000.0
 
 _NON_ALNUM = re.compile(r"[^A-Z0-9]")
 
@@ -54,13 +71,19 @@ class VehicleTelemetryReading(BaseModel):
 
     Plate (not a Favonius UUID) because Navirec has no knowledge of Favonius
     vehicle ids; the poller resolves plate → vehicle_id against the DB.
+
+    ``soc`` and ``odometer_km`` are both optional: a single Navirec record may
+    carry SoC, odometer, or both. A record with neither is dropped upstream
+    (see :func:`parse_navirec_point`) — but an odometer-only record is kept so
+    distance reporting works even when the device omits SoC, and vice versa.
     """
 
     vehicle_plate: str = Field(..., min_length=1)
-    soc: float = Field(..., ge=0.0, le=1.0)
+    soc: Optional[float] = Field(None, ge=0.0, le=1.0)
     time: datetime
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    odometer_km: Optional[float] = Field(None, ge=0.0)
     raw_fields: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -68,14 +91,20 @@ class ParsedPoint(NamedTuple):
     """Plate-independent telemetry fields parsed from one Navirec record.
 
     Shared by the live mapper and the historical backfill so both parse SoC /
-    time / position identically. The backfill needs this because history rows
-    carry no plate of their own — the vehicle is known from the parent object.
+    odometer / time / position identically. The backfill needs this because
+    history rows carry no plate of their own — the vehicle is known from the
+    parent object.
+
+    ``soc`` and ``odometer_km`` are independently optional (see
+    :func:`parse_navirec_point`): a point survives parsing as long as it has a
+    timestamp plus *at least one* of SoC / odometer.
     """
 
-    soc: float
+    soc: Optional[float]
     time: datetime
     latitude: Optional[float]
     longitude: Optional[float]
+    odometer_km: Optional[float]
 
 
 def _first(raw: dict[str, Any], keys: tuple[str, ...]) -> Any:
@@ -157,6 +186,34 @@ def _safe_coord(value: Any, limit: float) -> Optional[float]:
     return coord
 
 
+def _coerce_odometer(value: Any) -> Optional[float]:
+    """Coerce a telematics odometer reading into kilometres, or ``None``.
+
+    Rejects ``bool`` (``True``→1.0 would fabricate a reading), unparseable
+    input, non-finite (``NaN``/``inf``), negative values, and values above
+    :data:`_MAX_ODOMETER_KM` (obvious CAN-bus garbage). An odometer grows
+    unboundedly so — unlike SoC/coordinates — there is no meaningful upper
+    *clamp*; out-of-range input is dropped to ``None`` rather than clipped, so a
+    spurious spike can't corrupt a distance delta.
+
+    KNOWN LIMITATION (pin via scripts/probe_navirec_api.py): the source UNIT is
+    assumed to be kilometres. If the live feed reports metres, divide by 1000
+    here once the probe confirms it — exactly the same convention as
+    :func:`_coerce_soc`'s percent-vs-fraction note.
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        odo = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(odo):
+        return None
+    if odo < 0 or odo > _MAX_ODOMETER_KM:
+        return None
+    return odo
+
+
 def _coerce_time(value: Any) -> Optional[datetime]:
     """Parse a telematics timestamp into a tz-aware UTC datetime, or ``None``.
 
@@ -198,14 +255,23 @@ def _coerce_time(value: Any) -> Optional[datetime]:
 
 
 def parse_navirec_point(raw: dict[str, Any]) -> Optional[ParsedPoint]:
-    """Parse the plate-independent telemetry fields (SoC + time + position).
+    """Parse the plate-independent telemetry fields (SoC / odometer + time + position).
 
-    Returns ``None`` when SoC or timestamp is missing/unparseable so both the
-    live poller and the historical backfill skip the record rather than abort
-    the cycle. SoC and a source timestamp are mandatory (see ``_coerce_time``).
+    A source timestamp is always mandatory (it's the table's primary-key
+    component and what the freshness/merge windows judge — see ``_coerce_time``).
+    Beyond that, the record is kept when it carries **at least one** usable
+    signal: a SoC *or* an odometer. This decoupling matters because the two
+    feeds serve different consumers — SoC drives the optimizer's freshest-wins
+    merge, odometer drives distance/cost-per-km reporting — and a device that
+    reports only one must not cause the other to be discarded.
+
+    Returns ``None`` (caller skips) when the timestamp is missing/unparseable,
+    or when neither SoC nor odometer is present, so both the live poller and the
+    historical backfill skip the record rather than abort the cycle.
     """
     soc = _coerce_soc(_first(raw, _SOC_KEYS))
-    if soc is None:
+    odometer = _coerce_odometer(_first(raw, _ODOMETER_KEYS))
+    if soc is None and odometer is None:
         return None
     when = _coerce_time(_first(raw, _TIME_KEYS))
     if when is None:
@@ -215,6 +281,7 @@ def parse_navirec_point(raw: dict[str, Any]) -> Optional[ParsedPoint]:
         time=when,
         latitude=_safe_coord(_first(raw, _LAT_KEYS), 90.0),
         longitude=_safe_coord(_first(raw, _LON_KEYS), 180.0),
+        odometer_km=odometer,
     )
 
 
@@ -232,6 +299,7 @@ def reading_from_point(
         time=point.time,
         latitude=point.latitude,
         longitude=point.longitude,
+        odometer_km=point.odometer_km,
         raw_fields=raw_fields,
     )
 
@@ -240,9 +308,9 @@ def navirec_vehicle_to_reading(raw: dict[str, Any]) -> Optional[VehicleTelemetry
     """Map one Navirec vehicle object (carrying its plate) to a reading, or ``None``.
 
     Returns ``None`` (caller skips) when the object lacks a usable plate, a
-    parseable SoC, or a source timestamp — the optimizer only consumes SoC, so
-    a record we can't attribute or time-stamp would be dead weight (or worse,
-    misleading) in ``vehicle_telemetry``.
+    source timestamp, or both a parseable SoC and odometer — a record we can't
+    attribute, time-stamp, or extract any usable signal from would be dead
+    weight (or worse, misleading) in ``vehicle_telemetry``.
     """
     plate = normalize_plate(_first(raw, _PLATE_KEYS))
     if not plate:

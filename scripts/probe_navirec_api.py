@@ -29,6 +29,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.adapters.navirec import NavirecClient  # noqa: E402
 from src.adapters.navirec.mapping import (  # noqa: E402
+    _ODOMETER_KEYS,
+    _coerce_odometer,
+    _first,
     navirec_vehicle_id,
     navirec_vehicle_plate,
     navirec_vehicle_to_reading,
@@ -66,12 +69,20 @@ async def _amain() -> int:
         print("\nMapper interpretation of the first object:")
         print(f"  plate     → {navirec_vehicle_plate(first)!r}")
         print(f"  navirec_id→ {navirec_vehicle_id(first)!r}")
+        raw_odo = _first(first, _ODOMETER_KEYS)
+        print(f"  odometer  → raw={raw_odo!r} coerced_km={_coerce_odometer(raw_odo)!r}")
         reading = navirec_vehicle_to_reading(first)
         print(f"  reading   → {reading!r}")
         if reading is None:
             print(
-                "  ⚠ mapper returned None — plate or SoC field name likely differs; "
-                "update _PLATE_KEYS / _SOC_KEYS in mapping.py."
+                "  ⚠ mapper returned None — plate, SoC, or odometer field name likely "
+                "differs; update _PLATE_KEYS / _SOC_KEYS / _ODOMETER_KEYS in mapping.py."
+            )
+        elif raw_odo is None:
+            print(
+                "  ⚠ no odometer field matched — distance reporting needs it; "
+                "pin _ODOMETER_KEYS in mapping.py against the keys printed above, "
+                "and confirm the UNIT (km vs m) before trusting _coerce_odometer."
             )
     finally:
         await client.aclose()

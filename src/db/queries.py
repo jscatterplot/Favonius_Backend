@@ -313,7 +313,6 @@ async def fetch_prices_by_zone(
     if not rows:
         return {}
 
-
     known: list[tuple[datetime, float]] = []
     for row in rows:
         raw = row["lmp_price_mwh"]
@@ -392,7 +391,11 @@ async def fetch_or_pull_prices_by_zone(
         archive that the API doesn't serve, or an API outage).
     """
     cached = await fetch_prices_by_zone(
-        ts_db, bidding_zone, start_time, end_time, forward_fill_window,
+        ts_db,
+        bidding_zone,
+        start_time,
+        end_time,
+        forward_fill_window,
     )
 
     start_aware = _as_utc_aware(start_time)
@@ -412,7 +415,10 @@ async def fetch_or_pull_prices_by_zone(
             "fetch_or_pull_prices_by_zone: cache miss for zone=%s "
             "[%s, %s) missing=%d hours; EUROPEAN_ELECTRICITY_API "
             "unset — returning partial cache",
-            bidding_zone, start_aware, end_aware, len(missing_hours),
+            bidding_zone,
+            start_aware,
+            end_aware,
+            len(missing_hours),
         )
         return cached
 
@@ -428,13 +434,18 @@ async def fetch_or_pull_prices_by_zone(
         # rate-limit budget per request, not per hour, so one call for
         # the whole window is cheaper than per-hour calls.
         fetched = await adapter.get_day_ahead_prices(
-            start_aware, end_aware, bidding_zone=bidding_zone,
+            start_aware,
+            end_aware,
+            bidding_zone=bidding_zone,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "fetch_or_pull_prices_by_zone: ENTSO-E API call failed "
             "for zone=%s [%s, %s): %s — returning partial cache",
-            bidding_zone, start_aware, end_aware, exc,
+            bidding_zone,
+            start_aware,
+            end_aware,
+            exc,
         )
         return cached
     finally:
@@ -455,7 +466,9 @@ async def fetch_or_pull_prices_by_zone(
            AND time       >= $2
            AND time        < $3
         """,
-        bidding_zone, start_aware, end_aware,
+        bidding_zone,
+        start_aware,
+        end_aware,
     )
     existing_times = {_as_utc_aware(r["time"]) for r in existing_rows}
 
@@ -487,13 +500,18 @@ async def fetch_or_pull_prices_by_zone(
         logger.info(
             "fetch_or_pull_prices_by_zone: pulled %d hours from "
             "ENTSO-E into electricity_prices (zone=%s)",
-            len(new_rows), bidding_zone,
+            len(new_rows),
+            bidding_zone,
         )
 
     # Re-read with forward-fill so the returned dict matches the cache
     # path's shape and semantics exactly.
     return await fetch_prices_by_zone(
-        ts_db, bidding_zone, start_time, end_time, forward_fill_window,
+        ts_db,
+        bidding_zone,
+        start_time,
+        end_time,
+        forward_fill_window,
     )
 
 
@@ -544,6 +562,208 @@ async def resolve_bidding_zone(static_db, site_id: UUID) -> Optional[str]:
     from ..adapters.entsoe.mappings import get_bidding_zone
 
     return get_bidding_zone(tz)
+
+
+# ============ DIESEL PRICE / FUEL BASELINE QUERIES (EV-vs-diesel report) ============
+
+# Hard-coded fleet fuel-consumption defaults (litres / 100 km), keyed by the
+# vehicle_type strings actually present in `vehicles.vehicle_type`. Used as the
+# final fallback when no DB baseline row exists, so the EV-vs-diesel report
+# never blocks on missing config. Figures are typical EU fleet diesel
+# consumption; operators override per org/depot/type via
+# `vehicle_type_fuel_baselines` (Supabase migration 047).
+DEFAULT_FUEL_BASELINES: dict[str, float] = {
+    "bus_large": 35.0,
+    "transit_bus": 35.0,
+    "bus": 30.0,
+    "truck": 28.0,
+    "delivery_van": 11.0,
+    "van": 11.0,
+    "car": 6.0,
+    "sedan": 6.0,
+}
+
+# Fallback litres/100km for an unknown vehicle_type (mixed light/medium fleet).
+DEFAULT_FUEL_BASELINE_FLEET = 12.0
+
+# Sentinel key carrying the resolved fleet default in resolve_fuel_baselines'
+# return dict (so callers can look up the default without re-deriving it).
+FUEL_BASELINE_DEFAULT_KEY = "__default__"
+
+
+async def resolve_country_code(static_db, site_id: UUID) -> Optional[str]:
+    """Resolve a depot's ISO 3166-1 alpha-2 country code (for diesel pricing).
+
+    Cascade (mirrors :func:`resolve_bidding_zone`):
+
+    1. ``sites.tariff_config['diesel_country']`` — explicit operator override.
+    2. ``TIMEZONE_TO_COUNTRY[sites.timezone]`` — the static IANA-tz → country
+       map reused from ``src/adapters/entsoe/mappings.py``.
+    3. ``None`` — the caller treats this as "no diesel region" (unpriceable).
+
+    Returns an uppercase 2-letter code or ``None``.
+    """
+    row = await static_db.fetchrow(
+        "SELECT timezone, tariff_config FROM sites WHERE id = $1",
+        site_id,
+    )
+    if row is None:
+        return None
+
+    tariff = row["tariff_config"]
+    if isinstance(tariff, str):
+        try:
+            tariff = json.loads(tariff)
+        except json.JSONDecodeError:
+            tariff = None
+    if isinstance(tariff, dict):
+        explicit = tariff.get("diesel_country")
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip().upper()
+
+    tz = row["timezone"]
+    if not tz:
+        return None
+    # Local import keeps src/db/ free of an adapters/ dep at import time.
+    from ..adapters.entsoe.mappings import TIMEZONE_TO_COUNTRY
+
+    code = TIMEZONE_TO_COUNTRY.get(tz)
+    return code.upper() if code else None
+
+
+async def fetch_or_pull_diesel_price(
+    ts_db,
+    region: str,
+    when: datetime,
+    *,
+    source: Optional[str] = None,
+    max_age: timedelta = timedelta(days=14),
+) -> Optional[float]:
+    """Return the latest wholesale diesel price (€/L) for a region at/around ``when``.
+
+    Read-through cache around ``diesel_prices`` (analogous to
+    :func:`fetch_or_pull_prices_by_zone`): returns the most recent row with
+    ``time <= when`` within ``max_age``. On a miss — and only when a diesel
+    source base URL is configured (``DIESEL_PRICE_API_BASE_URL``) — it lazily
+    fetches from the source, persists (idempotent upsert), and re-reads.
+
+    Returns ``None`` when no price is available (the report treats the region
+    as unpriceable and excludes those vehicles from the % comparison). Never
+    raises on a source/API failure — a pricing gap must not break the report.
+    """
+    from ..adapters.diesel_prices.client import configured_source  # lazy
+
+    src = source or configured_source()
+    when_aware = _as_utc_aware(when)
+    floor = when_aware - max_age
+
+    async def _read_cached() -> Optional[float]:
+        row = await ts_db.fetchrow(
+            """
+            SELECT price_eur_per_l
+            FROM diesel_prices
+            WHERE region = $1 AND source = $2
+              AND time <= $3 AND time >= $4
+              AND price_eur_per_l IS NOT NULL
+            ORDER BY time DESC
+            LIMIT 1
+            """,
+            region.upper(),
+            src,
+            when_aware,
+            floor,
+        )
+        return float(row["price_eur_per_l"]) if row and row["price_eur_per_l"] is not None else None
+
+    cached = await _read_cached()
+    if cached is not None:
+        return cached
+
+    if not os.environ.get("DIESEL_PRICE_API_BASE_URL"):
+        logger.warning(
+            "fetch_or_pull_diesel_price: cache miss for region=%s source=%s at %s; "
+            "DIESEL_PRICE_API_BASE_URL unset — no live fetch, returning None",
+            region,
+            src,
+            when_aware,
+        )
+        return None
+
+    # Lazy import — keep src/db/ free of an adapters/ dep at import time.
+    from ..adapters.diesel_prices.adapter import DieselPriceAdapter
+
+    adapter = DieselPriceAdapter(pool=ts_db)
+    try:
+        prices = await adapter.get_current_prices([region.upper()])
+        if prices:
+            await adapter.store_prices_to_db(prices)
+    except Exception as exc:  # noqa: BLE001 — a pricing gap must not break the report
+        logger.warning(
+            "fetch_or_pull_diesel_price: live fetch failed for region=%s source=%s: %s",
+            region,
+            src,
+            exc,
+        )
+        return None
+    finally:
+        await adapter.aclose()
+
+    return await _read_cached()
+
+
+async def resolve_fuel_baselines(
+    static_db,
+    *,
+    depot_id: UUID,
+    organization_id: UUID,
+) -> dict[str, float]:
+    """Return ``{vehicle_type: litres_per_100km}`` for the EV-vs-diesel report.
+
+    Merges per-org/depot overrides from ``vehicle_type_fuel_baselines`` (Supabase
+    migration 047) on top of the hard-coded :data:`DEFAULT_FUEL_BASELINES`, with
+    precedence (most specific wins): site+type → org+type → site-default →
+    org-default → code default. The resolved fleet default is also returned
+    under :data:`FUEL_BASELINE_DEFAULT_KEY` so callers can price an unknown
+    vehicle_type without re-deriving it.
+
+    Fails open: if the table doesn't exist yet (migration not applied) or the
+    query errors, the code defaults are returned so the report still runs.
+    """
+    out: dict[str, float] = dict(DEFAULT_FUEL_BASELINES)
+    out[FUEL_BASELINE_DEFAULT_KEY] = DEFAULT_FUEL_BASELINE_FLEET
+
+    try:
+        rows = await static_db.fetch(
+            """
+            SELECT site_id, vehicle_type, diesel_l_per_100km
+            FROM vehicle_type_fuel_baselines
+            WHERE organization_id = $1
+              AND (site_id IS NULL OR site_id = $2)
+            """,
+            organization_id,
+            depot_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — table may not exist yet; fail open
+        logger.warning("resolve_fuel_baselines: falling back to code defaults: %s", exc)
+        return out
+
+    # Apply in precedence order: org-default, org+type, site-default, site+type.
+    # Sorting by (site_id present, vehicle_type present) makes later writes win.
+    def _rank(row: Any) -> int:
+        has_site = row["site_id"] is not None
+        has_type = row["vehicle_type"] is not None
+        return (2 if has_site else 0) + (1 if has_type else 0)
+
+    for row in sorted(rows, key=_rank):
+        litres = row["diesel_l_per_100km"]
+        if litres is None or float(litres) <= 0:
+            continue
+        litres = float(litres)
+        if row["vehicle_type"] is None:
+            out[FUEL_BASELINE_DEFAULT_KEY] = litres
+        else:
+            out[row["vehicle_type"]] = litres
+    return out
 
 
 # ============ SCHEDULE QUERIES ============
@@ -777,9 +997,7 @@ async def list_recurring_templates(db, *, depot_id: UUID) -> list[dict]:
     return [_row_to_recurring_template(r) for r in rows]
 
 
-async def get_cancelled_dates_for_templates(
-    db, *, template_ids: list[UUID]
-) -> dict[str, list]:
+async def get_cancelled_dates_for_templates(db, *, template_ids: list[UUID]) -> dict[str, list]:
     """Map ``template_id (str) → sorted list of cancelled occurrence_dates``."""
     if not template_ids:
         return {}
@@ -930,9 +1148,7 @@ async def set_recurring_template_active(
     return _row_to_recurring_template(row) if row else None
 
 
-async def delete_recurring_template(
-    db, *, depot_id: UUID, template_id: UUID
-) -> bool:
+async def delete_recurring_template(db, *, depot_id: UUID, template_id: UUID) -> bool:
     """Delete a template (cascades to cancellations). Returns True if removed."""
     query = """
         DELETE FROM recurring_schedule_template
@@ -968,25 +1184,19 @@ async def upsert_recurring_cancellation(
         RETURNING template_id, occurrence_date, cancelled_at,
                   cancelled_by_user_id, reason
     """
-    row = await db.fetchrow(
-        query, template_id, occurrence_date, cancelled_by_user_id, reason
-    )
+    row = await db.fetchrow(query, template_id, occurrence_date, cancelled_by_user_id, reason)
     return {
         "template_id": str(row["template_id"]),
         "occurrence_date": row["occurrence_date"],
         "cancelled_at": row["cancelled_at"],
         "cancelled_by_user_id": (
-            str(row["cancelled_by_user_id"])
-            if row["cancelled_by_user_id"] is not None
-            else None
+            str(row["cancelled_by_user_id"]) if row["cancelled_by_user_id"] is not None else None
         ),
         "reason": row["reason"],
     }
 
 
-async def delete_recurring_cancellation(
-    db, *, template_id: UUID, occurrence_date
-) -> bool:
+async def delete_recurring_cancellation(db, *, template_id: UUID, occurrence_date) -> bool:
     """Remove a single-occurrence cancellation. Returns True if a row was deleted."""
     query = """
         DELETE FROM recurring_schedule_cancellation
@@ -2869,9 +3079,7 @@ async def rotate_charger_credentials(
     }
 
 
-async def reset_local_auth_cache(
-    db, *, depot_id: str, charger_id: str
-) -> Optional[dict]:
+async def reset_local_auth_cache(db, *, depot_id: str, charger_id: str) -> Optional[dict]:
     """Clear the cached LocalAuthorizationList support outcome for a charger.
 
     Sets ``local_list_supported``, ``local_list_probed_firmware``,
@@ -2943,13 +3151,19 @@ async def reset_local_auth_cache(
     if row is None:
         return None
 
-    previous_supported = row.get("local_list_supported") if hasattr(row, "get") else (
-        row["local_list_supported"] if "local_list_supported" in row.keys() else None
+    previous_supported = (
+        row.get("local_list_supported")
+        if hasattr(row, "get")
+        else (row["local_list_supported"] if "local_list_supported" in row.keys() else None)
     )
-    previous_probed_firmware = row.get("local_list_probed_firmware") if hasattr(row, "get") else (
-        row["local_list_probed_firmware"]
-        if "local_list_probed_firmware" in row.keys()
-        else None
+    previous_probed_firmware = (
+        row.get("local_list_probed_firmware")
+        if hasattr(row, "get")
+        else (
+            row["local_list_probed_firmware"]
+            if "local_list_probed_firmware" in row.keys()
+            else None
+        )
     )
 
     await db.execute(
@@ -3444,9 +3658,7 @@ async def list_completed_sessions_for_charger(
         cursor_ts, cursor_session_id = cursor
         params.append(cursor_ts)
         params.append(cursor_session_id)
-        clauses.append(
-            f"(end_time, session_id) < (${len(params) - 1}, ${len(params)}::uuid)"
-        )
+        clauses.append(f"(end_time, session_id) < (${len(params) - 1}, ${len(params)}::uuid)")
 
     params.append(limit)
     where_sql = " AND ".join(clauses)

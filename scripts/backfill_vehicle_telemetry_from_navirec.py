@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """One-shot historical backfill for ``vehicle_telemetry`` from Navirec.
 
-Pulls historical telematics readings (SoC + position) from Navirec and upserts
-them into the ``vehicle_telemetry`` hypertable so analytics and surrogate-model
-training have data from a depot's first day, not just from when the live poller
-started. Reuses ``src/adapters/navirec`` so plate normalization, reading
-parsing, and the DB upsert are identical to the live feed.
+Pulls historical telematics readings (SoC + CAN-bus odometer + position) from
+Navirec and upserts them into the ``vehicle_telemetry`` hypertable so analytics,
+the EV-vs-diesel cost-per-km report, and surrogate-model training have data from
+a depot's first day, not just from when the live poller started. Reuses
+``src/adapters/navirec`` so plate normalization, reading parsing (incl. the
+odometer field), and the DB upsert are identical to the live feed.
 
 The backfill is **idempotent and re-runnable**: rows upsert with
 ``ON CONFLICT (vehicle_id, time) DO NOTHING`` (the same writer the poller uses),
@@ -149,9 +150,11 @@ async def run_backfill(
         async for raw in client.iter_vehicle_history(
             vehicle_id=nav_id, start_iso=start_iso, end_iso=end_iso
         ):
-            # History rows carry SoC + time but no plate of their own — the
-            # vehicle is already matched, so parse the plate-independent fields
-            # and attach the parent's plate.
+            # History rows carry SoC / odometer + time but no plate of their
+            # own — the vehicle is already matched, so parse the plate-
+            # independent fields and attach the parent's plate. A row with only
+            # an odometer (no SoC) is kept; parse_navirec_point drops a row only
+            # when it has neither signal or no timestamp.
             point = parse_navirec_point(raw)
             if point is None:
                 continue
