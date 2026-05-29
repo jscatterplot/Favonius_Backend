@@ -1,10 +1,19 @@
-"""Unit tests for the four operational alert producers.
+"""Unit tests for the operational alert producers.
 
 Producers covered:
 - ``charger_auth_failure``      (websocket_handler.security_manager)
-- ``degraded_optimization``     (core.controller)
 - ``missing_input``             (core.controller)
-- ``stale_telemetry``           (core.controller)
+
+Suppressed (regression net — must NOT be emitted):
+- ``degraded_optimization``     (core.controller) — silenced; was noise
+- ``stale_telemetry``           (core.controller) — silenced; was noise
+
+``degraded_optimization`` and ``stale_telemetry`` are no longer produced: a
+depot without a live building-load meter or telemetry feed degrades on
+essentially every cycle, so those warnings were pure noise (re-notified hourly
+by the dispatcher). The controller still *resolves* any rows produced before
+the removal so existing active alerts clear. The tests below pin that the
+upsert never fires and the resolves do.
 
 Each test runs the producer code path against an in-memory mock of the
 ``notifications.alerts.upsert_alert`` / ``resolve_alert`` repository so we
@@ -243,7 +252,13 @@ class TestMissingInputProducer:
 
 class TestDegradedOptimizationProducer:
     @pytest.mark.asyncio
-    async def test_degraded_run_emits_degraded_optimization_and_resolves_missing(self):
+    async def test_degraded_run_does_not_emit_degraded_optimization(self):
+        """A building-load degraded run no longer emits any alert.
+
+        The ``degraded_optimization`` warning was silenced (pure noise for
+        depots without a meter). The producer must instead *resolve* all three
+        readiness alert types so any pre-existing active rows clear.
+        """
         org_id = uuid4()
         depot_id = str(uuid4())
         pool, _ = _make_pool()
@@ -264,25 +279,15 @@ class TestDegradedOptimizationProducer:
         ) as resolve:
             await ctrl._emit_readiness_alerts(snapshot, run_status="degraded")
 
-        # Expect one upsert for degraded_optimization, plus a resolve for missing_input.
-        # The stale_telemetry path also resolves because telemetry_all_defaulted
-        # isn't in degraded_reasons.
-        types = [c.kwargs["alert_type"] for c in upsert.await_args_list]
-        assert "degraded_optimization" in types
-        assert "missing_input" not in types
-
-        resolved_keys = [c.kwargs["dedup_key"] for c in resolve.await_args_list]
-        assert f"missing_input:{depot_id}" in resolved_keys
-        assert f"stale_telemetry:{depot_id}" in resolved_keys
-
-        degraded_call = next(
-            c for c in upsert.await_args_list if c.kwargs["alert_type"] == "degraded_optimization"
-        )
-        assert degraded_call.kwargs["severity"].value == "warning"
-        assert degraded_call.kwargs["dedup_key"] == f"degraded_optimization:{depot_id}"
-        body = degraded_call.kwargs["detail"]
-        assert body["degraded_reasons"] == ["building_load_meter_unavailable"]
-        assert body["assumptions"] == {"building_load": {"source": "forecast_fallback"}}
+        # Nothing is emitted for a degraded (building-load) run anymore.
+        upsert.assert_not_awaited()
+        # All three readiness dedup keys are resolved so legacy rows clear.
+        resolved_keys = sorted(c.kwargs["dedup_key"] for c in resolve.await_args_list)
+        assert resolved_keys == [
+            f"degraded_optimization:{depot_id}",
+            f"missing_input:{depot_id}",
+            f"stale_telemetry:{depot_id}",
+        ]
 
     @pytest.mark.asyncio
     async def test_optimal_run_resolves_all_readiness_alerts(self):
@@ -317,7 +322,12 @@ class TestDegradedOptimizationProducer:
 
 class TestStaleTelemetryProducer:
     @pytest.mark.asyncio
-    async def test_telemetry_all_defaulted_emits_stale_telemetry(self):
+    async def test_telemetry_all_defaulted_does_not_emit_stale_telemetry(self):
+        """All-defaulted telemetry no longer emits a ``stale_telemetry`` alert.
+
+        The warning was silenced (pure noise when no telemetry feed exists);
+        the producer resolves the dedup key instead so any active row clears.
+        """
         org_id = uuid4()
         depot_id = str(uuid4())
         pool, _ = _make_pool()
@@ -335,17 +345,12 @@ class TestStaleTelemetryProducer:
             "src.notifications.alerts.upsert_alert", new_callable=AsyncMock
         ) as upsert, patch(
             "src.notifications.alerts.resolve_alert", new_callable=AsyncMock
-        ):
+        ) as resolve:
             await ctrl._emit_readiness_alerts(snapshot, run_status="degraded")
 
-        types = [c.kwargs["alert_type"] for c in upsert.await_args_list]
-        assert "stale_telemetry" in types
-        stale_call = next(
-            c for c in upsert.await_args_list if c.kwargs["alert_type"] == "stale_telemetry"
-        )
-        assert stale_call.kwargs["severity"].value == "warning"
-        assert stale_call.kwargs["dedup_key"] == f"stale_telemetry:{depot_id}"
-        assert stale_call.kwargs["detail"]["context"]["kind"] == "site"
+        upsert.assert_not_awaited()
+        resolved_keys = {c.kwargs["dedup_key"] for c in resolve.await_args_list}
+        assert f"stale_telemetry:{depot_id}" in resolved_keys
 
     @pytest.mark.asyncio
     async def test_no_org_id_skips_emission(self):

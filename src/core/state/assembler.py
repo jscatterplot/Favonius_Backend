@@ -189,7 +189,10 @@ class StateAssembler:
 
         # Validate vehicle_socs matches config
         if not vehicle_socs:
-            logger.warning(
+            # Expected steady state for a depot without a live telemetry feed;
+            # we fall back to a default SoC. Logged at debug to avoid per-cycle
+            # noise (the run's degraded status already records the assumption).
+            logger.debug(
                 f"No vehicle SoC data found for depot {self.depot_id}, "
                 "using default SoC for all configured vehicles"
             )
@@ -201,7 +204,9 @@ class StateAssembler:
         # Ensure all vehicles in config have SoC data
         missing_vehicles = set(self.config.vehicle_capacities.keys()) - set(vehicle_socs.keys())
         if missing_vehicles:
-            logger.warning(f"Missing SoC for vehicles: {missing_vehicles}, using default 0.5")
+            # Per-cycle steady state when some vehicles lack recent telemetry;
+            # logged at debug rather than warning to avoid noise.
+            logger.debug(f"Missing SoC for vehicles: {missing_vehicles}, using default 0.5")
             for vid in missing_vehicles:
                 vehicle_socs[vid] = 0.5
 
@@ -1123,7 +1128,10 @@ class StateAssembler:
             return self._get_building_power_forecast(start, end, n_steps)
 
         if not rows:
-            logger.warning(
+            # Expected steady state for a depot without a building-load meter;
+            # we fall back to the business-hours forecast. Logged at debug to
+            # avoid per-cycle noise (readiness still records the degraded source).
+            logger.debug(
                 f"No building load data found for depot {self.depot_id} "
                 f"between {start} and {end}, using fallback source"
             )

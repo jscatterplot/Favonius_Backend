@@ -681,10 +681,21 @@ class DepotController:
         """Emit / resolve readiness-related alerts based on the latest run.
 
         Called twice in the optimization path:
-        - Before solving with ``run_status=None`` to publish ``missing_input``
-          if readiness blocks the run.
-        - After ``_store_result`` with the final ``run_status`` to publish
-          ``degraded_optimization`` and reconcile ``missing_input``.
+        - Before solving (``run_status=None``), only when readiness blocks the
+          run, to publish the ``missing_input`` alert.
+        - After ``_store_result`` to reconcile alerts once the run finished.
+
+        Only ``missing_input`` (a genuine blocking outage: no vehicles,
+        chargers, prices, or schedules) is emitted. The ``degraded_optimization``
+        and ``stale_telemetry`` warnings are no longer produced — a depot
+        without a live building-load meter or telemetry feed degrades on
+        essentially every cycle, so those alerts were pure noise and the
+        dispatcher re-notified them hourly. The degraded assumptions remain
+        captured in the input snapshot and the run's ``degraded`` status; any
+        rows produced before the removal are resolved here so existing active
+        alerts clear and stop re-notifying. ``run_status`` is retained for the
+        two-phase call contract and to keep re-enabling these alerts a localized
+        change.
 
         Best-effort; failures here never abort the optimization.
         """
@@ -700,11 +711,11 @@ class DepotController:
         # "no recipients for org=…" on every tick forever.
         if not await self._depot_exists_in_supabase():
             logger.info(
-                "skipping readiness alert: depot %s no longer exists in sites "
-                "(org=%s, type=%s)",
+                "skipping readiness alert handling: depot %s no longer exists "
+                "in sites (org=%s, action=%s)",
                 depot_id,
                 org_id,
-                "missing_input" if readiness.is_blocking else "degraded_optimization",
+                "emit missing_input" if readiness.is_blocking else "resolve readiness alerts",
             )
             return
 
@@ -753,75 +764,20 @@ class DepotController:
                     return
 
                 stale_dedup = f"stale_telemetry:{depot_id}"
-                telemetry_stale = "telemetry_all_defaulted" in readiness.degraded_reasons
 
-                # Run was attempted; reconcile based on final status.
-                if run_status == "degraded":
-                    detail = {
-                        "description": (
-                            "Optimization ran with documented assumptions: "
-                            f"{', '.join(readiness.degraded_reasons) or 'unknown'}."
-                        ),
-                        "suggestedAction": (
-                            "Connect the missing data source (e.g. building load "
-                            "meter or telemetry stream) so the next run can use "
-                            "real values instead of fallback assumptions."
-                        ),
-                        "context": {"kind": "site", "id": depot_id, "label": depot_id},
-                        "degraded_reasons": list(readiness.degraded_reasons),
-                        "assumptions": readiness.assumptions,
-                    }
-                    await upsert_alert(
-                        conn,
-                        organization_id=org_uuid,
-                        depot_id=depot_uuid,
-                        alert_type="degraded_optimization",
-                        severity=Severity.WARNING,
-                        title="Optimization degraded — using fallback assumptions",
-                        detail=detail,
-                        dedup_key=degraded_dedup,
-                    )
-                    await resolve_alert(
-                        conn, organization_id=org_uuid, dedup_key=missing_dedup
-                    )
-                else:
-                    # optimal / feasible / timeout / infeasible — clear both.
-                    await resolve_alert(
-                        conn, organization_id=org_uuid, dedup_key=missing_dedup
-                    )
-                    await resolve_alert(
-                        conn, organization_id=org_uuid, dedup_key=degraded_dedup
-                    )
-
-                if telemetry_stale:
-                    stale_detail = {
-                        "description": (
-                            "All vehicles in this depot are missing recent "
-                            "telemetry; the assembler is using a default 50% "
-                            "SoC. Charging schedules may be inaccurate until "
-                            "telemetry resumes."
-                        ),
-                        "suggestedAction": (
-                            "Confirm the OCPP MeterValues feed is connected "
-                            "and that vehicles are plugged in. Check connector "
-                            "status for stuck sessions."
-                        ),
-                        "context": {"kind": "site", "id": depot_id, "label": depot_id},
-                    }
-                    await upsert_alert(
-                        conn,
-                        organization_id=org_uuid,
-                        depot_id=depot_uuid,
-                        alert_type="stale_telemetry",
-                        severity=Severity.WARNING,
-                        title="Vehicle telemetry is stale across the depot",
-                        detail=stale_detail,
-                        dedup_key=stale_dedup,
-                    )
-                else:
-                    await resolve_alert(
-                        conn, organization_id=org_uuid, dedup_key=stale_dedup
-                    )
+                # The run was not blocked (the blocking case returned above), so
+                # ``missing_input`` is always cleared here. ``degraded_optimization``
+                # and ``stale_telemetry`` are intentionally NOT emitted: a depot
+                # without a live building-load meter or telemetry feed runs
+                # degraded on essentially every cycle, so these warnings were pure
+                # noise (re-notified hourly by the dispatcher). The degraded
+                # assumptions remain captured in the input snapshot and the run's
+                # ``degraded`` status. We still resolve any rows produced before
+                # this change so existing active alerts clear from the UI and stop
+                # re-notifying.
+                await resolve_alert(conn, organization_id=org_uuid, dedup_key=missing_dedup)
+                await resolve_alert(conn, organization_id=org_uuid, dedup_key=degraded_dedup)
+                await resolve_alert(conn, organization_id=org_uuid, dedup_key=stale_dedup)
         except Exception:
             logger.warning(
                 "readiness alert emission failed for depot %s",
