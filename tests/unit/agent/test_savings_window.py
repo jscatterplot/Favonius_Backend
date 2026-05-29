@@ -119,10 +119,27 @@ def test_classify_savings_window(message, expected):
 
 
 def test_resolve_overnight_matches_helper():
+    # 09:00 Vilnius (06:00Z, EEST): the canonical 17:00→07:00 window already
+    # ended, so the now-clamp is a no-op and the resolved window equals the
+    # raw helper output.
     now = datetime(2026, 5, 28, 6, 0, tzinfo=timezone.utc)
     win = resolve_savings_window("save overnight", now, "Europe/Vilnius")
     assert win.kind == "overnight" and win.label == "overnight"
     assert (win.period_start, win.period_end) == overnight_window_utc(now, "Europe/Vilnius")
+
+
+def test_resolve_overnight_clamps_end_to_now_before_morning():
+    # 04:00 Vilnius (01:00Z, EEST): the night is still in progress, so the raw
+    # 17:00→07:00 window ends in the future (07:00 local). The resolved window
+    # must clamp period_end back to `now` so the baseline price-average doesn't
+    # include not-yet-charged hours.
+    now = datetime(2026, 5, 28, 1, 0, tzinfo=timezone.utc)
+    raw_start, raw_end = overnight_window_utc(now, "Europe/Vilnius")
+    win = resolve_savings_window("save overnight", now, "Europe/Vilnius")
+    assert win.kind == "overnight"
+    assert raw_end > now  # the canonical window genuinely extends past now
+    assert win.period_end == now  # …and we clamp it back
+    assert win.period_start == raw_start < win.period_end
 
 
 def test_resolve_month_to_date_ends_at_now():

@@ -105,7 +105,12 @@ def resolve_savings_window(
 
     if kind == "overnight":
         start, end = overnight_window_utc(now, tz_name)
-        return SavingsWindow(kind=kind, label=label, period_start=start, period_end=end)
+        # Clamp the end to `now` like the calendar windows below: asked between
+        # local midnight and 07:00 the canonical 17:00→07:00 window ends in the
+        # future, so the day-ahead price average would cover not-yet-charged
+        # hours and inflate the baseline against past-only sessions. After
+        # 07:00 the window already ends <= now, so the clamp is a no-op.
+        return SavingsWindow(kind=kind, label=label, period_start=start, period_end=min(end, now))
 
     if kind == "month_to_date":
         # Month start (depot-local) → now. "this_month" relative gives the
