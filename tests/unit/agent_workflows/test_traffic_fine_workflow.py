@@ -132,6 +132,7 @@ def _extraction(deadline_dt: datetime, **over: Any) -> dict[str, Any]:
     return base
 
 
+@pytest.mark.asyncio
 async def test_within_window_raises_alert(patched: SimpleNamespace) -> None:
     client = _client_for(_extraction(NOW + timedelta(hours=36)))
     await tf.triage_traffic_fine(
@@ -148,6 +149,7 @@ async def test_within_window_raises_alert(patched: SimpleNamespace) -> None:
     assert content[0]["source"]["media_type"] == "application/pdf"
 
 
+@pytest.mark.asyncio
 async def test_not_yet_does_not_alert(patched: SimpleNamespace) -> None:
     client = _client_for(_extraction(NOW + timedelta(days=10)))
     await tf.triage_traffic_fine(
@@ -157,6 +159,7 @@ async def test_not_yet_does_not_alert(patched: SimpleNamespace) -> None:
     assert patched.alerts == []
 
 
+@pytest.mark.asyncio
 async def test_not_a_fine_does_not_alert(patched: SimpleNamespace) -> None:
     client = _client_for(_extraction(NOW + timedelta(hours=12), is_traffic_fine=False))
     await tf.triage_traffic_fine(

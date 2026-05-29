@@ -57,6 +57,7 @@ def _candidate(deadline_dt: datetime) -> dict[str, Any]:
     }
 
 
+@pytest.mark.asyncio
 async def test_sweep_raises_only_for_due_fines(monkeypatch: pytest.MonkeyPatch) -> None:
     due = _candidate(NOW + timedelta(hours=12))  # inside the 48h window
     far = _candidate(NOW + timedelta(days=10))  # outside (defensive — re-checked)
@@ -88,6 +89,7 @@ async def test_sweep_raises_only_for_due_fines(monkeypatch: pytest.MonkeyPatch) 
     assert marked == [due["id"]]
 
 
+@pytest.mark.asyncio
 async def test_sweep_skips_unparseable_extraction(monkeypatch: pytest.MonkeyPatch) -> None:
     bad = {
         "id": uuid4(),
