@@ -20,7 +20,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 # ── Wire enums (camelCase values as the frontend Zod schemas expect) ──────────
 
 VALID_KINDS = frozenset(
-    {"weekly_ops", "monthly_savings", "monthly_consumption", "incident", "compliance"}
+    {
+        "weekly_ops",
+        "monthly_savings",
+        "monthly_consumption",
+        "incident",
+        "compliance",
+        "ev_vs_diesel_tco",
+    }
 )
 VALID_GROUP_BY = frozenset({"card", "vehicle"})
 VALID_FREQUENCIES = frozenset({"weekly", "monthly", "quarterly"})
@@ -323,6 +330,11 @@ def _validate_kind_and_group_by(kind: object, group_by: object) -> tuple[str, st
         )
     if kind == "monthly_consumption" and group_by is None:
         raise ScheduleValidationError("groupBy is required for kind 'monthly_consumption'")
+    # The EV-vs-diesel comparison groups internally by vehicle type + fleet
+    # total, so an explicit groupBy is meaningless here — reject it rather than
+    # silently ignore so the wire contract stays unambiguous.
+    if kind == "ev_vs_diesel_tco" and group_by is not None:
+        raise ScheduleValidationError("groupBy is not supported for kind 'ev_vs_diesel_tco'")
     return kind, group_by  # type: ignore[return-value]
 
 

@@ -46,7 +46,13 @@ REQUIRED: dict[str, frozenset[str]] = {
         }
     ),
     "connector_status": frozenset({"station_id", "connector_id", "status", "timestamp"}),
-    "telemetry": frozenset({"time", "vehicle_id", "soc", "charging_kw", "charger_id", "is_plugged"}),
+    "telemetry": frozenset(
+        {"time", "vehicle_id", "soc", "charging_kw", "charger_id", "is_plugged"}
+    ),
+    # vehicle_telemetry.odometer_km (migration 047) backs the EV-vs-diesel report's
+    # distance; diesel_prices (migration 047) is read by fetch_or_pull_diesel_price.
+    "vehicle_telemetry": frozenset({"time", "vehicle_id", "soc", "odometer_km"}),
+    "diesel_prices": frozenset({"time", "region", "source", "price_eur_per_l"}),
 }
 
 

@@ -96,17 +96,13 @@ def _apply_group_id(
         if representative is not None and representative.card_id is not None:
             row_payload["card_id"] = representative.card_id
             row_payload["card_label"] = (
-                representative.card_label
-                or representative.card_id_tag
-                or representative.card_id
+                representative.card_label or representative.card_id_tag or representative.card_id
             )
         else:
             row_payload["card_label"] = _UNASSIGNED if value is None else value
 
 
-def _window_utc_bounds(
-    timezone: str, from_date: date, to_date: date
-) -> tuple[datetime, datetime]:
+def _window_utc_bounds(timezone: str, from_date: date, to_date: date) -> tuple[datetime, datetime]:
     """Compute the half-open UTC window for the depot-local calendar range."""
     tz = ZoneInfo(timezone)
     window_start_local = datetime.combine(from_date, datetime.min.time())
@@ -117,9 +113,7 @@ def _window_utc_bounds(
     )
 
 
-def _session_in_window(
-    row: SessionRow, start_utc: datetime, end_utc: datetime
-) -> bool:
+def _session_in_window(row: SessionRow, start_utc: datetime, end_utc: datetime) -> bool:
     """Return True when ``row.start_time`` is inside the half-open UTC window."""
     start = row.start_time
     if start.tzinfo is None:
@@ -156,16 +150,12 @@ def _accumulate(agg: dict[str, float], row: SessionRow) -> None:
         agg["cost_total_sum"] += float(row.cost_total)
 
 
-def _finalize_agg(
-    agg: dict[str, float], under_cap_rate: Optional[float], currency: str
-) -> dict:
+def _finalize_agg(agg: dict[str, float], under_cap_rate: Optional[float], currency: str) -> dict:
     """Project an accumulator into the report payload (excluding ``bucket``)."""
     estimated = agg["cost_missing_count"] > 0
     if estimated:
         cost_amount = agg["cost_total_sum"] + (
-            agg["energy_kwh_missing_cost"] * under_cap_rate
-            if under_cap_rate is not None
-            else 0.0
+            agg["energy_kwh_missing_cost"] * under_cap_rate if under_cap_rate is not None else 0.0
         )
     else:
         cost_amount = agg["cost_total_sum"]
@@ -366,6 +356,79 @@ def stream_rows_as_csv(
             totals_cost.get("amount", 0.0),
             totals_cost.get("currency", ""),
             "true" if totals_cost.get("estimated") else "false",
+        ]
+        writer.writerow(record)
+        yield buffer.getvalue()
+        buffer.seek(0)
+        buffer.truncate(0)
+
+
+TCO_CSV_COLUMNS: tuple[str, ...] = (
+    "vehicle_type",
+    "vehicle_count",
+    "distance_km",
+    "ev_energy_kwh",
+    "ev_cost",
+    "ev_eur_per_km",
+    "diesel_litres",
+    "diesel_cost",
+    "diesel_eur_per_km",
+    "pct_difference",
+)
+
+
+def _tco_cell(value: Optional[float]) -> str:
+    """Render an optional numeric cell — empty string for None (unpriceable)."""
+    return "" if value is None else str(value)
+
+
+def stream_tco_rows_as_csv(data: dict) -> Iterator[str]:
+    """Yield CSV chunks for an ``ev_vs_diesel_tco`` report's stored ``data``.
+
+    One header row, one row per vehicle type (from ``by_vehicle_type``), and a
+    final ``TOTAL`` fleet row (from ``totals``). The row shape differs from the
+    energy report's, so this is a dedicated writer rather than an overload of
+    :func:`stream_rows_as_csv`. Unpriceable / unknown numeric cells are emitted
+    as empty strings (not 0) so a consumer can tell "no data" from "zero".
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(TCO_CSV_COLUMNS)
+    yield buffer.getvalue()
+    buffer.seek(0)
+    buffer.truncate(0)
+
+    for row in data.get("by_vehicle_type") or []:
+        record = [
+            str(row.get("vehicle_type", "")),
+            str(row.get("vehicle_count", 0)),
+            _tco_cell(row.get("distance_km")),
+            _tco_cell(row.get("ev_energy_kwh")),
+            _tco_cell(row.get("ev_cost")),
+            _tco_cell(row.get("ev_eur_per_km")),
+            _tco_cell(row.get("diesel_litres")),
+            _tco_cell(row.get("diesel_cost")),
+            _tco_cell(row.get("diesel_eur_per_km")),
+            _tco_cell(row.get("pct_difference")),
+        ]
+        writer.writerow(record)
+        yield buffer.getvalue()
+        buffer.seek(0)
+        buffer.truncate(0)
+
+    totals = data.get("totals") or {}
+    if totals:
+        record = [
+            "TOTAL",
+            "",
+            _tco_cell(totals.get("distance_km")),
+            "",
+            _tco_cell(totals.get("ev_cost")),
+            _tco_cell(totals.get("ev_eur_per_km")),
+            _tco_cell(totals.get("diesel_litres")),
+            _tco_cell(totals.get("diesel_cost")),
+            _tco_cell(totals.get("diesel_eur_per_km")),
+            _tco_cell(totals.get("pct_difference")),
         ]
         writer.writerow(record)
         yield buffer.getvalue()

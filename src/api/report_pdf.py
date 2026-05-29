@@ -36,6 +36,47 @@ def _fmt_cost(cost: Any) -> str:
     return f"{amount:.2f} {currency}{suffix}".strip()
 
 
+def _base_table_style(*, has_total_row: bool) -> TableStyle:
+    """Shared table palette for all report tables (DRY across report kinds).
+
+    Adds bold + a rule above the last row when ``has_total_row`` so a TOTAL/
+    fleet-summary row stands out.
+    """
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d1d5db")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f3f4f6")]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]
+    if has_total_row:
+        style.append(("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"))
+        style.append(("LINEABOVE", (0, -1), (-1, -1), 0.75, colors.HexColor("#1f2937")))
+    return TableStyle(style)
+
+
+def _fmt_num(value: Any, digits: int = 2) -> str:
+    """Format an optional number to ``digits`` places, or ``—`` when None."""
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _fmt_pct(value: Any) -> str:
+    """Format a signed percentage (positive = EV cheaper), or ``—`` when None."""
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):+.1f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
 def _consumption_table(data: dict) -> Table:
     group_by = data.get("group_by")
     rows = data.get("rows") or []
@@ -84,20 +125,128 @@ def _consumption_table(data: dict) -> Table:
         table_data.append(total_cells)
 
     table = Table(table_data, repeatRows=1)
-    style = [
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d1d5db")),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f3f4f6")]),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]
-    if totals is not None:
-        style.append(("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"))
-        style.append(("LINEABOVE", (0, -1), (-1, -1), 0.75, colors.HexColor("#1f2937")))
-    table.setStyle(TableStyle(style))
+    table.setStyle(_base_table_style(has_total_row=totals is not None))
     return table
+
+
+def _tco_story(data: dict, styles: Any) -> list[Any]:
+    """Build the EV-vs-diesel comparison flowables (headline + two tables).
+
+    ``data`` is the JSON stored by serialize_fleet_km_result: a ``by_vehicle_type``
+    list, a ``totals`` dict, and the diesel context. Unknown / unpriceable cells
+    render as ``—``; a headline paragraph states the fleet savings when positive.
+    """
+    flowables: list[Any] = []
+    totals = data.get("totals") or {}
+    currency = data.get("currency") or ""
+    fleet_pct = totals.get("pct_difference")
+
+    # Headline.
+    if isinstance(fleet_pct, (int, float)):
+        if fleet_pct > 0:
+            headline = (
+                f"Electrifying this fleet is {fleet_pct:.1f}% cheaper per kilometre "
+                f"than diesel."
+            )
+        elif fleet_pct < 0:
+            headline = (
+                f"This fleet is currently {abs(fleet_pct):.1f}% more expensive per "
+                f"kilometre than diesel."
+            )
+        else:
+            headline = "This fleet's per-kilometre cost matches diesel."
+        flowables.append(Paragraph(headline, styles["Heading2"]))
+        flowables.append(Spacer(1, 4 * mm))
+
+    region = data.get("diesel_region")
+    price = data.get("diesel_price_eur_per_l")
+    flowables.append(
+        Paragraph(
+            f"Wholesale diesel price: {_fmt_num(price, 3)} EUR/L"
+            + (f" ({region})" if region else ""),
+            styles["Normal"],
+        )
+    )
+    if data.get("currency_mismatch"):
+        flowables.append(
+            Paragraph(
+                f"⚠ EV cost is in {currency} but diesel is priced in EUR — the "
+                f"per-km comparison mixes currencies.",
+                styles["Italic"],
+            )
+        )
+    flowables.append(Spacer(1, 6 * mm))
+
+    by_type = data.get("by_vehicle_type") or []
+    if not by_type:
+        flowables.append(
+            Paragraph(
+                "No vehicles with both measured distance and a diesel price in "
+                "this period — nothing to compare.",
+                styles["Italic"],
+            )
+        )
+        return flowables
+
+    # Per-vehicle-type table.
+    header = [
+        "Vehicle type",
+        "Vehicles",
+        "Distance (km)",
+        "EV kWh",
+        f"EV {currency}/km",
+        "Diesel L/100km*",
+        "Diesel EUR/km",
+        "Δ % saved",
+    ]
+    table_data: list[list[str]] = [header]
+    for a in by_type:
+        # Derive the implied L/100km for display (litres / distance * 100).
+        dist = a.get("distance_km")
+        litres = a.get("diesel_litres")
+        l_per_100 = (litres / dist * 100.0) if dist and litres is not None else None
+        table_data.append(
+            [
+                str(a.get("vehicle_type", "")),
+                str(a.get("vehicle_count", 0)),
+                _fmt_num(a.get("distance_km"), 1),
+                _fmt_num(a.get("ev_energy_kwh"), 1),
+                _fmt_num(a.get("ev_eur_per_km"), 4),
+                _fmt_num(l_per_100, 1),
+                _fmt_num(a.get("diesel_eur_per_km"), 4),
+                _fmt_pct(a.get("pct_difference")),
+            ]
+        )
+    type_table = Table(table_data, repeatRows=1)
+    type_table.setStyle(_base_table_style(has_total_row=False))
+    flowables.append(type_table)
+    flowables.append(Spacer(1, 6 * mm))
+
+    # Fleet summary table.
+    summary_header = [
+        f"Fleet EV {currency}/km",
+        "Fleet diesel EUR/km",
+        "Savings %",
+        "Total distance (km)",
+    ]
+    summary_row = [
+        _fmt_num(totals.get("ev_eur_per_km"), 4),
+        _fmt_num(totals.get("diesel_eur_per_km"), 4),
+        _fmt_pct(totals.get("pct_difference")),
+        _fmt_num(totals.get("distance_km"), 1),
+    ]
+    summary_table = Table([summary_header, summary_row], repeatRows=1)
+    summary_table.setStyle(_base_table_style(has_total_row=False))
+    flowables.append(summary_table)
+    flowables.append(Spacer(1, 3 * mm))
+    flowables.append(
+        Paragraph(
+            "* Diesel litres/100km are configured per-vehicle-type baselines for "
+            "an equivalent diesel vehicle; EV figures are measured.",
+            styles["Italic"],
+        )
+    )
+    return flowables
 
 
 def render_report_pdf(
@@ -141,6 +290,8 @@ def render_report_pdf(
             story.append(Paragraph(f"Grouped by: {group_by}", styles["Normal"]))
             story.append(Spacer(1, 4 * mm))
         story.append(_consumption_table(data))
+    elif kind == "ev_vs_diesel_tco" and isinstance(data, dict):
+        story.extend(_tco_story(data, styles))
     else:
         story.append(
             Paragraph(

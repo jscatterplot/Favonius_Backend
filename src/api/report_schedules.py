@@ -449,9 +449,7 @@ async def finalize_run(
     )
 
 
-async def _persist_run_report_id(
-    conn: "asyncpg.Connection", run_id: str, report_id: str
-) -> None:
+async def _persist_run_report_id(conn: "asyncpg.Connection", run_id: str, report_id: str) -> None:
     """Record the generated report on an in-flight run so stale retries can resume."""
     await conn.execute(
         """
@@ -657,12 +655,18 @@ def render_attachment(fmt: str, report_row: "asyncpg.Record", parsed_data: Optio
             filename=f"{base_name}.pdf", content=content, content_type="application/pdf"
         )
 
-    # CSV: reuse the same streamer the export endpoint uses.
-    from .reports import stream_rows_as_csv
+    # CSV: the EV-vs-diesel report has a different row shape, so it uses a
+    # dedicated streamer; every other kind streams the energy-row shape.
+    if kind == "ev_vs_diesel_tco":
+        from .reports import stream_tco_rows_as_csv
 
-    rows = (parsed_data or {}).get("rows", [])
-    totals = (parsed_data or {}).get("totals")
-    csv_text = "".join(stream_rows_as_csv(rows, group_by=report_row["group_by"], totals=totals))
+        csv_text = "".join(stream_tco_rows_as_csv(parsed_data or {}))
+    else:
+        from .reports import stream_rows_as_csv
+
+        rows = (parsed_data or {}).get("rows", [])
+        totals = (parsed_data or {}).get("totals")
+        csv_text = "".join(stream_rows_as_csv(rows, group_by=report_row["group_by"], totals=totals))
     return EmailAttachment(
         filename=f"{base_name}.csv", content=csv_text.encode("utf-8"), content_type="text/csv"
     )
@@ -693,8 +697,7 @@ def _build_report_message(
     lead = "Your scheduled report" if scheduled else "Your report"
     body_text = f"{lead} '{title}' is attached.\n\nPeriod: {period_label}\n"
     body_html = (
-        f"<p>{lead} <strong>{title}</strong> is attached.</p>"
-        f"<p>Period: {period_label}</p>"
+        f"<p>{lead} <strong>{title}</strong> is attached.</p>" f"<p>Period: {period_label}</p>"
     )
     return EmailMessage(
         to=to_email,
@@ -1087,9 +1090,7 @@ async def append_delivery_status_from_webhook(
     await insert_delivery(
         conn,
         run_id=str(latest["run_id"]),
-        recipient_id=(
-            str(latest["recipient_id"]) if latest["recipient_id"] is not None else None
-        ),
+        recipient_id=(str(latest["recipient_id"]) if latest["recipient_id"] is not None else None),
         email_address=latest["email_address"],
         fmt=latest["format"],
         status=mapped,

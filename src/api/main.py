@@ -623,6 +623,15 @@ async def lifespan(app: FastAPI):
     _create_background_task(run_navirec_poll_loop(static_pool, ts_pool))
     logger.info("Navirec telematics poller task started")
 
+    # ── Diesel wholesale-price feeder ─────────────────────────────────────────
+    # Keeps diesel_prices warm for the EV-vs-diesel cost-per-km report. No-ops
+    # unless DIESEL_PRICE_POLL_ENABLED=true. The loop never raises out (failed
+    # cycles are logged + retried on the next interval).
+    from ..adapters.diesel_prices import run_diesel_poll_loop  # noqa: PLC0415
+
+    _create_background_task(run_diesel_poll_loop(static_pool, ts_pool))
+    logger.info("Diesel price feeder task started")
+
     # ── SQL-agent token-budget reconcile ──────────────────────────────────────
     # Flushes low-traffic usage that never trips the on-write threshold and
     # re-hydrates cross-worker totals on a timer (bounds multi-worker over-spend).
@@ -652,16 +661,13 @@ async def lifespan(app: FastAPI):
                     ts_pool=ts_pool,
                 )
                 logger.info(
-                    "Daily readiness workflow registered: %s "
-                    "(tiers_seeded=%d, depots_seen=%d)",
+                    "Daily readiness workflow registered: %s " "(tiers_seeded=%d, depots_seen=%d)",
                     result["workflow_id"],
                     result["tiers_seeded"],
                     result["depots_seen"],
                 )
             except Exception as exc:  # never affect the running API
-                logger.error(
-                    "Failed to register daily readiness workflow: %s", exc, exc_info=True
-                )
+                logger.error("Failed to register daily readiness workflow: %s", exc, exc_info=True)
 
         _create_background_task(_register_readiness_workflow())
         logger.info("Daily readiness workflow registration scheduled")
@@ -8567,7 +8573,9 @@ async def _build_power_timeline(
             history_points.append(
                 PowerTimelineHistoryPoint(
                     time=bucket.isoformat(),
-                    charging_kw=float(row["charging_kw"]) if row["charging_kw"] is not None else None,
+                    charging_kw=(
+                        float(row["charging_kw"]) if row["charging_kw"] is not None else None
+                    ),
                     vehicle_count=int(row["vehicle_count"] or 0),
                 )
             )
@@ -8599,9 +8607,11 @@ async def _build_power_timeline(
         # plan_meta reflects the run regardless of whether schedule_json is usable.
         plan_meta = PowerTimelinePlanMeta(
             run_id=str(run_row["run_id"]),
-            generated_at=run_row["run_time"].replace(tzinfo=timezone.utc).isoformat()
-            if run_row["run_time"].tzinfo is None
-            else run_row["run_time"].isoformat(),
+            generated_at=(
+                run_row["run_time"].replace(tzinfo=timezone.utc).isoformat()
+                if run_row["run_time"].tzinfo is None
+                else run_row["run_time"].isoformat()
+            ),
             solver_status=run_row["status"] or "unknown",
             horizon_start=h_start.isoformat(),
             horizon_end=h_end.isoformat(),
@@ -8706,14 +8716,10 @@ async def get_depot_power_timeline(
     except HTTPException:
         raise
     except asyncpg.PostgresError as e:
-        logger.error(
-            "Database error in power-timeline for %s: %s", depot_id, e, exc_info=True
-        )
+        logger.error("Database error in power-timeline for %s: %s", depot_id, e, exc_info=True)
         raise DatabaseError() from e
     except Exception as e:
-        logger.error(
-            "Failed to build power-timeline for %s: %s", depot_id, e, exc_info=True
-        )
+        logger.error("Failed to build power-timeline for %s: %s", depot_id, e, exc_info=True)
         raise HTTPException(
             status_code=500,
             detail={
@@ -12286,9 +12292,148 @@ async def _handle_optimization_run(
 
 
 _VALID_REPORT_KINDS = frozenset(
-    {"weekly_ops", "monthly_savings", "monthly_consumption", "incident", "compliance"}
+    {
+        "weekly_ops",
+        "monthly_savings",
+        "monthly_consumption",
+        "incident",
+        "compliance",
+        "ev_vs_diesel_tco",
+    }
 )
 _VALID_REPORT_GROUP_BY = frozenset({"card", "vehicle"})
+
+
+def _round_opt(value: Optional[float], digits: int = 6) -> Optional[float]:
+    """Round an optional float, leaving ``None`` untouched (for JSON storage)."""
+    return round(value, digits) if value is not None else None
+
+
+def serialize_fleet_km_result(result: Any) -> dict:
+    """Project a FleetKmResult into a JSON-safe dict for reports.data storage.
+
+    ``result`` is a :class:`src.core.billing.cost_per_km.FleetKmResult`; typed as
+    ``Any`` to avoid a module-level adapters import in this import-order-sensitive
+    file (the value is produced by ``compute_cost_per_km`` at the one call site).
+
+    Mirrors the monthly_consumption shape: a ``rows`` list (per vehicle type)
+    plus headline ``totals`` and the diesel context, so report_pdf / the CSV
+    streamer can render without re-querying.
+    """
+    return {
+        "kind": "ev_vs_diesel_tco",
+        "currency": result.currency,
+        "diesel_currency": result.diesel_currency,
+        "diesel_price_eur_per_l": _round_opt(result.diesel_price_eur_per_l, 4),
+        "diesel_region": result.diesel_region,
+        "currency_mismatch": result.currency_mismatch,
+        "priceable_vehicle_count": result.priceable_vehicle_count,
+        "unpriceable_vehicle_count": result.unpriceable_vehicle_count,
+        "notes": list(result.notes),
+        "by_vehicle_type": [
+            {
+                "vehicle_type": a.vehicle_type,
+                "vehicle_count": a.vehicle_count,
+                "distance_km": _round_opt(a.distance_km, 3),
+                "ev_energy_kwh": _round_opt(a.ev_energy_kwh, 3),
+                "ev_cost": _round_opt(a.ev_cost_eur, 2),
+                "ev_eur_per_km": _round_opt(a.ev_eur_per_km, 4),
+                "diesel_litres": _round_opt(a.diesel_litres, 2),
+                "diesel_cost": _round_opt(a.diesel_cost_eur, 2),
+                "diesel_eur_per_km": _round_opt(a.diesel_eur_per_km, 4),
+                "pct_difference": _round_opt(a.pct_difference, 1),
+            }
+            for a in result.by_vehicle_type
+        ],
+        "totals": {
+            "distance_km": _round_opt(result.total_distance_km, 3),
+            "ev_cost": _round_opt(result.total_ev_cost_eur, 2),
+            "diesel_cost": _round_opt(result.total_diesel_cost_eur, 2),
+            "ev_eur_per_km": _round_opt(result.fleet_ev_eur_per_km, 4),
+            "diesel_eur_per_km": _round_opt(result.fleet_diesel_eur_per_km, 4),
+            "pct_difference": _round_opt(result.fleet_pct_difference, 1),
+        },
+    }
+
+
+async def _resolve_depot_organization_id(depot_id: str) -> Optional[str]:
+    """Return the depot's ``sites.organization_id`` (or None) from the static DB."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    async with db_pools.static.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT organization_id::text AS org_id FROM sites WHERE id = $1::uuid",
+            depot_id,
+        )
+    return row["org_id"] if row and row["org_id"] else None
+
+
+async def _build_ev_vs_diesel_tco_data(
+    *,
+    depot_id: str,
+    depot_name: str,
+    timezone_name: str,
+    currency: str,
+    under_cap_rate: Optional[float],
+    ocpp_ids: list[str],
+    charger_id_by_ocpp_id: dict[str, str],
+    period_start_date: date,
+    period_end_date: date,
+    ts_conn: Optional[asyncpg.Connection] = None,
+) -> str:
+    """Compute the EV-vs-diesel comparison and return it as a JSON string.
+
+    Resolves the depot's organization (for per-type fuel baselines), fetches the
+    period's charging sessions once, groups them by vehicle, and delegates the
+    math to :func:`compute_cost_per_km`. Returns ``reports.data`` JSON.
+    """
+    from ..core.billing.cost_per_km import compute_cost_per_km  # noqa: PLC0415
+
+    organization_id = await _resolve_depot_organization_id(depot_id)
+    if not organization_id:
+        # Without an org we can't resolve fuel baselines; store an explicit
+        # empty result so the report renders an informative "no data" page
+        # rather than 500ing.
+        return json.dumps(
+            {
+                "kind": "ev_vs_diesel_tco",
+                "currency": currency,
+                "depot_name": depot_name,
+                "by_vehicle_type": [],
+                "totals": {},
+                "notes": ["no_organization_for_depot"],
+            }
+        )
+
+    sessions = await _fetch_session_rows(
+        depot_id,
+        timezone_name,
+        ocpp_ids,
+        charger_id_by_ocpp_id,
+        period_start_date,
+        period_end_date,
+        ts_conn=ts_conn,
+    )
+    sessions_by_vehicle: dict[str, list[SessionRow]] = {}
+    for row in sessions:
+        if row.vehicle_id is None:
+            continue
+        sessions_by_vehicle.setdefault(row.vehicle_id, []).append(row)
+
+    result = await compute_cost_per_km(
+        db_pools,
+        depot_id=depot_id,
+        organization_id=organization_id,
+        period_start=period_start_date,
+        period_end=period_end_date,
+        timezone_name=timezone_name,
+        currency=currency,
+        under_cap_rate=under_cap_rate,
+        session_rows_by_vehicle=sessions_by_vehicle,
+    )
+    payload = serialize_fleet_km_result(result)
+    payload["depot_name"] = depot_name
+    return json.dumps(payload)
 
 
 async def _handle_reports_generate(
@@ -12430,6 +12575,19 @@ async def _handle_reports_generate(
                 "depot_name": depot_name,
                 "totals": totals,
             }
+        )
+    elif kind == "ev_vs_diesel_tco":
+        stored_data = await _build_ev_vs_diesel_tco_data(
+            depot_id=depot_id,
+            depot_name=depot_name,
+            timezone_name=timezone_name,
+            currency=currency,
+            under_cap_rate=under_cap_rate,
+            ocpp_ids=ocpp_ids,
+            charger_id_by_ocpp_id=charger_id_by_ocpp_id,
+            period_start_date=period_start_date,
+            period_end_date=period_end_date,
+            ts_conn=ts_conn,
         )
 
     async def _insert_report(conn: asyncpg.Connection) -> asyncpg.Record:
@@ -13336,7 +13494,9 @@ async def _handle_alerts_acknowledge(
                 row = await sc.fetchrow("SELECT name FROM sites WHERE id = $1", updated.depot_id)
                 depot_name = row["name"] if row else None
         except Exception:
-            logger.warning("Failed to fetch depot name for alert %s; omitting from response", alert_id)
+            logger.warning(
+                "Failed to fetch depot name for alert %s; omitting from response", alert_id
+            )
 
     return _alert_to_notification_item(updated, depot_name=depot_name).model_dump()
 
@@ -13393,9 +13553,7 @@ async def _handle_alerts_resolve(
         raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
 
     if existing.status == "resolved":
-        raise HTTPException(
-            status_code=409, detail=f"Alert {alert_id} is already resolved"
-        )
+        raise HTTPException(status_code=409, detail=f"Alert {alert_id} is already resolved")
 
     effective_email = acknowledged_by_email
     if effective_email is None and isinstance(user, dict):
@@ -13450,7 +13608,9 @@ async def _handle_alerts_resolve(
                 row = await sc.fetchrow("SELECT name FROM sites WHERE id = $1", updated.depot_id)
                 depot_name = row["name"] if row else None
         except Exception:
-            logger.warning("Failed to fetch depot name for alert %s; omitting from response", alert_id)
+            logger.warning(
+                "Failed to fetch depot name for alert %s; omitting from response", alert_id
+            )
 
     return _alert_to_notification_item(updated, depot_name=depot_name).model_dump()
 
@@ -13666,10 +13826,7 @@ async def acknowledge_notification_alert(
         if (
             existing is None
             or not _alert_belongs_to_depot(existing.depot_id, depot_id)
-            or (
-                role != "favonius_admin"
-                and str(existing.organization_id) != str(caller_org)
-            )
+            or (role != "favonius_admin" and str(existing.organization_id) != str(caller_org))
         ):
             raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
 
@@ -13731,7 +13888,9 @@ def _project_alert_resolved(
     """Dry-run projection of resolve_by_id outcome."""
     now = datetime.now(timezone.utc)
     ack_by = alert.acknowledged_by if alert.acknowledged_by is not None else user_id
-    ack_email = alert.acknowledged_by_email if alert.acknowledged_by_email is not None else user_email
+    ack_email = (
+        alert.acknowledged_by_email if alert.acknowledged_by_email is not None else user_email
+    )
     ack_at = alert.acknowledged_at
     if ack_at is None and ack_by is not None:
         ack_at = now
