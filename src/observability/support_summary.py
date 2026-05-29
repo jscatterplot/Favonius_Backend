@@ -344,11 +344,6 @@ async def deliver_support_summary(
     or unconfigured send never raises out (it only records ``failed`` /
     ``skipped``). Reuses :class:`EmailMessage` / :class:`EmailAttachment`.
     """
-    row = await fetch_support_summary(ts_pool, summary_id, include_screenshot=True)
-    if row is None:
-        logger.warning("support delivery: summary %s vanished before send", summary_id)
-        return
-
     if not eng_recipient:
         await _update_delivery(
             ts_pool, summary_id, "skipped", {"reason": "no SUPPORT_ENG_RECIPIENT configured"}
@@ -360,6 +355,11 @@ async def deliver_support_summary(
         return
     if email_client is None:
         await _update_delivery(ts_pool, summary_id, "skipped", {"reason": "no email client"})
+        return
+
+    row = await fetch_support_summary(ts_pool, summary_id, include_screenshot=True)
+    if row is None:
+        logger.warning("support delivery: summary %s vanished before send", summary_id)
         return
 
     attachments: list[EmailAttachment] = []
