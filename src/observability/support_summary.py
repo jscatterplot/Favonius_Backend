@@ -415,7 +415,12 @@ async def deliver_support_summary(
         logger.exception("support delivery: send failed for %s", summary_id)
         status = "failed"
         detail = {"error": str(exc)}
-    await _update_delivery(ts_pool, summary_id, status, detail)
+    try:
+        await _update_delivery(ts_pool, summary_id, status, detail)
+    except Exception:  # noqa: BLE001 - delivery is best-effort
+        logger.exception(
+            "support delivery: failed to update delivery_status for %s", summary_id
+        )
 
 
 async def run_support_summary_purge_loop(ts_pool: Any, *, interval_seconds: float) -> None:
