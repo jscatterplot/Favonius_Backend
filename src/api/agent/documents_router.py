@@ -50,26 +50,32 @@ _PDF_MIME = "application/pdf"
 _DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MiB
 
 
+def _sanitize_attachment_filename(name: str) -> str:
+    """Strip path/control chars so ``file_name`` is safe in Content-Disposition."""
+    candidate = name.replace("\\", "/").split("/")[-1]
+    candidate = "".join(ch for ch in candidate if ch.isprintable() and ch not in '"\r\n\t')
+    return candidate.strip(" \"';")[:255]
+
+
 def _content_disposition(filename: str) -> str:
     """Build an RFC 6266-safe ``Content-Disposition`` value.
 
-    ASGI header values are encoded latin-1, so a non-Latin-1 filename (very
+    ASGI header values are latin-1 encoded, so a non-Latin-1 filename (very
     common in this deployment, e.g. Lithuanian ``ataskaita_Šiaurė.docx``) would
-    raise ``UnicodeEncodeError`` at response construction → 500. A literal ``"``
-    or control char would also break or inject into the header. We therefore
-    emit an ASCII-sanitised ``filename="…"`` fallback PLUS a percent-encoded
-    ``filename*=UTF-8''…`` for clients that support it — mirroring Starlette's
-    own ``FileResponse`` behaviour. The result is pure ASCII and quote-safe.
+    raise ``UnicodeEncodeError`` at response construction → 500. We first strip
+    path/quote/control chars (:func:`_sanitize_attachment_filename`), then emit
+    an ASCII ``filename="…"`` fallback PLUS a percent-encoded ``filename*=UTF-8''…``
+    carrying the real (possibly non-ASCII) name — mirroring Starlette's
+    ``FileResponse``. The header value is therefore always pure ASCII and
+    quote-safe, and clients still recover the original name.
     """
     from urllib.parse import quote
 
-    # ASCII fallback: drop non-ASCII, strip quote/backslash/control chars.
-    ascii_name = filename.encode("ascii", "ignore").decode("ascii")
-    ascii_name = "".join(ch for ch in ascii_name if ch >= " " and ch != "\x7f" and ch not in '"\\')
-    ascii_name = ascii_name.strip() or "document"
+    safe = _sanitize_attachment_filename(filename) or "document"
+    ascii_name = safe.encode("ascii", "ignore").decode("ascii").strip() or "document"
     disposition = f'attachment; filename="{ascii_name}"'
-    if ascii_name != filename:
-        disposition += f"; filename*=UTF-8''{quote(filename, safe='')}"
+    if safe != ascii_name:
+        disposition += f"; filename*=UTF-8''{quote(safe, safe='')}"
     return disposition
 
 
@@ -152,13 +158,21 @@ async def upload_document(
         detected_fields=detected_fields,
         idempotency_key=idempotency_key,
     )
-    session_id = await document_store.open_session(
-        ts_pool,
-        template_id=template_id,
-        organization_id=auth.organization_id,
-        depot_id=depot_id,
-        user_id=auth.user_id,
-    )
+    session_id = None
+    if idempotency_key:
+        session_id = await document_store.find_session_for_template_user(
+            ts_pool,
+            template_id=template_id,
+            user_id=auth.user_id,
+        )
+    if session_id is None:
+        session_id = await document_store.open_session(
+            ts_pool,
+            template_id=template_id,
+            organization_id=auth.organization_id,
+            depot_id=depot_id,
+            user_id=auth.user_id,
+        )
     return {
         "session_id": str(session_id),
         "document_id": str(template_id),
@@ -189,7 +203,9 @@ async def download_document(
         )
     kind = row["kind"]
     media = _DOCX_MIME if kind == "docx" else _PDF_MIME
-    filename = row.get("file_name") or f"document.{'docx' if kind == 'docx' else 'pdf'}"
+    default_name = f"document.{'docx' if kind == 'docx' else 'pdf'}"
+    # _content_disposition sanitizes + RFC 6266-encodes internally.
+    filename = row.get("file_name") or default_name
     return Response(
         content=bytes(row["raw_payload"]),
         media_type=media,
