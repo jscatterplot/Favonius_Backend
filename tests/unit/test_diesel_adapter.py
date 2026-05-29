@@ -197,6 +197,46 @@ class _FakeClient:
             yield r
 
 
+# ── client source/auth resolution ─────────────────────────────────────────────
+
+
+def test_client_default_source(monkeypatch):
+    from src.adapters.diesel_prices.client import DieselPriceClient, configured_source
+
+    monkeypatch.delenv("DIESEL_PRICE_SOURCE", raising=False)
+    assert configured_source() == "eu_oil_bulletin"
+    c = DieselPriceClient()
+    assert c.source == "eu_oil_bulletin"
+    assert "energy.ec.europa.eu" in c._base_url  # noqa: SLF001
+
+
+def test_client_source_env_override(monkeypatch):
+    from src.adapters.diesel_prices.client import DieselPriceClient
+
+    monkeypatch.setenv("DIESEL_PRICE_SOURCE", "tankerkonig")
+    monkeypatch.delenv("DIESEL_PRICE_API_BASE_URL", raising=False)
+    c = DieselPriceClient()
+    assert c.source == "tankerkonig"
+    assert "tankerkoenig" in c._base_url  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_client_fetch_token_open_source_is_empty(monkeypatch):
+    from src.adapters.diesel_prices.client import DieselPriceClient
+
+    monkeypatch.delenv("DIESEL_PRICE_API_KEY", raising=False)
+    c = DieselPriceClient(source="eu_oil_bulletin")
+    assert await c._fetch_token() == ""  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_client_fetch_token_returns_api_key():
+    from src.adapters.diesel_prices.client import DieselPriceClient
+
+    c = DieselPriceClient(source="fuel_prices_eu", api_key="secret-key")
+    assert await c._fetch_token() == "secret-key"  # noqa: SLF001
+
+
 @pytest.mark.asyncio
 async def test_get_current_prices_filters_regions_and_skips_bad():
     records = [
