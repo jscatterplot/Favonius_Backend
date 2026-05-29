@@ -136,6 +136,28 @@ async def load_template(ts_pool: Any, template_id: UUID) -> Optional[dict[str, A
 # ── Sessions ─────────────────────────────────────────────────────────────────
 
 
+async def find_session_for_template_user(
+    ts_pool: Any,
+    *,
+    template_id: UUID,
+    user_id: UUID,
+) -> Optional[UUID]:
+    """Return the earliest fill session for ``template_id`` owned by ``user_id``."""
+    async with ts_pool.acquire() as conn:
+        row = await conn.fetchval(
+            """
+            SELECT id
+              FROM agent_document_fill_sessions
+             WHERE template_id = $1::uuid AND user_id = $2::uuid
+             ORDER BY created_at ASC
+             LIMIT 1
+            """,
+            str(template_id),
+            str(user_id),
+        )
+    return UUID(str(row)) if row is not None else None
+
+
 async def open_session(
     ts_pool: Any,
     *,
@@ -313,6 +335,7 @@ async def load_output_for_user(
 __all__ = [
     "store_template",
     "load_template",
+    "find_session_for_template_user",
     "open_session",
     "load_session_for_user",
     "update_session",

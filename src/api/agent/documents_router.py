@@ -129,13 +129,21 @@ async def upload_document(
         detected_fields=detected_fields,
         idempotency_key=idempotency_key,
     )
-    session_id = await document_store.open_session(
-        ts_pool,
-        template_id=template_id,
-        organization_id=auth.organization_id,
-        depot_id=depot_id,
-        user_id=auth.user_id,
-    )
+    session_id = None
+    if idempotency_key:
+        session_id = await document_store.find_session_for_template_user(
+            ts_pool,
+            template_id=template_id,
+            user_id=auth.user_id,
+        )
+    if session_id is None:
+        session_id = await document_store.open_session(
+            ts_pool,
+            template_id=template_id,
+            organization_id=auth.organization_id,
+            depot_id=depot_id,
+            user_id=auth.user_id,
+        )
     return {
         "session_id": str(session_id),
         "document_id": str(template_id),

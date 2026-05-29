@@ -340,7 +340,10 @@ def _apply_pdf_replacements(body: bytes, replacements: list[dict[str, Any]]) -> 
                                 new_arr[j] = TextStringObject(new_item)
                                 changed = True
                     if changed:
-                        cs.operations[i] = ((new_arr,) + tuple(operands[1:]), operator)
+                        cs.operations[i] = (
+                            (ArrayObject(new_arr),) + tuple(operands[1:]),
+                            operator,
+                        )
 
     try:
         reader = PdfReader(io.BytesIO(body))
