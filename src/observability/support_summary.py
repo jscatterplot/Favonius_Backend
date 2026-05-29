@@ -183,11 +183,11 @@ def render_logs_excerpt(records: Iterable[BufferedRecord], *, max_bytes: int) ->
 
 
 def extract_last_error_line(record: Optional[BufferedRecord]) -> Optional[str]:
-    """Redact + truncate the most-recent-error message, or ``None``."""
+    """Redact the most-recent-error message, or ``None``."""
     if record is None:
         return None
     redacted = redact_log_line(record.message)
-    return redacted[:MAX_ERROR_LINE_CHARS] if redacted else None
+    return redacted or None
 
 
 # ── Persistence (TimescaleDB ``ts`` pool) ─────────────────────────────────────
