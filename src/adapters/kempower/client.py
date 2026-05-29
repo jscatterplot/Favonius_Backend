@@ -147,17 +147,23 @@ class KempowerClient(BaseRestClient):
         """Fetch one Power Group (load-balancing) object by Kempower id."""
         return await self._request("GET", f"/power-groups/{group_id}")
 
+    # ChargEye's list endpoints live under ``/v1`` (the docs index every
+    # resource as "(v1)") — the unversioned paths return AWS API Gateway's
+    # catch-all 403 ("Invalid key=value pair in Authorization header").
+    # ``/locations/{id}`` above is empirically reachable unversioned, so it
+    # stays as-is. Flip these to bare paths to revert if a future revision
+    # drops the version prefix.
     def iter_charging_stations(self, location_id: str) -> AsyncIterator[dict[str, Any]]:
         """Iterate ChargingStation objects scoped to a Location."""
         return self._iter_paginated(
-            "/charging-stations",
+            "/v1/charging-stations",
             params={"locationId": location_id},
         )
 
     def iter_vehicles(self, location_id: str) -> AsyncIterator[dict[str, Any]]:
         """Iterate Vehicle objects scoped to a Location."""
         return self._iter_paginated(
-            "/vehicles",
+            "/v1/vehicles",
             params={"locationId": location_id},
         )
 
@@ -170,7 +176,7 @@ class KempowerClient(BaseRestClient):
     ) -> AsyncIterator[dict[str, Any]]:
         """Iterate Transaction objects for a station within a time window."""
         return self._iter_paginated(
-            "/transactions",
+            "/v1/transactions",
             params={
                 "stationId": station_id,
                 "from": start_iso,
