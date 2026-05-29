@@ -12872,8 +12872,8 @@ async def _handle_agent_action_approve(
         result["report"] = report_result
     if schedule_result:
         result["schedule"] = schedule_result
-        # Count a committed approval (created or already-existed) once, post-commit.
-        AGENT_AUTOMATION_SUGGESTIONS.labels(stage="approved").inc()
+        if schedule_result.get("scheduleCreated"):
+            AGENT_AUTOMATION_SUGGESTIONS.labels(stage="approved").inc()
     return result
 
 
