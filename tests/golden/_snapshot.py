@@ -245,13 +245,21 @@ async def load_ts(conn: Any, snapshot: dict[str, Any], scenario_now: datetime) -
             s.get("source", "live"),
         )
 
-    for t in snapshot.get("telemetry") or []:
+    for i, t in enumerate(snapshot.get("telemetry") or []):
+        # telemetry PK is (time, station_id, connector_id) — vehicle_id is NOT
+        # part of it — so two readings at the same `time` (e.g. one per vehicle
+        # in a multi-vehicle scenario) collide unless each carries a distinct
+        # station_id. Default to a per-row-unique synthetic id; the readiness
+        # SoC query keys on vehicle_id, so the station_id value is immaterial.
         await conn.execute(
             """
-            INSERT INTO telemetry (time, vehicle_id, charger_id, soc, is_plugged, charging_kw)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO telemetry (time, station_id, connector_id, vehicle_id, charger_id,
+                                   soc, is_plugged, charging_kw)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             """,
             resolve_dt(t["time"], scenario_now),
+            str(t.get("station_id") or f"tele-{i + 1:02d}"),
+            int(t.get("connector_id", 1)),
             coerce_uuid(t["vehicle_id"]),
             maybe_uuid(t.get("charger_id")),
             t.get("soc"),
