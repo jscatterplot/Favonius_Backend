@@ -308,3 +308,20 @@ def test_wrapper_times_out_without_raising(monkeypatch):
 
     monkeypatch.setattr(autosug, "_detect_and_emit", _slow)
     asyncio.run(maybe_emit_automation_suggestion(ts_pool="P", auth=_auth(1), token_payload={}))
+
+
+def test_wrapper_swallows_pre_detection_setup_errors(monkeypatch):
+    """A failure in the pre-detection setup (config/import/now) must not escape.
+
+    Regression: those statements used to run outside the try/except, so an
+    exception would propagate into run_turn's outer handler and 502 a turn that
+    already succeeded.
+    """
+    monkeypatch.setenv("AGENT_AUTOMATION_SUGGESTIONS_ENABLED", "true")
+
+    def _boom():
+        raise RuntimeError("from_env exploded")
+
+    monkeypatch.setattr(autosug.SuggestionConfig, "from_env", staticmethod(_boom))
+    # No config passed → from_env() is invoked inside the wrapper; must be swallowed.
+    asyncio.run(maybe_emit_automation_suggestion(ts_pool="P", auth=_auth(1), token_payload={}))

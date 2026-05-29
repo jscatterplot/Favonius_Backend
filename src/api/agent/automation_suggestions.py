@@ -587,11 +587,15 @@ async def maybe_emit_automation_suggestion(
     """
     if not is_automation_suggestions_enabled():
         return
-    from src.monitoring.metrics import AGENT_AUTOMATION_DETECT_DURATION
-
-    cfg = config or SuggestionConfig.from_env()
-    current = now or datetime.now(timezone.utc)
+    # Everything below is inside the try so this coroutine can NEVER raise into
+    # the chat turn — including the lazy import, from_env(), and now(). An escape
+    # here would land in run_turn's outer except and re-close an already-success
+    # run as error, 502-ing a turn that actually succeeded.
     try:
+        from src.monitoring.metrics import AGENT_AUTOMATION_DETECT_DURATION
+
+        cfg = config or SuggestionConfig.from_env()
+        current = now or datetime.now(timezone.utc)
         with AGENT_AUTOMATION_DETECT_DURATION.time():
             await asyncio.wait_for(
                 _detect_and_emit(ts_pool, auth, token_payload, cfg, current),
