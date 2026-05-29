@@ -561,10 +561,8 @@ async def _run_readiness_turn(
         tz_name = (await load_depot_timezones(static_pool, depot_ids)).get(depot_ids[0])
     window_start, window_end, window_label = resolve_readiness_window(message, as_of, tz_name)
 
-    departures: list[dict[str, Any]] = []
-    if depot_ids:
-        rows = await static_pool.fetch(DEPARTURES_SQL, depot_ids, window_start, window_end)
-        departures = [dict(r) for r in rows]
+    rows = await static_pool.fetch(DEPARTURES_SQL, depot_ids, window_start, window_end)
+    departures = [dict(r) for r in rows]
     await agent_runs_step(
         ts_pool,
         run_id,
@@ -785,6 +783,7 @@ async def run_turn(
     *,
     sse: Optional[SSEEventStream] = None,
     context: Optional[AgentViewContext] = None,
+    now: Optional[datetime] = None,
 ) -> AgentReply:
     """End-to-end orchestration of one chat turn.
 
@@ -801,6 +800,8 @@ async def run_turn(
             item). Only consulted on the SQL-mode path, where it is parked for
             the ``get_page_context`` tool. Ignored by the consumption fast path
             (a one-shot extraction with no tool loop).
+        now: Optional clock override for deterministic fast-path intents
+            (readiness, savings). Defaults to UTC "now" when omitted.
 
     Returns:
         An :class:`AgentReply`. Raises only on unrecoverable failures
@@ -867,6 +868,7 @@ async def run_turn(
                 ts_pool=ts_pool,
                 sse=sse,
                 emit_step=_emit_step,
+                now=now,
             )
 
         if decision.route == "sql_general":
