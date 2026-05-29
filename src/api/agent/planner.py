@@ -32,7 +32,10 @@ from uuid import UUID
 logger = logging.getLogger(__name__)
 
 
-Route = Literal["consumption_by_user", "sql_general", "refuse"]
+# ``document_fill`` is decided structurally in ``run_turn`` (a session_id is
+# present) before ``classify`` runs, not by the text classifier below — it's
+# included here only so the route vocabulary is complete and type-consistent.
+Route = Literal["consumption_by_user", "sql_general", "refuse", "document_fill"]
 
 
 @dataclass(frozen=True)

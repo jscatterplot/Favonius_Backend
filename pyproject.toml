@@ -88,6 +88,15 @@ dependencies = [
     # LLM-powered depot chat agent (see docs/plans/agent_search_architecture_v0.md §4)
     # Model is selected via AGENT_LLM_MODEL env var; API key via secrets.py.
     "anthropic>=0.40.0",
+    # Agent document-fill (DOCX/PDF templates + old-report refresh). All
+    # pure-Python (no system libs); lazily imported in
+    # src/api/agent/document_render.py so unaffected paths never load them.
+    # docxtpl builds on python-docx + the jinja2 already pinned above.
+    "python-docx>=1.1.0",
+    "docxtpl>=0.18.0",
+    "pypdf>=4.0.0",
+    # Multipart parsing for the /agent/documents upload endpoint (FastAPI File).
+    "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]

@@ -109,12 +109,18 @@ class AgentTurnRequest(BaseModel):
     into the prompt; the SQL-mode agent pulls it on demand via the
     ``get_page_context`` tool only when a question is ambiguous. See
     ``src/api/agent/view_context.py``.
+
+    ``session_id`` is an optional document-fill session (from
+    ``POST /agent/documents``). When present and ``AGENT_DOC_FILL_ENABLED`` is
+    on, the turn routes to the collaborative document-fill loop instead of the
+    planner.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     message: str = Field(..., min_length=1, max_length=2000)
     context: Optional[AgentViewContext] = None
+    session_id: Optional[UUID] = None
 
 
 class AgentRunRow(BaseModel):
@@ -162,6 +168,7 @@ async def post_turn(
             ts_pool=ts_pool,
             llm_client=llm_client,
             context=body.context,
+            session_id=body.session_id,
         )
         duration = time.monotonic() - start
         intent = reply.intent or "unknown"
@@ -216,6 +223,7 @@ async def post_turn_stream(
                 llm_client=llm_client,
                 sse=stream,
                 context=body.context,
+                session_id=body.session_id,
             )
             duration = time.monotonic() - start
             intent = reply.intent or "unknown"

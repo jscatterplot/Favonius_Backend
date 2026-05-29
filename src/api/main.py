@@ -785,6 +785,12 @@ def _body_size_limit_for_path(path: str) -> int:
         from ..adapters.chargers.upload_token import get_max_upload_bytes
 
         return get_max_upload_bytes()
+    if path == "/agent/documents":
+        # Agent document-fill template upload — its own (larger) cap so the
+        # global 1 MiB default doesn't block a multi-MB DOCX/PDF.
+        from .agent.documents_router import get_doc_upload_max_bytes
+
+        return get_doc_upload_max_bytes()
     return _MAX_BODY_SIZE
 
 
@@ -1198,6 +1204,19 @@ if is_agent_search_enabled():
 
     app.include_router(agent_router)
     logger.info("Depot chat agent enabled at /agent/*")
+
+
+# ── Agent document-fill (feature-flagged, default off) ──────────────────────
+# Collaborative DOCX/PDF template fill + old-report refresh. Reuses the
+# SQL-mode data tools, so the agent_views.* functions + read-only roles must
+# be migrated before enabling. Inherits the JWT + geo-block pipeline above.
+from .agent.feature_flag import is_agent_doc_fill_enabled  # noqa: E402
+
+if is_agent_doc_fill_enabled():
+    from .agent.documents_router import router as agent_documents_router  # noqa: PLC0415
+
+    app.include_router(agent_documents_router)
+    logger.info("Agent document-fill enabled at /agent/documents*")
 
 
 # ── Data Sources (feature-flagged) ─────────────────────────────────────────

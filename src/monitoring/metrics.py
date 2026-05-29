@@ -152,6 +152,25 @@ AGENT_SQL_BUDGET_REFUSED = Counter(
     ["organization_id"],
 )
 
+# Agent document-fill (collaborative DOCX/PDF templates, migration 047).
+# A turn ends either by asking the user (mode=ask) or finalizing (mode=finalize).
+AGENT_DOC_FILL_TURNS = Counter(
+    "favonius_agent_doc_fill_turns_total",
+    "Document-fill agent turns by terminator mode and outcome",
+    [
+        "mode",
+        "status",
+    ],  # mode: ask|finalize|none ; status: success|needs_input|not_found|error|refused
+)
+
+# One rendered output (preview or final). outcome=ok|error; fidelity captures
+# whether the original layout was preserved (docx/AcroForm) or re-rendered (flat PDF).
+AGENT_DOC_RENDERS = Counter(
+    "favonius_agent_doc_renders_total",
+    "Document-fill renders by kind, fidelity, and outcome",
+    ["kind", "fidelity", "outcome"],  # kind: docx|pdf ; fidelity: preserved|degraded|none
+)
+
 # Depot workflow agent runtime metrics (PRD §4.3/§4.4, sprint 2).
 # Naming mirrors the existing agent_search metrics one level up.
 WORKFLOW_TURNS = Counter(

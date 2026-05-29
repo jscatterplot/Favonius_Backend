@@ -29,14 +29,16 @@ never leaked back to the client per the security review.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any, Optional, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.api.agent import budget
+from src.api.agent import budget, document_render, document_store
 from src.api.agent.audit import (
     agent_runs_close,
     agent_runs_open,
@@ -46,6 +48,16 @@ from src.api.agent.audit import (
     write_agent_query_audit,
 )
 from src.api.agent.auth_context import ResolvedEntity, ResolvedTimeWindow, build_auth_context
+from src.api.agent.document_prompts import (
+    build_document_fill_system_prompt,
+    format_document_fill_user_message,
+    initial_draft,
+)
+from src.api.agent.document_tools import (
+    DOCUMENT_FILL_TOOL_NAMES,
+    build_document_fill_tool_registry,
+)
+from src.api.agent.feature_flag import is_agent_doc_fill_enabled
 from src.api.agent.intents.consumption_by_user import (
     compile_consumption_by_user,
     summarize_consumption_rows,
@@ -65,12 +77,18 @@ from src.api.agent.resolve import (
     resolve_entities,
     resolve_time_window,
 )
-from src.api.agent.sql_tools import SQL_AGENT_TOOL_NAMES, build_sql_agent_tool_registry
+from src.api.agent.sql_tools import (
+    EMIT_FINAL_ANSWER_TOOL,
+    SQL_AGENT_TOOL_NAMES,
+    build_sql_agent_tool_registry,
+)
 from src.api.agent.stream import SSEEventStream
 from src.api.agent.view_context import AgentViewContext, build_page_context_payload
 from src.api.agent_workflows.runtime import ToolNotAllowedError, run_qa_turn
 from src.api.agent_workflows.tools import ToolNotRegisteredError
 from src.monitoring.metrics import (
+    AGENT_DOC_FILL_TURNS,
+    AGENT_DOC_RENDERS,
     AGENT_RESOLVER_MISSES,
     AGENT_SQL_BUDGET_REFUSED,
     AGENT_SQL_TOOL_TURNS,
@@ -153,9 +171,10 @@ class _CandidateOption(BaseModel):
 class AgentReply(BaseModel):
     """End-of-turn payload returned by both the JSON and SSE endpoints.
 
-    Four possible ``status`` values:
+    Possible ``status`` values:
 
-    - ``success``         — the answer is in ``text``.
+    - ``success``         — the answer is in ``text``. For a document-fill
+                            finalize, ``download`` points to the finished file.
     - ``disambiguation``  — multiple matches; ``candidates`` lists them.
     - ``not_found``       — at least one subject did not resolve;
                             ``not_found`` carries the unresolved phrases.
@@ -166,12 +185,21 @@ class AgentReply(BaseModel):
                             machine-readable code (e.g.
                             ``monthly_budget_exceeded``) and ``text`` is the
                             user-facing message. No Anthropic tokens consumed.
+    - ``needs_input``     — document-fill only: the agent asked the user to
+                            clarify. ``questions`` carries the prompts,
+                            ``session_id`` resumes the conversation, and
+                            ``download`` (when present) is a preview. This is a
+                            presentation status; the per-turn ``agent_runs`` row
+                            still closes ``success`` (the turn succeeded), with
+                            the awaiting-input lifecycle on the session row.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     run_id: UUID
-    status: str = Field(..., description="success | disambiguation | not_found | error | refused")
+    status: str = Field(
+        ..., description="success | disambiguation | not_found | error | refused | needs_input"
+    )
     text: str
     intent: Optional[str] = None
     candidates: list[_CandidateOption] = Field(default_factory=list)
@@ -180,10 +208,61 @@ class AgentReply(BaseModel):
         default=None,
         description="Machine-readable code for status='refused' (e.g. monthly_budget_exceeded).",
     )
+    # ── Document-fill fields (None/empty for every other path) ──────────────
+    session_id: Optional[UUID] = Field(
+        default=None, description="Document-fill session to resume (status needs_input/success)."
+    )
+    questions: list[dict[str, Any]] = Field(
+        default_factory=list, description="Clarifying questions for status='needs_input'."
+    )
+    download: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Rendered document pointer {output_id, url, kind, fidelity, output_kind}.",
+    )
 
     @classmethod
     def success(cls, *, run_id: UUID, intent: str, text: str) -> "AgentReply":
         return cls(run_id=run_id, status="success", text=text, intent=intent)
+
+    @classmethod
+    def document_ready(
+        cls,
+        *,
+        run_id: UUID,
+        session_id: UUID,
+        text: str,
+        download: Optional[dict[str, Any]],
+    ) -> "AgentReply":
+        """A finalized document-fill turn — the finished file is in ``download``."""
+        return cls(
+            run_id=run_id,
+            status="success",
+            text=text,
+            intent="document_fill",
+            session_id=session_id,
+            download=download,
+        )
+
+    @classmethod
+    def needs_input(
+        cls,
+        *,
+        run_id: UUID,
+        session_id: UUID,
+        text: str,
+        questions: list[dict[str, Any]],
+        download: Optional[dict[str, Any]] = None,
+    ) -> "AgentReply":
+        """The fill agent paused to ask the user; conversation resumes via ``session_id``."""
+        return cls(
+            run_id=run_id,
+            status="needs_input",
+            text=text,
+            intent="document_fill",
+            session_id=session_id,
+            questions=questions,
+            download=download,
+        )
 
     @classmethod
     def disambiguation(
@@ -291,6 +370,7 @@ _STEP_LABELS: dict[str, str] = {
     "current_time": "Checking the current time",
     "lookup_entity": "Finding the matching record",
     "get_page_context": "Checking what you're looking at",
+    "get_template_text": "Reading your document",
     "emit_final_answer": "Composing your answer",
 }
 
@@ -433,6 +513,7 @@ async def run_turn(
     *,
     sse: Optional[SSEEventStream] = None,
     context: Optional[AgentViewContext] = None,
+    session_id: Optional[UUID] = None,
 ) -> AgentReply:
     """End-to-end orchestration of one chat turn.
 
@@ -449,6 +530,10 @@ async def run_turn(
             item). Only consulted on the SQL-mode path, where it is parked for
             the ``get_page_context`` tool. Ignored by the consumption fast path
             (a one-shot extraction with no tool loop).
+        session_id: Optional document-fill session id. When present and the
+            feature flag is on, the turn routes straight to the collaborative
+            document-fill loop (``_run_document_fill_turn``), bypassing the
+            planner — the document is the subject, not the message text.
 
     Returns:
         An :class:`AgentReply`. Raises only on unrecoverable failures
@@ -468,6 +553,28 @@ async def run_turn(
             await sse.emit("step", {"name": name, "summary": summary})
 
     try:
+        # 0a. Document-fill: a session_id (+ feature on) routes straight to the
+        # collaborative fill loop, before any planner classification — here the
+        # uploaded document is the subject, not the message text.
+        if session_id is not None and is_agent_doc_fill_enabled():
+            await agent_runs_step(
+                ts_pool,
+                run_id,
+                "planner_decision",
+                {"route": "document_fill", "reason": "document_session"},
+            )
+            await _emit_step("planner_decision")
+            return await _run_document_fill_turn(
+                run_id=run_id,
+                message=message,
+                auth=auth,
+                static_pool=static_pool,
+                ts_pool=ts_pool,
+                session_id=session_id,
+                sse=sse,
+                emit_step=_emit_step,
+            )
+
         # 0. Planner — pick consumption fast path, sql_general, or refuse.
         #
         # Two-phase approach: run a cheap text-only pre-check first.  Only
@@ -1165,4 +1272,429 @@ async def _run_sql_general_turn(
         ts_pool, run_id, reply.status, reply, failure_reason=classify_failure(qa)
     )
     await _emit_answer_safe(sse, reply, run_id)
+    return reply
+
+
+# ── Document-fill (collaborative DOCX/PDF) sub-orchestrator ────────────────
+
+# Trim the per-session conversation log to the last N text turns when replaying
+# it into the loop — bounds token growth across a long collaboration.
+_DOC_FILL_MAX_LOG_TURNS = 20
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _filled_filename(original: Optional[str], kind: str) -> str:
+    """Derive a download filename for the rendered output."""
+    ext = "docx" if kind == "docx" else "pdf"
+    if original:
+        base = original.rsplit(".", 1)[0] if "." in original else original
+        return f"{base}_filled.{ext}"
+    return f"filled.{ext}"
+
+
+def _doc_fill_sql_audit_numbers(tool_calls: Any) -> tuple[int, int]:
+    """(sql_attempts, server_row_total) over a doc-fill turn's run_select calls."""
+    attempts = 0
+    rows = 0
+    for tc in tool_calls:
+        if tc.name not in ("run_select_ts", "run_select_static"):
+            continue
+        attempts += 1
+        if tc.ok and isinstance(tc.result, dict):
+            try:
+                rows += int(tc.result.get("row_count", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+    return attempts, rows
+
+
+async def _run_document_fill_turn(
+    *,
+    run_id: UUID,
+    message: str,
+    auth: Any,
+    static_pool: Any,
+    ts_pool: Any,
+    session_id: UUID,
+    sse: Optional[SSEEventStream],
+    emit_step: Any,
+) -> AgentReply:
+    """Drive one turn of the collaborative document-fill loop.
+
+    Sibling of :func:`_run_sql_general_turn`: same Anthropic tool-use loop
+    (``run_qa_turn``), same per-org token budget, same audit writers — but it
+    (1) loads the uploaded document + the multi-turn session, (2) replays the
+    compacted conversation history, (3) reads the document terminator back from
+    ``qa.tool_calls`` for its structured ``field_values`` / ``replacements`` /
+    ``mode`` / ``questions``, (4) enforces grounding by dropping unknown fields
+    and unanchored replacements, (5) renders the filled document (preview on
+    ``ask``, final on ``finalize``), and (6) persists the session. The per-turn
+    ``agent_runs`` row always closes ``success``; the awaiting-input lifecycle
+    lives on the session row (``reply.status='needs_input'`` is presentation).
+    """
+    is_admin = auth.role == "favonius_admin"
+
+    async def _terminal(status: str, text: str, *, failure: Optional[str]) -> AgentReply:
+        """Build, close (status), emit, count, and return a terminal reply."""
+        reply = AgentReply(
+            run_id=run_id,
+            status=status,
+            text=text,
+            intent="document_fill",
+            session_id=session_id,
+        )
+        await agent_runs_close(ts_pool, run_id, status, reply, failure_reason=failure)
+        await _emit_answer_safe(sse, reply, run_id)
+        AGENT_DOC_FILL_TURNS.labels(mode="none", status=reply.status).inc()
+        return reply
+
+    # 1. Load the session (owner-scoped) + its template blob.
+    session = await document_store.load_session_for_user(
+        ts_pool, session_id, auth.user_id, is_admin=is_admin
+    )
+    if session is None or session.get("status") == "abandoned":
+        return await _terminal(
+            "not_found",
+            (
+                "I couldn't find that document session — it may have expired or "
+                "belong to someone else. Upload the document again to start over."
+            ),
+            failure=None,
+        )
+
+    template = await document_store.load_template(ts_pool, UUID(str(session["template_id"])))
+    if template is None or template.get("raw_payload") is None:
+        return await _terminal(
+            "error",
+            "The uploaded document is no longer available. Please upload it again.",
+            failure="other",
+        )
+
+    # 2. Extract text + detected fields fresh from the stored blob (single
+    # source of truth). Never raises into the loop — a parse failure ends the
+    # turn gracefully.
+    try:
+        extracted = document_render.extract(bytes(template["raw_payload"]), template["kind"])
+    except document_render.DocumentRenderError as exc:
+        logger.warning("doc-fill extract failed (run=%s): %s", run_id, exc)
+        return await _terminal(
+            "error",
+            "I couldn't read that document. It may be corrupt or password-protected.",
+            failure="other",
+        )
+
+    template_text = extracted.text
+    detected_fields = [{"name": f.name, "source": f.source} for f in extracted.fields]
+    field_names = {f.name for f in extracted.fields}
+    depot_id = UUID(str(session["depot_id"])) if session.get("depot_id") else None
+
+    # 3. Per-org monthly token budget — gate before any Anthropic import.
+    system_prompt = build_document_fill_system_prompt()
+    est_tokens = budget.estimate_turn_tokens(system_prompt)
+    reservation = await budget.check_and_reserve(auth.organization_id, est_tokens)
+    if reservation is None:
+        AGENT_SQL_BUDGET_REFUSED.labels(
+            organization_id=str(auth.organization_id) if auth.organization_id else "none"
+        ).inc()
+        await agent_runs_step(ts_pool, run_id, "budget_refused", {"est_tokens": est_tokens})
+        reply = AgentReply(
+            run_id=run_id,
+            status="refused",
+            text=(
+                "This organisation has reached its monthly usage limit for the "
+                "assistant. The limit resets at the start of next month — contact "
+                "your administrator if you need it raised."
+            ),
+            intent="document_fill",
+            reason="monthly_budget_exceeded",
+            session_id=session_id,
+        )
+        await agent_runs_close(
+            ts_pool, run_id, "refused", reply, failure_reason=classify_failure("refused")
+        )
+        await _emit_answer_safe(sse, reply, run_id)
+        AGENT_DOC_FILL_TURNS.labels(mode="none", status="refused").inc()
+        return reply
+
+    draft = session.get("draft") or initial_draft()
+    message_log = list(session.get("message_log") or [])
+    history = [
+        {"role": m.get("role", "user"), "content": m.get("text", "")}
+        for m in message_log
+        if isinstance(m, dict) and m.get("text")
+    ]
+
+    async def _on_step(tool_call: Any) -> None:
+        result = tool_call.result
+        if isinstance(result, dict) and isinstance(result.get("rows"), list):
+            rows = result["rows"]
+            preview: Any = {
+                **{k: v for k, v in result.items() if k != "rows"},
+                "row_preview": rows[:3],
+                "row_total": result.get("row_count", len(rows)),
+            }
+        elif tool_call.name == "get_template_text" and isinstance(result, dict):
+            # Don't dump the full document text into every step trace.
+            preview = {
+                "kind": result.get("kind"),
+                "pdf_form_type": result.get("pdf_form_type"),
+                "field_count": len(result.get("fields") or []),
+                "text_chars": len(result.get("text") or ""),
+            }
+        else:
+            preview = result
+        await agent_runs_step(
+            ts_pool,
+            run_id,
+            "tool_call",
+            {
+                "tool": tool_call.name,
+                "ok": tool_call.ok,
+                "input": tool_call.arguments,
+                "result_preview": preview,
+                "error": tool_call.error,
+            },
+        )
+        await emit_step("tool_call", label_key=tool_call.name)
+
+    try:
+        from src.api.agent import llm as agent_llm  # local: keep test envs llm-free
+
+        client = agent_llm._get_client()
+        config = agent_llm.CONFIG
+        registry = build_document_fill_tool_registry(
+            static_pool,
+            ts_pool,
+            auth,
+            template_text=template_text,
+            template_kind=template["kind"],
+            template_pdf_form_type=template["pdf_form_type"],
+            detected_fields=detected_fields,
+        )
+        qa = await run_qa_turn(
+            anthropic_client=client,
+            model=config.model,
+            system_prompt=system_prompt,
+            user_message=format_document_fill_user_message(message, draft),
+            tool_registry=registry,
+            allowed_tools=DOCUMENT_FILL_TOOL_NAMES,
+            max_iterations=10,
+            max_tokens=4096,
+            temperature=0.0,
+            effort=config.effort,
+            on_step=_on_step,
+            history=history,
+        )
+    except asyncio.CancelledError as exc:
+        budget.record_actual(
+            reservation, getattr(exc, "input_tokens", 0), getattr(exc, "output_tokens", 0)
+        )
+        raise
+    except (ToolNotRegisteredError, ToolNotAllowedError) as exc:
+        budget.record_actual(
+            reservation, getattr(exc, "input_tokens", 0), getattr(exc, "output_tokens", 0)
+        )
+        logger.error("doc-fill tool error (run=%s): %s", run_id, exc)
+        return await _terminal(
+            "error",
+            "Something went wrong filling your document. Please try again.",
+            failure=classify_failure(exc),
+        )
+    except Exception as exc:
+        budget.record_actual(
+            reservation, getattr(exc, "input_tokens", 0), getattr(exc, "output_tokens", 0)
+        )
+        raise
+    else:
+        budget.record_actual(reservation, qa.input_tokens, qa.output_tokens)
+
+    # Mirror data reads to the admin audit feed (parity with SQL mode).
+    sql_attempts, server_row_total = _doc_fill_sql_audit_numbers(qa.tool_calls)
+    if sql_attempts > 0:
+        functions_accessed = _sql_functions_accessed(qa.tool_calls)
+        try:
+            await write_agent_query_audit(
+                ts_pool,
+                auth,
+                run_id,
+                "document_fill",
+                server_row_total,
+                depot_id=depot_id,
+                target_type=sql_audit_target_type(functions_accessed),
+                functions_accessed=functions_accessed or None,
+            )
+        except Exception:  # noqa: BLE001 - best-effort audit
+            logger.exception("Failed to write doc-fill audit for run %s", run_id)
+
+    # No usable terminator → the model didn't deliver a fill this turn.
+    term = next(
+        (tc for tc in reversed(qa.tool_calls) if tc.name == EMIT_FINAL_ANSWER_TOOL and tc.ok),
+        None,
+    )
+    if term is None or qa.status != "success":
+        text = (qa.text or "").strip() or (
+            "I wasn't able to work on the document this time. "
+            "Please try rephrasing what you'd like changed."
+        )
+        status = (
+            "not_found" if qa.status in ("no_terminator", "max_iterations", "success") else "error"
+        )
+        return await _terminal(status, text, failure=classify_failure(qa))
+
+    args = term.arguments if isinstance(term.arguments, dict) else {}
+    mode = str(args.get("mode") or "finalize").strip().lower()
+    if mode not in ("ask", "finalize"):
+        mode = "finalize"
+    raw_fields = args.get("field_values") if isinstance(args.get("field_values"), dict) else {}
+    raw_reps = args.get("replacements") if isinstance(args.get("replacements"), list) else []
+    questions = [q for q in (args.get("questions") or []) if isinstance(q, dict)]
+    answer_text = str(args.get("text") or "")
+
+    # Grounding enforcement: drop unknown field names and unanchored
+    # replacements so no ungrounded edit is ever written to the document.
+    field_values = {
+        k: ("" if v is None else str(v)) for k, v in raw_fields.items() if k in field_names
+    }
+    dropped_fields = [k for k in raw_fields if k not in field_names]
+    replacements: list[dict[str, Any]] = []
+    dropped_anchors = 0
+    for rep in raw_reps:
+        if not isinstance(rep, dict):
+            continue
+        find = str(rep.get("find") or "")
+        if find and find in template_text:
+            replacements.append(
+                {
+                    "find": find,
+                    "replace": str(rep.get("replace") or ""),
+                    "label": str(rep.get("label") or ""),
+                }
+            )
+        else:
+            dropped_anchors += 1
+
+    # Merge into the running draft (new values/anchors win).
+    merged_fields = {**(draft.get("field_values") or {}), **field_values}
+    rep_by_find: dict[str, dict[str, Any]] = {
+        r["find"]: r
+        for r in (draft.get("replacements") or [])
+        if isinstance(r, dict) and r.get("find")
+    }
+    for r in replacements:
+        rep_by_find[r["find"]] = r
+    merged_reps = list(rep_by_find.values())
+    new_draft = {
+        "field_values": merged_fields,
+        "replacements": merged_reps,
+        "open_questions": questions if mode == "ask" else [],
+        "notes": draft.get("notes", ""),
+    }
+
+    # Render: a preview each turn that has something to apply, always on finalize.
+    download: Optional[dict[str, Any]] = None
+    output_id: Optional[UUID] = None
+    if merged_fields or merged_reps or mode == "finalize":
+        try:
+            rendered, fidelity = document_render.render(
+                kind=template["kind"],
+                pdf_form_type=template["pdf_form_type"],
+                body=bytes(template["raw_payload"]),
+                field_values=merged_fields,
+                replacements=merged_reps,
+                full_text=template_text,
+            )
+            out_name = _filled_filename(template.get("file_name"), template["kind"])
+            output_id = await document_store.store_output(
+                ts_pool,
+                template_id=UUID(str(template["id"])),
+                session_id=session_id,
+                run_id=run_id,
+                organization_id=auth.organization_id,
+                depot_id=depot_id,
+                kind=template["kind"],
+                output_kind=("final" if mode == "finalize" else "preview"),
+                fidelity=fidelity,
+                file_name=out_name,
+                file_size_bytes=len(rendered),
+                content_sha256=hashlib.sha256(rendered).hexdigest(),
+                raw_payload=rendered,
+                field_values=merged_fields,
+                replacements=merged_reps,
+            )
+            download = {
+                "output_id": str(output_id),
+                "url": f"/agent/documents/{output_id}/download",
+                "kind": template["kind"],
+                "fidelity": fidelity,
+                "output_kind": "final" if mode == "finalize" else "preview",
+            }
+            AGENT_DOC_RENDERS.labels(kind=template["kind"], fidelity=fidelity, outcome="ok").inc()
+        except document_render.DocumentRenderError as exc:
+            logger.warning("doc-fill render failed (run=%s): %s", run_id, exc)
+            AGENT_DOC_RENDERS.labels(kind=template["kind"], fidelity="none", outcome="error").inc()
+            answer_text = (
+                answer_text + "\n\n(Note: I couldn't render the document this time.)"
+            ).strip()
+
+    # Surface dropped (ungrounded) edits so the user can correct them.
+    notes: list[str] = []
+    if dropped_fields:
+        notes.append(
+            "Some requested fields aren't in the document and were skipped: "
+            + ", ".join(sorted(dropped_fields)[:8])
+            + "."
+        )
+    if dropped_anchors:
+        notes.append(
+            f"{dropped_anchors} proposed change(s) didn't match the document text "
+            "and were skipped."
+        )
+    if notes:
+        answer_text = (answer_text + "\n\n" + " ".join(notes)).strip()
+
+    # Append this turn to the conversation log (trimmed).
+    new_log = list(message_log)
+    new_log.append({"role": "user", "text": message, "run_id": str(run_id), "ts": _now_iso()})
+    if answer_text:
+        new_log.append(
+            {"role": "assistant", "text": answer_text, "run_id": str(run_id), "ts": _now_iso()}
+        )
+    new_log = new_log[-_DOC_FILL_MAX_LOG_TURNS:]
+
+    latest_output = output_id or (
+        UUID(str(session["latest_output_id"])) if session.get("latest_output_id") else None
+    )
+    session_status = "awaiting_input" if mode == "ask" else "finalized"
+    await document_store.update_session(
+        ts_pool,
+        session_id,
+        status=session_status,
+        draft=new_draft,
+        message_log=new_log,
+        latest_output_id=latest_output,
+    )
+
+    if mode == "ask":
+        text = answer_text or "I have a few questions before I finish."
+        reply = AgentReply.needs_input(
+            run_id=run_id,
+            session_id=session_id,
+            text=text,
+            questions=questions,
+            download=download,
+        )
+    else:
+        text = answer_text or "I've updated the document — download it below."
+        reply = AgentReply.document_ready(
+            run_id=run_id, session_id=session_id, text=text, download=download
+        )
+
+    # The per-turn agent_runs row closes 'success' for both ask and finalize
+    # (the turn succeeded); the awaiting-input lifecycle is on the session row.
+    await agent_runs_close(ts_pool, run_id, "success", reply, failure_reason=classify_failure(qa))
+    await _emit_answer_safe(sse, reply, run_id)
+    AGENT_DOC_FILL_TURNS.labels(mode=mode, status=reply.status).inc()
     return reply
