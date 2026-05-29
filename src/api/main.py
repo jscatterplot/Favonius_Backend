@@ -623,6 +623,22 @@ async def lifespan(app: FastAPI):
     _create_background_task(run_navirec_poll_loop(static_pool, ts_pool))
     logger.info("Navirec telematics poller task started")
 
+    # ── Traffic-fine deadline re-check sweep ──────────────────────────────────
+    # Behind TRAFFIC_FINE_AGENT_ENABLED. Re-evaluates parsed fines (no LLM call)
+    # so a fine uploaded before its window still alerts when the early-payment
+    # deadline comes within range. Idempotent via the alert dedup key.
+    from ..core.traffic_fines.config import (  # noqa: PLC0415
+        is_traffic_fine_agent_enabled as _tf_enabled,
+    )
+
+    if _tf_enabled():
+        from ..core.traffic_fines.sweeper import (  # noqa: PLC0415
+            run_traffic_fine_deadline_sweep,
+        )
+
+        _create_background_task(run_traffic_fine_deadline_sweep(ts_pool, static_pool))
+        logger.info("Traffic-fine deadline sweep started")
+
     # ── SQL-agent token-budget reconcile ──────────────────────────────────────
     # Flushes low-traffic usage that never trips the on-write threshold and
     # re-hydrates cross-worker totals on a timer (bounds multi-worker over-spend).
@@ -785,6 +801,12 @@ def _body_size_limit_for_path(path: str) -> int:
         from ..adapters.chargers.upload_token import get_max_upload_bytes
 
         return get_max_upload_bytes()
+    if path.startswith("/admin/depots/") and path.endswith("/traffic-fines"):
+        # Traffic-fine document upload (POST). Lazy import so the env knob is
+        # read at call time (tests can monkeypatch TRAFFIC_FINE_UPLOAD_MAX_BYTES).
+        from ..core.traffic_fines.config import upload_max_bytes
+
+        return upload_max_bytes()
     return _MAX_BODY_SIZE
 
 
@@ -899,7 +921,7 @@ def _verify_handoff_payload(
 # the new resource segment to the alternation when chargers or schedules ship
 # their own xlsx import.
 _ADMIN_BULK_WRITE_PATH_RE = re.compile(
-    r"^/admin/depots/[^/]+/(?:vehicles|drivers|rfid-cards|charging-sessions/import)(?:/|$)"
+    r"^/admin/depots/[^/]+/(?:vehicles|drivers|rfid-cards|charging-sessions/import|traffic-fines)(?:/|$)"
 )
 
 
@@ -1221,6 +1243,20 @@ if is_data_sources_enabled():
 from .optimization import router as optimization_router  # noqa: E402
 
 app.include_router(optimization_router)
+
+
+# ── Traffic-fine triage agent (feature-flagged) ───────────────────────────────
+# Mounted behind ``TRAFFIC_FINE_AGENT_ENABLED`` (default off). Operators upload a
+# fine document; a Depot Agent workflow extracts the fields multimodally and
+# alerts the Logistics Manager when the early-payment discount is closing (<48h).
+# Inherits the JWT + geo-block pipeline above.
+from ..core.traffic_fines.config import is_traffic_fine_agent_enabled  # noqa: E402
+
+if is_traffic_fine_agent_enabled():
+    from .traffic_fines import router as traffic_fines_router  # noqa: PLC0415
+
+    app.include_router(traffic_fines_router)
+    logger.info("Traffic-fine triage agent enabled at /admin/depots/*/traffic-fines")
 
 
 class OptimizationRequest(BaseModel):

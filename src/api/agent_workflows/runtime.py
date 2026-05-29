@@ -271,6 +271,7 @@ class WorkflowAgent:
         user_input: dict[str, Any] | None = None,
         *,
         permission_tier: PermissionTier = DEFAULT_PERMISSION_TIER,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> Decision:
         """Run one turn of ``workflow`` against the agent's Anthropic client.
 
@@ -340,6 +341,7 @@ class WorkflowAgent:
                         auth_context=auth_context,
                         user_input=user_input,
                         permission_tier=permission_tier,
+                        attachments=attachments,
                     ),
                 }
             ]
@@ -606,11 +608,18 @@ You are the Favonius Depot Agent running the workflow `{workflow.name}` (v{workf
         auth_context: AuthContext,
         user_input: dict[str, Any] | None,
         permission_tier: PermissionTier,
-    ) -> str:
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> str | list[dict[str, Any]]:
         """Compose the per-turn user message.
 
-        Kept outside the cached system block on purpose so the depot
-        and per-turn payload don't bust the prefix cache.
+        Kept outside the cached system block on purpose so the depot and
+        per-turn payload don't bust the prefix cache. When ``attachments`` are
+        supplied (e.g. a base64 document/image content block for a
+        document-analysis workflow), the message becomes a content-block list
+        with the attachments first and the JSON payload as a trailing text
+        block — Anthropic recommends placing documents before the instruction.
+        With no attachments the return is the plain string (unchanged
+        behaviour for every existing workflow).
         """
         payload: dict[str, Any] = {
             "depot_id": str(depot_id),
@@ -622,10 +631,13 @@ You are the Favonius Depot Agent running the workflow `{workflow.name}` (v{workf
         if user_input is not None:
             payload["input"] = user_input
         payload_json = json.dumps(payload, default=str, sort_keys=True, indent=2)
-        return (
+        text = (
             "Run the workflow for the following turn. Use tools to gather any "
             f"state you need.\n\n```json\n{payload_json}\n```"
         )
+        if not attachments:
+            return text
+        return [*attachments, {"type": "text", "text": text}]
 
     # ── Terminator capture ─────────────────────────────────────────────
 

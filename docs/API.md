@@ -750,6 +750,51 @@ list when present (absent = unchanged). Enums: `ScheduleRunStatus` =
 
 ---
 
+## Traffic-Fine Triage (`/admin/depots/{id}/traffic-fines`)
+
+Gated by `TRAFFIC_FINE_AGENT_ENABLED` (default off). An operator uploads a fine
+document; a Depot Agent workflow extracts the issuing authority, amounts,
+early-payment deadline, and IBAN (multimodally), and the platform alerts the
+Logistics Manager (via the notifications pipeline) when the early-payment
+discount is closing within the configured window (default 48h).
+
+### POST /admin/depots/{depot_id}/traffic-fines
+
+Upload a fine document for triage. **Role:** `customer_admin` or `favonius_admin`
+(depot-scoped).
+
+- **Body:** the raw document bytes (PDF or PNG/JPEG/GIF/WEBP). Content-Type is
+  informational; the type is confirmed by magic bytes. Unsupported types → 415.
+  Bodies above `TRAFFIC_FINE_UPLOAD_MAX_BYTES` (default 10 MiB) → 413.
+- **Query:** `file_name` (optional original filename).
+- **Response (202):** `{ "id": "<uuid>", "status": "received", "status_url": "/admin/depots/{depot_id}/traffic-fines/{id}" }`.
+  Extraction + evaluation run asynchronously; poll the detail endpoint.
+
+### GET /admin/depots/{depot_id}/traffic-fines
+
+List a depot's uploaded fines (most recent first; no raw bytes). Any depot
+member. Returns `{ "fines": [ <fine>, … ] }`.
+
+### GET /admin/depots/{depot_id}/traffic-fines/{fine_id}
+
+Fetch one fine. Any depot member. Returns the row including `status`
+(`received` | `parsing` | `parsed` | `alerted` | `no_alert` | `parse_failed` |
+`unsupported_media`), the extracted fields (`issuing_authority`,
+`issuing_country`, `fine_reference`, `currency`, `full_amount`,
+`early_payment_amount`, `discount_amount`, `iban`, `early_payment_deadline`),
+the evaluation (`evaluation_kind`, `hours_until_deadline`, `within_alert_window`),
+and `decision_id` / `alert_id` links. 404 if the fine does not exist for the
+depot.
+
+**Alert:** when the discount is closing within the window, an alert of type
+`traffic_fine_early_payment` is raised; the title is the verbatim operator
+message (`Priority: Early payment discount for Fine #[ID] expires in 2 days.
+Automate payment now to save €[Discount Amount]?`). Register the Logistics
+Manager as a `notification_recipients` row subscribed to that alert type (or
+`*`).
+
+---
+
 ## Implementation Notes
 
 - All endpoints use FastAPI framework
