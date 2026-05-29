@@ -35,7 +35,9 @@ logger = logging.getLogger(__name__)
 # ``document_fill`` is decided structurally in ``run_turn`` (a session_id is
 # present) before ``classify`` runs, not by the text classifier below — it's
 # included here only so the route vocabulary is complete and type-consistent.
-Route = Literal["consumption_by_user", "sql_general", "refuse", "document_fill"]
+Route = Literal[
+    "consumption_by_user", "readiness", "savings", "sql_general", "refuse", "document_fill"
+]
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,56 @@ _CONSUMPTION_ANTIPATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bfault"),
     re.compile(r"\bschedule"),
     re.compile(r"\bopt(imization|imisation) (run|trigger)"),
+)
+
+# Deterministic fast-path intents that pre-empt the consumption / SQL routes.
+# Both are precision-first and checked BEFORE consumption so a "how much did
+# we save by charging…" question lands on savings rather than the consumption
+# trigger it would otherwise match. Neither depends on SQL mode — like the
+# consumption fast path, they answer with their own deterministic handler.
+
+# "save / saved / saving / savings" — in a depot-analytics chat this
+# overwhelmingly means cost savings vs an unmanaged baseline.
+_SAVINGS_TRIGGERS: tuple[re.Pattern[str], ...] = (re.compile(r"\bsav(?:e|ed|ing|ings)\b"),)
+
+# Pull non-financial "save" phrasing back to SQL mode (save a report,
+# configuration, export, schedule, etc.).
+_SAVINGS_ANTIPATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\bsav(?:e|ing)\s+(?:this|the|an?|my|a)\s+"
+        r"(?:config(?:uration)?|settings?|export|schedule|report|file|draft)\b"
+    ),
+    re.compile(r"\bsav(?:e|ing)\s+(?:to|as)\b"),
+    re.compile(r"\bsave\s+(?:changes?|draft|settings?)\b"),
+)
+
+# Departure-readiness phrasing. Kept tight so ops/status questions that merely
+# say "active" or "available" — or unrelated "is the report ready?" — do not
+# get pulled in. The bare "are/is … ready" form requires a fleet/vehicle/we/
+# depot subject between the verb and "ready" so it cannot steal questions about
+# a report, a charger install, a data export, etc.
+_READINESS_TRIGGERS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\breadiness\b"),
+    re.compile(
+        r"\bready\s+(?:to\s+(?:depart|leave|roll|go)|"
+        r"for\s+(?:departure|departures|tomorrow|today|the\s+morning|service))\b"
+    ),
+    re.compile(
+        r"\b(?:are|is)\b[^?]*"
+        r"\b(?:we|fleet|vehicles?|buses|bus|vans?|trucks?|cars?|depot|everything|all)\b"
+        r"[^?]*\bready\b"
+    ),
+)
+
+# Pull a "readiness" match back out of the departure-readiness fast path when
+# it is really about the *optimization* readiness / input-checklist flow
+# (GET /depots/{id}/optimization/readiness), e.g. "what is blocking
+# optimization readiness?" — those belong in SQL mode, not the departure-SoC
+# handler.
+_READINESS_ANTIPATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\boptim(?:al|ize|ise|izer|iser|ization|isation)\b"),
+    re.compile(r"\binput"),
+    re.compile(r"\bsolver\b"),
 )
 
 
@@ -131,7 +183,10 @@ def classify(
 
     Returns:
         A :class:`PlannerDecision` whose ``route`` is one of
-        ``consumption_by_user`` / ``sql_general`` / ``refuse``.
+        ``savings`` / ``readiness`` / ``consumption_by_user`` /
+        ``sql_general`` / ``refuse``. ``savings`` and ``readiness`` are
+        deterministic fast-path intents matched first, independent of SQL
+        mode.
 
         ``refuse`` is returned when SQL mode is disabled (globally or
         for this org) AND the message does not look like a consumption
@@ -140,6 +195,18 @@ def classify(
     text = (message or "").strip().lower()
     if not text:
         return PlannerDecision(route="refuse", reason="empty_message")
+
+    # Deterministic fast-path intents win first (independent of SQL mode).
+    # Savings precedes consumption: "how much did we save by charging…" would
+    # otherwise match the consumption trigger.
+    if any(p.search(text) for p in _SAVINGS_TRIGGERS) and not any(
+        p.search(text) for p in _SAVINGS_ANTIPATTERNS
+    ):
+        return PlannerDecision(route="savings", reason="matched_savings_trigger")
+    if any(p.search(text) for p in _READINESS_TRIGGERS) and not any(
+        p.search(text) for p in _READINESS_ANTIPATTERNS
+    ):
+        return PlannerDecision(route="readiness", reason="matched_readiness_trigger")
 
     consumption_match = any(p.search(text) for p in _CONSUMPTION_TRIGGERS)
     anti_match = any(p.search(text) for p in _CONSUMPTION_ANTIPATTERNS)

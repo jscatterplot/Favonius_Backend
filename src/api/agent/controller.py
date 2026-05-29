@@ -32,8 +32,8 @@ import asyncio
 import hashlib
 import logging
 import re
-from datetime import datetime, timezone
-from typing import Any, Optional, Protocol
+from datetime import datetime, timedelta, timezone
+from typing import Any, Awaitable, Callable, Optional, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -62,6 +62,20 @@ from src.api.agent.intents.consumption_by_user import (
     compile_consumption_by_user,
     summarize_consumption_rows,
 )
+from src.api.agent.intents.readiness import (
+    DEPARTURES_SQL,
+    LATEST_PLAN_SQL,
+    PlanContext,
+    ReadinessVerdict,
+    SocReading,
+    render_readiness_answer,
+    resolve_readiness_window,
+    summarize_readiness,
+)
+from src.api.agent.intents.savings import (
+    render_savings_answer,
+    resolve_savings_window,
+)
 from src.api.agent.llm_router import (
     configured_default_model,
     pick_model,
@@ -86,6 +100,8 @@ from src.api.agent.stream import SSEEventStream
 from src.api.agent.view_context import AgentViewContext, build_page_context_payload
 from src.api.agent_workflows.runtime import ToolNotAllowedError, run_qa_turn
 from src.api.agent_workflows.tools import ToolNotRegisteredError
+from src.api.savings import SavingsSummary, compute_savings_for_window
+from src.db.queries import fetch_freshest_vehicle_socs
 from src.monitoring.metrics import (
     AGENT_DOC_FILL_TURNS,
     AGENT_DOC_RENDERS,
@@ -93,6 +109,7 @@ from src.monitoring.metrics import (
     AGENT_SQL_BUDGET_REFUSED,
     AGENT_SQL_TOOL_TURNS,
 )
+from src.security.data_freshness import MAX_TELEMETRY_AGE
 
 logger = logging.getLogger(__name__)
 
@@ -360,6 +377,9 @@ _STEP_LABELS: dict[str, str] = {
     "resolve_entities": "Finding who and what you mentioned",
     "compile": "Preparing the query",
     "execute": "Fetching the data",
+    # Readiness + savings deterministic fast-path intents.
+    "readiness": "Checking departure readiness",
+    "savings": "Calculating your savings",
     # SQL-mode tools. The SSE event name stays "tool_call"; the tool name is
     # the label key.
     "list_tables": "Reviewing the available data",
@@ -501,6 +521,335 @@ async def _depot_wide_consumption_rows(
     return rows_list, window, len(tz_depots)
 
 
+# ── Deterministic-intent shared helpers ────────────────────────────────────
+
+
+async def _resolve_scoped_depots(message: str, auth: Any, static_pool: Any) -> list[UUID]:
+    """Scope a deterministic-intent turn to a depot named in the message.
+
+    The planner routes readiness/savings before entity resolution, so a
+    "…at Vilnius" / "Is Vilnius ready?" question would otherwise span every
+    visible depot. LLM-free: when the caller sees more than one depot and one
+    or more of their names appears as a whole word/phrase (case-insensitive)
+    in the message, scope to those; otherwise return all visible depots.
+    """
+    visible = list(auth.visible_depot_ids)
+    if len(visible) <= 1:
+        return visible
+    rows = await static_pool.fetch("SELECT id, name FROM sites WHERE id = ANY($1::uuid[])", visible)
+    text = (message or "").lower()
+    matched = [
+        UUID(str(row["id"]))
+        for row in rows
+        if row["name"] and re.search(r"\b" + re.escape(row["name"].lower()) + r"\b", text)
+    ]
+    return matched or visible
+
+
+# ── Readiness fast-path intent ─────────────────────────────────────────────
+
+
+async def _fetch_readiness_socs(
+    ts_pool: Any,
+    vehicle_ids: list[UUID],
+    recency_floor: datetime,
+) -> dict[str, SocReading]:
+    """Freshest SoC per vehicle, keyed for the readiness verdict.
+
+    Thin adapter over the shared
+    :func:`src.db.queries.fetch_freshest_vehicle_socs` (the same merge the
+    optimizer's ``StateAssembler`` uses), mapping its rows to
+    ``{vehicle_id: SocReading}``.
+    """
+    rows = await fetch_freshest_vehicle_socs(ts_pool, vehicle_ids, recency_floor=recency_floor)
+    socs: dict[str, SocReading] = {}
+    for row in rows:
+        if row["soc"] is None:
+            continue
+        socs[str(row["vehicle_id"])] = SocReading(soc=float(row["soc"]), time=row["time"])
+    return socs
+
+
+async def _finish_intent_success(
+    ts_pool: Any,
+    sse: Optional[SSEEventStream],
+    run_id: UUID,
+    *,
+    auth: Any,
+    intent: str,
+    text: str,
+    row_count: int,
+    target_type: str,
+) -> AgentReply:
+    """Shared success bookend for the deterministic fast-path intents.
+
+    Mirrors a query into the admin audit feed, builds the success reply,
+    closes the ``agent_runs`` row, and emits the final SSE answer. Each
+    deterministic intent handler ends with this so the
+    audit/close/emit plumbing lives in one place (the consumption and
+    sql_general paths have their own richer flows and don't use it).
+    """
+    await write_agent_query_audit(ts_pool, auth, run_id, intent, row_count, target_type=target_type)
+    reply = AgentReply.success(run_id=run_id, intent=intent, text=text)
+    await agent_runs_close(ts_pool, run_id, "success", reply)
+    await _emit_answer_safe(sse, reply, run_id)
+    return reply
+
+
+async def _run_readiness_turn(
+    *,
+    run_id: UUID,
+    auth: Any,
+    static_pool: Any,
+    ts_pool: Any,
+    sse: Optional[SSEEventStream],
+    emit_step: Any,
+    message: str = "",
+    now: Optional[datetime] = None,
+) -> AgentReply:
+    """Answer "are we ready to depart?" deterministically (no LLM call).
+
+    Three set-based queries — upcoming departures (static), freshest SoC per
+    departing vehicle (TS), latest plan per depot (TS) — reduced to a depot
+    verdict by :func:`summarize_readiness`, which aligns each vehicle's plan
+    SoC to its departure instant. Scope honours a named depot in the message
+    (``_resolve_scoped_depots``) and the look-ahead honours a day phrase
+    (``resolve_readiness_window``: "tomorrow" / "today" / default next-24h);
+    both fall back to all visible depots / next-24h when absent.
+    """
+    as_of = now if now is not None else datetime.now(timezone.utc)
+    await emit_step("readiness")
+
+    depot_ids = await _resolve_scoped_depots(message, auth, static_pool)
+    if not depot_ids:
+        reply = AgentReply(
+            run_id=run_id,
+            status="not_found",
+            text="I couldn't find any depots in your account to check departure readiness for.",
+            intent="readiness",
+        )
+        await agent_runs_close(ts_pool, run_id, "not_found", reply)
+        await _emit_answer_safe(sse, reply, run_id)
+        return reply
+
+    # A day phrase ("tomorrow"/"today") is anchored in the depot's timezone only
+    # when exactly one depot is in scope; otherwise the window stays the
+    # tz-agnostic next-24h.
+    tz_name = None
+    if len(depot_ids) == 1:
+        tz_name = (await load_depot_timezones(static_pool, depot_ids)).get(depot_ids[0])
+    window_start, window_end, window_label = resolve_readiness_window(message, as_of, tz_name)
+
+    rows = await static_pool.fetch(DEPARTURES_SQL, depot_ids, window_start, window_end)
+    departures = [dict(r) for r in rows]
+    await agent_runs_step(
+        ts_pool,
+        run_id,
+        "readiness_departures",
+        {"count": len(departures), "depots": len(depot_ids), "window": window_label},
+    )
+
+    if not departures:
+        verdict = ReadinessVerdict(
+            window_label=window_label, total=0, ready=0, at_risk=0, unknown=0, vehicles=[]
+        )
+    else:
+        vehicle_ids = sorted({UUID(d["vehicle_id"]) for d in departures})
+        depot_uuids = sorted({UUID(d["depot_id"]) for d in departures})
+        # Scan-floor for the SoC merge: 24h before the earliest thing we care
+        # about (now, or the window start if it is in the past).
+        soc_floor = min(as_of, window_start) - timedelta(hours=24)
+        socs, plan_rows = await asyncio.gather(
+            _fetch_readiness_socs(ts_pool, vehicle_ids, soc_floor),
+            ts_pool.fetch(LATEST_PLAN_SQL, depot_uuids),
+        )
+        plans_by_depot = {
+            str(r["depot_id"]): PlanContext(
+                schedule_json=r["schedule_json"],
+                horizon_start=r["horizon_start"],
+                horizon_end=r["horizon_end"],
+            )
+            for r in plan_rows
+        }
+        verdict = summarize_readiness(
+            departures,
+            socs,
+            plans_by_depot,
+            now=as_of,
+            max_age=MAX_TELEMETRY_AGE,
+            window_label=window_label,
+        )
+
+    await agent_runs_step(
+        ts_pool,
+        run_id,
+        "readiness_verdict",
+        {
+            "total": verdict.total,
+            "ready": verdict.ready,
+            "at_risk": verdict.at_risk,
+            "unknown": verdict.unknown,
+            "overall": verdict.overall,
+        },
+    )
+    text = render_readiness_answer(verdict)
+    return await _finish_intent_success(
+        ts_pool,
+        sse,
+        run_id,
+        auth=auth,
+        intent="readiness",
+        text=text,
+        row_count=verdict.total,
+        target_type="schedules",
+    )
+
+
+# ── Savings fast-path intent ───────────────────────────────────────────────
+
+
+async def _run_savings_turn(
+    *,
+    run_id: UUID,
+    message: str,
+    auth: Any,
+    static_pool: Any,
+    ts_pool: Any,
+    sse: Optional[SSEEventStream],
+    emit_step: Any,
+    now: Optional[datetime] = None,
+) -> AgentReply:
+    """Answer "how much did we save (overnight / this month / …)?" — no LLM.
+
+    Scope honours a depot named in the message (``_resolve_scoped_depots``),
+    else all visible depots. Resolves the window from the message + each
+    depot's timezone (:func:`resolve_savings_window`), reuses
+    :func:`src.api.savings.compute_savings_for_window` per depot, and
+    aggregates the euro figures. Each depot computes its own window in its own
+    timezone, so a multi-timezone org's "overnight" is correct per site.
+    """
+    as_of = now if now is not None else datetime.now(timezone.utc)
+    await emit_step("savings")
+
+    depot_ids = await _resolve_scoped_depots(message, auth, static_pool)
+    if not depot_ids:
+        reply = AgentReply(
+            run_id=run_id,
+            status="not_found",
+            text="I couldn't find any depots in your account to calculate savings for.",
+            intent="savings",
+        )
+        await agent_runs_close(ts_pool, run_id, "not_found", reply)
+        await _emit_answer_safe(sse, reply, run_id)
+        return reply
+
+    depot_tzs = await load_depot_timezones(static_pool, depot_ids)
+    # Window is resolved per depot (each in its own tz); the label + kind are
+    # constant across depots (they depend only on the message), so we read them
+    # off any resolved window rather than re-classifying the message.
+    windows = {d: resolve_savings_window(message, as_of, depot_tzs.get(d)) for d in depot_ids}
+    first_window = next(iter(windows.values()))
+    label = first_window.label
+    kind = first_window.kind
+
+    # Compute every depot concurrently — the calls are independent (3 DB hits
+    # each) and `load_depot_timezones` already ran, so there's no shared state.
+    results = await asyncio.gather(
+        *(
+            compute_savings_for_window(
+                static_pool,
+                ts_pool,
+                str(d),
+                period_start=w.period_start,
+                period_end=w.period_end,
+                now=as_of,
+            )
+            for d, w in windows.items()
+        ),
+        return_exceptions=True,
+    )
+    summaries = [r for r in results if isinstance(r, SavingsSummary)]
+    failures = [r for r in results if isinstance(r, BaseException)]
+    if failures and not summaries:
+        # Every depot computation failed — surface the failure (run_turn closes
+        # the run as 'error') rather than returning a misleading "no charging".
+        raise failures[0]
+    if failures:
+        logger.warning(
+            "savings: %d/%d depot computations failed; reporting partial aggregate",
+            len(failures),
+            len(results),
+        )
+
+    # Aggregate ONLY depots with a priceable baseline. A depot with no
+    # bidding zone / no prices (baseline_known=False) is excluded from BOTH
+    # sides of the comparison so its unpriced spend can't dilute the saving;
+    # this also means a genuine baseline that sums to 0 (negative prices
+    # cancelling) is still reported as a known baseline, not "no price data".
+    priced = [s for s in summaries if s.baseline_known]
+    if priced:
+        total_actual = sum(s.actual_eur for s in priced)
+        total_baseline = sum(s.baseline_eur for s in priced)
+        baseline_known = True
+        depot_count = len(priced)
+    else:
+        # Nothing priceable — report total spend across the depots that
+        # computed, with no baseline (render says "can't estimate").
+        total_actual = sum(s.actual_eur for s in summaries)
+        total_baseline = 0.0
+        baseline_known = False
+        depot_count = len(summaries)
+
+    actual = round(total_actual, 2)
+    baseline = round(total_baseline, 2)
+    saved = round(baseline - actual, 2)
+    saved_pct = round((saved / abs(baseline)) * 100.0, 1) if baseline != 0 else 0.0
+
+    await agent_runs_step(
+        ts_pool,
+        run_id,
+        "savings_window",
+        {
+            "kind": kind,
+            "label": label,
+            "depots": depot_count,
+            "failed_depots": len(failures),
+            "baseline_known": baseline_known,
+            "actual_eur": actual,
+            "baseline_eur": baseline,
+        },
+    )
+    text = render_savings_answer(
+        actual_eur=actual,
+        baseline_eur=baseline,
+        saved_eur=saved,
+        saved_pct=saved_pct,
+        label=label,
+        depot_count=depot_count,
+        baseline_known=baseline_known,
+    )
+    return await _finish_intent_success(
+        ts_pool,
+        sse,
+        run_id,
+        auth=auth,
+        intent="savings",
+        text=text,
+        row_count=depot_count,
+        target_type="charging_sessions",
+    )
+
+
+# Deterministic fast-path intents share one handler signature; the orchestrator
+# dispatches by route through this registry so adding intent #3 is a handler +
+# one entry here (no new branch). The consumption fast path and sql_general have
+# their own richer flows and are dispatched explicitly in run_turn.
+_DETERMINISTIC_INTENT_HANDLERS: dict[str, Callable[..., Awaitable[AgentReply]]] = {
+    "savings": _run_savings_turn,
+    "readiness": _run_readiness_turn,
+}
+
+
 # ── Orchestrator ───────────────────────────────────────────────────────────
 
 
@@ -514,6 +863,7 @@ async def run_turn(
     sse: Optional[SSEEventStream] = None,
     context: Optional[AgentViewContext] = None,
     session_id: Optional[UUID] = None,
+    now: Optional[datetime] = None,
 ) -> AgentReply:
     """End-to-end orchestration of one chat turn.
 
@@ -534,6 +884,8 @@ async def run_turn(
             feature flag is on, the turn routes straight to the collaborative
             document-fill loop (``_run_document_fill_turn``), bypassing the
             planner — the document is the subject, not the message text.
+        now: Optional clock override for deterministic fast-path intents
+            (readiness, savings). Defaults to UTC "now" when omitted.
 
     Returns:
         An :class:`AgentReply`. Raises only on unrecoverable failures
@@ -611,6 +963,19 @@ async def run_turn(
             await agent_runs_close(ts_pool, run_id, "not_found", reply)
             await _emit_answer_safe(sse, reply, run_id)
             return reply
+
+        deterministic_handler = _DETERMINISTIC_INTENT_HANDLERS.get(decision.route)
+        if deterministic_handler is not None:
+            return await deterministic_handler(
+                run_id=run_id,
+                message=message,
+                auth=auth,
+                static_pool=static_pool,
+                ts_pool=ts_pool,
+                sse=sse,
+                emit_step=_emit_step,
+                now=now,
+            )
 
         if decision.route == "sql_general":
             return await _run_sql_general_turn(

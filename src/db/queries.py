@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import UUID
 
+import asyncpg
+
 logger = logging.getLogger(__name__)
 
 
@@ -112,6 +114,81 @@ async def get_latest_vehicle_soc(
     """
     row = await db.fetchrow(query, vehicle_id, cutoff_time)
     return row["soc"] if row else None
+
+
+# Freshest SoC per vehicle, merging the OCPP charger feed (`telemetry`) and the
+# telematics feed (`vehicle_telemetry`, migration 044). The 24h scan floor is a
+# parameter ($2) — not DB now() — so callers that inject a clock (golden tests)
+# get deterministic results. On an exact (vehicle_id, time) tie, src_priority
+# makes charger telemetry win (ground truth when plugged in). Selecting `time`
+# lets callers apply their own staleness check (MAX_TELEMETRY_AGE).
+_MERGED_VEHICLE_SOC_SQL = """
+    SELECT DISTINCT ON (vehicle_id)
+        vehicle_id::text AS vehicle_id,
+        soc,
+        time
+    FROM (
+        SELECT vehicle_id, soc, time, 0 AS src_priority
+        FROM telemetry
+        WHERE vehicle_id = ANY($1::uuid[])
+          AND soc IS NOT NULL
+          AND time > $2
+        UNION ALL
+        SELECT vehicle_id, soc, time, 1 AS src_priority
+        FROM vehicle_telemetry
+        WHERE vehicle_id = ANY($1::uuid[])
+          AND soc IS NOT NULL
+          AND time > $2
+    ) merged
+    ORDER BY vehicle_id, time DESC, src_priority
+"""
+
+# Fallback when vehicle_telemetry is absent (migration 044 not yet applied /
+# rollout skew) — charger telemetry only.
+_TELEMETRY_ONLY_VEHICLE_SOC_SQL = """
+    SELECT DISTINCT ON (vehicle_id)
+        vehicle_id::text AS vehicle_id,
+        soc,
+        time
+    FROM telemetry
+    WHERE vehicle_id = ANY($1::uuid[])
+      AND soc IS NOT NULL
+      AND time > $2
+    ORDER BY vehicle_id, time DESC
+"""
+
+
+async def fetch_freshest_vehicle_socs(
+    fetcher: Any,
+    vehicle_ids: list[UUID],
+    *,
+    recency_floor: datetime,
+) -> list:
+    """Return the freshest SoC row per vehicle from the merged telemetry feeds.
+
+    Single source of the merge SQL shared by ``StateAssembler._get_vehicle_socs``
+    (optimizer input) and the chat agent's readiness intent. ``fetcher`` is
+    anything exposing ``.fetch`` (an asyncpg pool, a pooled connection, or a
+    test facade). Each returned row has ``vehicle_id`` (text), ``soc`` and
+    ``time``. Falls back to charger-telemetry-only when ``vehicle_telemetry``
+    does not exist yet.
+
+    Args:
+        fetcher: Object with an awaitable ``fetch(sql, *args)``.
+        vehicle_ids: Vehicle UUIDs to look up (``[]`` → ``[]``).
+        recency_floor: Lower bound on the reading ``time`` (typically
+            ``now - 24h``) bounding the DISTINCT ON scan.
+    """
+    if not vehicle_ids:
+        return []
+    try:
+        return await fetcher.fetch(_MERGED_VEHICLE_SOC_SQL, vehicle_ids, recency_floor)
+    except asyncpg.exceptions.UndefinedTableError:
+        logger.warning(
+            "vehicle_telemetry missing (migration 044 not applied?); "
+            "falling back to charger telemetry only"
+        )
+        return await fetcher.fetch(_TELEMETRY_ONLY_VEHICLE_SOC_SQL, vehicle_ids, recency_floor)
 
 
 async def insert_telemetry(
@@ -313,7 +390,6 @@ async def fetch_prices_by_zone(
     if not rows:
         return {}
 
-
     known: list[tuple[datetime, float]] = []
     for row in rows:
         raw = row["lmp_price_mwh"]
@@ -392,7 +468,11 @@ async def fetch_or_pull_prices_by_zone(
         archive that the API doesn't serve, or an API outage).
     """
     cached = await fetch_prices_by_zone(
-        ts_db, bidding_zone, start_time, end_time, forward_fill_window,
+        ts_db,
+        bidding_zone,
+        start_time,
+        end_time,
+        forward_fill_window,
     )
 
     start_aware = _as_utc_aware(start_time)
@@ -412,7 +492,10 @@ async def fetch_or_pull_prices_by_zone(
             "fetch_or_pull_prices_by_zone: cache miss for zone=%s "
             "[%s, %s) missing=%d hours; EUROPEAN_ELECTRICITY_API "
             "unset — returning partial cache",
-            bidding_zone, start_aware, end_aware, len(missing_hours),
+            bidding_zone,
+            start_aware,
+            end_aware,
+            len(missing_hours),
         )
         return cached
 
@@ -428,13 +511,18 @@ async def fetch_or_pull_prices_by_zone(
         # rate-limit budget per request, not per hour, so one call for
         # the whole window is cheaper than per-hour calls.
         fetched = await adapter.get_day_ahead_prices(
-            start_aware, end_aware, bidding_zone=bidding_zone,
+            start_aware,
+            end_aware,
+            bidding_zone=bidding_zone,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "fetch_or_pull_prices_by_zone: ENTSO-E API call failed "
             "for zone=%s [%s, %s): %s — returning partial cache",
-            bidding_zone, start_aware, end_aware, exc,
+            bidding_zone,
+            start_aware,
+            end_aware,
+            exc,
         )
         return cached
     finally:
@@ -455,7 +543,9 @@ async def fetch_or_pull_prices_by_zone(
            AND time       >= $2
            AND time        < $3
         """,
-        bidding_zone, start_aware, end_aware,
+        bidding_zone,
+        start_aware,
+        end_aware,
     )
     existing_times = {_as_utc_aware(r["time"]) for r in existing_rows}
 
@@ -487,13 +577,18 @@ async def fetch_or_pull_prices_by_zone(
         logger.info(
             "fetch_or_pull_prices_by_zone: pulled %d hours from "
             "ENTSO-E into electricity_prices (zone=%s)",
-            len(new_rows), bidding_zone,
+            len(new_rows),
+            bidding_zone,
         )
 
     # Re-read with forward-fill so the returned dict matches the cache
     # path's shape and semantics exactly.
     return await fetch_prices_by_zone(
-        ts_db, bidding_zone, start_time, end_time, forward_fill_window,
+        ts_db,
+        bidding_zone,
+        start_time,
+        end_time,
+        forward_fill_window,
     )
 
 
@@ -777,9 +872,7 @@ async def list_recurring_templates(db, *, depot_id: UUID) -> list[dict]:
     return [_row_to_recurring_template(r) for r in rows]
 
 
-async def get_cancelled_dates_for_templates(
-    db, *, template_ids: list[UUID]
-) -> dict[str, list]:
+async def get_cancelled_dates_for_templates(db, *, template_ids: list[UUID]) -> dict[str, list]:
     """Map ``template_id (str) → sorted list of cancelled occurrence_dates``."""
     if not template_ids:
         return {}
@@ -930,9 +1023,7 @@ async def set_recurring_template_active(
     return _row_to_recurring_template(row) if row else None
 
 
-async def delete_recurring_template(
-    db, *, depot_id: UUID, template_id: UUID
-) -> bool:
+async def delete_recurring_template(db, *, depot_id: UUID, template_id: UUID) -> bool:
     """Delete a template (cascades to cancellations). Returns True if removed."""
     query = """
         DELETE FROM recurring_schedule_template
@@ -968,25 +1059,19 @@ async def upsert_recurring_cancellation(
         RETURNING template_id, occurrence_date, cancelled_at,
                   cancelled_by_user_id, reason
     """
-    row = await db.fetchrow(
-        query, template_id, occurrence_date, cancelled_by_user_id, reason
-    )
+    row = await db.fetchrow(query, template_id, occurrence_date, cancelled_by_user_id, reason)
     return {
         "template_id": str(row["template_id"]),
         "occurrence_date": row["occurrence_date"],
         "cancelled_at": row["cancelled_at"],
         "cancelled_by_user_id": (
-            str(row["cancelled_by_user_id"])
-            if row["cancelled_by_user_id"] is not None
-            else None
+            str(row["cancelled_by_user_id"]) if row["cancelled_by_user_id"] is not None else None
         ),
         "reason": row["reason"],
     }
 
 
-async def delete_recurring_cancellation(
-    db, *, template_id: UUID, occurrence_date
-) -> bool:
+async def delete_recurring_cancellation(db, *, template_id: UUID, occurrence_date) -> bool:
     """Remove a single-occurrence cancellation. Returns True if a row was deleted."""
     query = """
         DELETE FROM recurring_schedule_cancellation
@@ -2869,9 +2954,7 @@ async def rotate_charger_credentials(
     }
 
 
-async def reset_local_auth_cache(
-    db, *, depot_id: str, charger_id: str
-) -> Optional[dict]:
+async def reset_local_auth_cache(db, *, depot_id: str, charger_id: str) -> Optional[dict]:
     """Clear the cached LocalAuthorizationList support outcome for a charger.
 
     Sets ``local_list_supported``, ``local_list_probed_firmware``,
@@ -2943,13 +3026,19 @@ async def reset_local_auth_cache(
     if row is None:
         return None
 
-    previous_supported = row.get("local_list_supported") if hasattr(row, "get") else (
-        row["local_list_supported"] if "local_list_supported" in row.keys() else None
+    previous_supported = (
+        row.get("local_list_supported")
+        if hasattr(row, "get")
+        else (row["local_list_supported"] if "local_list_supported" in row.keys() else None)
     )
-    previous_probed_firmware = row.get("local_list_probed_firmware") if hasattr(row, "get") else (
-        row["local_list_probed_firmware"]
-        if "local_list_probed_firmware" in row.keys()
-        else None
+    previous_probed_firmware = (
+        row.get("local_list_probed_firmware")
+        if hasattr(row, "get")
+        else (
+            row["local_list_probed_firmware"]
+            if "local_list_probed_firmware" in row.keys()
+            else None
+        )
     )
 
     await db.execute(
@@ -3444,9 +3533,7 @@ async def list_completed_sessions_for_charger(
         cursor_ts, cursor_session_id = cursor
         params.append(cursor_ts)
         params.append(cursor_session_id)
-        clauses.append(
-            f"(end_time, session_id) < (${len(params) - 1}, ${len(params)}::uuid)"
-        )
+        clauses.append(f"(end_time, session_id) < (${len(params) - 1}, ${len(params)}::uuid)")
 
     params.append(limit)
     where_sql = " AND ".join(clauses)

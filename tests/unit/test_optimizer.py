@@ -191,6 +191,53 @@ def test_invalid_config_negative_charger_power(simple_depot_state):
         build_optimization_model(simple_depot_state, config)
 
 
+def test_no_battery_builds_solves_and_dispatches_zero(simple_depot_state):
+    """Depot with no stationary battery (capacity=0, power=0) must build, solve,
+    and dispatch zero battery power.
+
+    Regression: this previously raised InvalidConfigError("battery_capacity must
+    be positive") and, past the validator, would ZeroDivisionError in the
+    battery-SoC dynamics. StateAssembler emits 0/0 as the documented "no
+    battery" sentinel for depots without a battery_storage row.
+    """
+    config = DepotConfig(
+        vehicle_capacities={"bus_1": 324.0, "bus_2": 324.0},
+        vehicle_max_charge_kw={"bus_1": 80.0, "bus_2": 80.0},
+        charger_groups={80.0: 2},
+        charger_efficiency=0.95,
+        charger_vehicle_access={},
+        battery_capacity=0.0,  # no battery
+        battery_power=0.0,  # no battery
+        max_site_power=500.0,
+    )
+    # Build must not raise.
+    build_optimization_model(simple_depot_state, config)
+    # Full solve path (what the controller invokes) must succeed.
+    result = optimize(simple_depot_state, config, time_limit=60.0)
+    assert result.status == "completed"
+    assert result.objective_value is not None
+    # No battery => zero dispatch at every timestep.
+    assert result.battery_dispatch
+    assert all(abs(p) < 1e-6 for p in result.battery_dispatch)
+
+
+def test_negative_battery_capacity_rejected(simple_depot_state):
+    """Negative battery values remain a hard config error — only 0 is the
+    'no battery' sentinel."""
+    config = DepotConfig(
+        vehicle_capacities={"bus_1": 324.0, "bus_2": 324.0},
+        vehicle_max_charge_kw={"bus_1": 80.0, "bus_2": 80.0},
+        charger_groups={80.0: 2},
+        charger_efficiency=0.95,
+        charger_vehicle_access={},
+        battery_capacity=-1.0,  # invalid
+        battery_power=100.0,
+        max_site_power=500.0,
+    )
+    with pytest.raises(InvalidConfigError):
+        build_optimization_model(simple_depot_state, config)
+
+
 # Solver Tests
 def test_model_solves_feasible(simple_depot_state, simple_depot_config):
     """Model should find feasible solution."""

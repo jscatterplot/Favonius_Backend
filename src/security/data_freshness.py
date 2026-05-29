@@ -75,11 +75,13 @@ def check_data_freshness(
                 f"Telemetry data stale: {age.total_seconds() / 60:.1f} min old "
                 f"(max: {MAX_TELEMETRY_AGE.total_seconds() / 60:.0f} min)"
             )
-            logger.warning(warnings[-1])
+            # Still surfaced in ``warnings`` for callers; logged at debug to
+            # avoid per-cycle vehicle-SoC noise.
+            logger.debug(warnings[-1])
     else:
         telemetry_fresh = False
         warnings.append("No telemetry data available")
-        logger.warning(warnings[-1])
+        logger.debug(warnings[-1])
 
     # Check price freshness
     if price_time:
@@ -120,7 +122,9 @@ def check_data_freshness(
                 f"Building load data stale: {age.total_seconds() / 60:.1f} min old "
                 f"(max: {MAX_BUILDING_LOAD_AGE.total_seconds() / 60:.0f} min)"
             )
-            logger.warning(warnings[-1])
+            # Still surfaced in ``warnings`` for callers; logged at debug to
+            # avoid per-cycle noise for depots without a building-load meter.
+            logger.debug(warnings[-1])
     else:
         building_load_fresh = False
         # Building load is optional, log at debug level

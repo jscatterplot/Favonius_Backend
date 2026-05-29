@@ -155,6 +155,17 @@ jobs:
             -m "agent_sql_golden or not agent_sql_golden" \
             --tb=short
 
+      - name: Run readiness + savings intent golden gate
+        # Deterministic fast-path intents (no LLM). Seeds each graph_snapshot
+        # into the same TS+static pair, calls the real handler with
+        # scenario_now injected, and asserts the rendered answer. Reuses the
+        # `schedules` table from the Supabase bootstrap and the
+        # telemetry / vehicle_telemetry / optimization_runs tables created by
+        # the migrations applied above. Catches cross-pool SQL / schema drift
+        # in the readiness queries + the savings aggregation.
+        run: |
+          pytest tests/golden/test_agent_intents_golden.py --tb=short
+
       - name: Run AT-18 acceptance e2e (S3 step B)
         # The TS+static pair set up above backs the new AT-18 SQL-mode tests
         # (planner -> run_qa_turn -> sql_validator -> sql_executor over SSE, with
