@@ -51,6 +51,16 @@ class BufferedRecord:
 # process* (when building/persisting a support bundle). Kept out of the
 # hot ``emit`` path — redacting every log line would be wasteful while the
 # data never leaves memory. Order matters: more specific patterns first.
+#
+# Best-effort denylist, deliberately biased toward OVER-redaction (losing a
+# little log context beats leaking a secret in a GDPR-bounded bundle). It
+# covers the log shapes this service actually produces: dict/JSON
+# (``{"password": "x"}``), key=value / key: value, connection-string
+# passwords, bearer/JWT, prefixed API keys, and long hex blobs.
+_SECRET_KEYS = (
+    r"authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"client[_-]?secret|secret|token|password|passwd|pwd"
+)
 _REDACTIONS: list[tuple[re.Pattern[str], str]] = [
     # JSON Web Tokens (header.payload.signature, base64url).
     (
@@ -59,16 +69,29 @@ _REDACTIONS: list[tuple[re.Pattern[str], str]] = [
     ),
     # Email addresses.
     (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "[REDACTED_EMAIL]"),
-    # "Bearer <token>" anywhere in the line.
-    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer [REDACTED]"),
-    # key=value / key: value secrets (authorization, token, api_key, password, secret).
+    # Connection-string passwords: scheme://user:PASSWORD@host
+    (re.compile(r"(://[^:/?#\s]+:)([^@\s]+)(@)"), r"\1[REDACTED]\3"),
+    # key=value / key: value secrets. Handles quoted keys ({"password": ...})
+    # and quoted values; an UNQUOTED value runs until the next "<ident>=/:"
+    # field or end-of-line, so space-bearing values are fully covered (this
+    # over-redacts the rest of the field rather than leaking the tail). Running
+    # before the bare-bearer pass means "Authorization: Bearer x" collapses to
+    # one "[REDACTED]" instead of double-redacting.
     (
         re.compile(
-            r"(?i)\b(authorization|token|api[_-]?key|password|passwd|pwd|secret)\b"
-            r"(\s*[:=]\s*)\S+"
+            r"""(?ix)
+            (["']?\b(?:"""
+            + _SECRET_KEYS
+            + r""")\b["']?\s*[:=]\s*)
+            ("[^"]*"|'[^']*'|(?:(?!\s+[\w.-]+\s*[:=])[^,;}\n\r])+)
+            """
         ),
-        r"\1\2[REDACTED]",
+        r"\1[REDACTED]",
     ),
+    # Bare "Bearer <token>" not already handled by the key=value pass above.
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer [REDACTED]"),
+    # Prefixed API keys (Stripe/OpenAI-style: sk-, sk_live_, pk_, rk_, ak_).
+    (re.compile(r"\b(?:sk|pk|rk|ak)[-_][A-Za-z0-9_-]{8,}"), "[REDACTED_KEY]"),
     # Long hex blobs (>= 32 chars) — likely keys/hashes/credentials.
     (re.compile(r"\b[0-9a-fA-F]{32,}\b"), "[REDACTED_HEX]"),
 ]
@@ -198,6 +221,11 @@ def install_log_buffer(
     ``LoggingMiddleware`` — which is exactly the "last few minutes of FastAPI
     logs" the support summary needs. If already installed, returns the existing
     handler unchanged.
+
+    Only the *handler's* level is set; the root logger's level is left alone so
+    installing the buffer never overrides the operator's ``LOG_LEVEL`` or
+    changes global stdout verbosity. The buffer captures whatever the
+    configured logging already propagates.
     """
     global _log_buffer
     with _install_lock:
@@ -205,12 +233,7 @@ def install_log_buffer(
             return _log_buffer
         handler = RingBufferLogHandler(max_records=max_records, max_age_seconds=max_age_seconds)
         handler.setLevel(level)
-        root = logging.getLogger()
-        root.addHandler(handler)
-        # Ensure the root logger actually propagates records at our level;
-        # don't lower an already-more-verbose effective level.
-        if root.level == logging.NOTSET or root.level > level:
-            root.setLevel(level)
+        logging.getLogger().addHandler(handler)
         _log_buffer = handler
         return handler
 

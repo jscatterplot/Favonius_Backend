@@ -47,13 +47,13 @@ async def test_websocket_in_process_running_with_chargers():
     server._running = True
     server.charge_points = {"cp1": object()}
     with patch.object(main, "ocpp_server", server):
-        assert await main.check_websocket_health() == "healthy"
+        assert await main.check_websocket_health() == ("healthy", "in_process")
 
 
 async def test_websocket_unknown_when_disabled_and_no_probe(monkeypatch):
     monkeypatch.delenv("WEBSOCKET_HEALTH_PROBE_URL", raising=False)
     with patch.object(main, "ocpp_server", None):
-        assert await main.check_websocket_health() == "unknown"
+        assert await main.check_websocket_health() == ("unknown", "unknown")
 
 
 async def test_websocket_probe_healthy(monkeypatch):
@@ -76,7 +76,7 @@ async def test_websocket_probe_healthy(monkeypatch):
             return _Resp()
 
     with patch.object(main, "ocpp_server", None), patch("httpx.AsyncClient", _Client):
-        assert await main.check_websocket_health() == "healthy"
+        assert await main.check_websocket_health() == ("healthy", "http_probe")
 
 
 async def test_websocket_probe_non_200_is_degraded(monkeypatch):
@@ -99,7 +99,7 @@ async def test_websocket_probe_non_200_is_degraded(monkeypatch):
             return _Resp()
 
     with patch.object(main, "ocpp_server", None), patch("httpx.AsyncClient", _Client):
-        assert await main.check_websocket_health() == "degraded"
+        assert await main.check_websocket_health() == ("degraded", "http_probe")
 
 
 async def test_websocket_probe_timeout_is_unavailable(monkeypatch):
@@ -119,7 +119,7 @@ async def test_websocket_probe_timeout_is_unavailable(monkeypatch):
             raise TimeoutError("probe timed out")
 
     with patch.object(main, "ocpp_server", None), patch("httpx.AsyncClient", _Client):
-        assert await main.check_websocket_health() == "unavailable"
+        assert await main.check_websocket_health() == ("unavailable", "http_probe")
 
 
 async def test_build_health_snapshot_shape(monkeypatch):

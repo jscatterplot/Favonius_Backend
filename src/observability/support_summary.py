@@ -27,7 +27,7 @@ import base64
 import binascii
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any, Iterable, Optional
@@ -76,7 +76,6 @@ class SupportSummaryBundle:
     screenshot_size_bytes: Optional[int] = None
     screenshot_sha256: Optional[str] = None
     logs_excerpt: str = ""
-    extra_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 # ── Pure helpers (no I/O) ─────────────────────────────────────────────────────

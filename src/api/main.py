@@ -85,6 +85,7 @@ from ..observability.log_buffer import (
     get_log_buffer,
     install_log_buffer,
     redact_log_line,
+    uninstall_log_buffer,
 )
 from ..observability.support_summary import (
     ScreenshotRejected,
@@ -755,6 +756,12 @@ async def lifespan(app: FastAPI):
         logger.info("Security audit logger stopped")
     except Exception as e:
         logger.error(f"Error stopping audit logger: {e}", exc_info=True)
+
+    try:
+        uninstall_log_buffer()
+        logger.info("Support log ring-buffer uninstalled")
+    except Exception as e:
+        logger.error(f"Error uninstalling log buffer: {e}", exc_info=True)
 
     await static_pool.close()
     logger.info("Static (Supabase) pool closed")
@@ -10438,10 +10445,16 @@ class SupportSummaryRequest(BaseModel):
 
 
 class SupportSummaryResponse(BaseModel):
-    """Response for a successfully filed support report."""
+    """Acknowledgement returned to the reporter.
+
+    Deliberately omits the engineering ``summary_text`` and any log excerpt:
+    those are derived from the process-wide log buffer and can contain other
+    tenants' request data, so they are stored + emailed to engineering
+    (favonius_admin) only — never returned to the submitting tenant user.
+    """
 
     id: str = Field(..., description="Support summary UUID")
-    summary_text: str = Field(..., description="Rendered engineering summary sentence")
+    status: str = Field(..., description="Always 'received'")
     health_snapshot: dict = Field(..., description="Tiger Cloud + WebSocket status at report time")
     delivery_status: str = Field(..., description="Always 'pending' at creation (email is async)")
     created_at: str = Field(..., description="Creation timestamp (ISO 8601)")
@@ -10514,7 +10527,11 @@ async def submit_support_summary(
         screenshot_sha = hashlib.sha256(screenshot_bytes).hexdigest()
         screenshot_size = len(screenshot_bytes)
 
-    # Gather context — best-effort; never fail the report on these.
+    # Gather context — best-effort; never fail the report on these. The ring
+    # buffer is process-wide, so logs_excerpt / last_error_line are recent
+    # SERVER logs (may span requests/tenants); they are persisted + emailed to
+    # engineering only and never returned to the reporter (see the response
+    # model). One buffer scan; derive the last error from the same records.
     buf = get_log_buffer()
     if buf is not None:
         records = buf.get_records(since_seconds=300)
@@ -10522,15 +10539,19 @@ async def submit_support_summary(
             records,
             max_bytes=int(os.getenv("SUPPORT_LOG_EXCERPT_MAX_BYTES", str(64 * 1024))),
         )
-        last_error_line = extract_last_error_line(buf.most_recent_error(since_seconds=300))
+        last_error_rec = next((r for r in reversed(records) if r.level >= logging.ERROR), None)
+        last_error_line = extract_last_error_line(last_error_rec)
     else:
         logs_excerpt = ""
         last_error_line = None
 
+    # Redact the user-supplied page (query strings can carry tokens/PII) before
+    # it enters the stored/emailed summary.
+    redacted_page = redact_log_line(body.page)
     health = await build_health_snapshot()
     summary_text = build_summary_text(
         user_id=user_id,
-        page=body.page,
+        page=redacted_page,
         tiger_cloud_status=health["tiger_cloud"],
         websocket_status=health["websocket"],
         last_error_line=last_error_line,
@@ -10540,7 +10561,7 @@ async def submit_support_summary(
         user_id=user_id,
         organization_id=org_id,
         depot_id=depot_id,
-        page=body.page,
+        page=redacted_page,
         user_note=redact_log_line(body.user_note) if body.user_note else None,
         screenshot=screenshot_bytes,
         screenshot_content_type=screenshot_ct,
@@ -10566,7 +10587,7 @@ async def submit_support_summary(
             target_type="support_summary",
             target_id=new_id,
             metadata={
-                "page": body.page,
+                "page": redacted_page,
                 "has_screenshot": screenshot_bytes is not None,
                 "tiger_cloud": health["tiger_cloud"],
                 "websocket": health["websocket"],
@@ -10587,7 +10608,7 @@ async def submit_support_summary(
 
     return SupportSummaryResponse(
         id=new_id,
-        summary_text=summary_text,
+        status="received",
         health_snapshot=health,
         delivery_status="pending",
         created_at=datetime.now(timezone.utc).isoformat(),
@@ -10709,22 +10730,25 @@ async def delete_support_summary_endpoint(
 # ── Health checks ─────────────────────────────────────────────────────────────
 
 
-async def check_database_health() -> str:
-    """Check database connectivity.
+async def _check_pool_health(pool: Any, *, label: str) -> str:
+    """Ping an asyncpg pool with ``SELECT 1``.
 
-    Returns:
-        "healthy" if database is accessible, "unavailable" otherwise
+    Returns "healthy" if reachable, "unavailable" otherwise (incl. ``pool is None``).
     """
-    if not db_pools:
+    if pool is None:
         return "unavailable"
-
     try:
-        async with db_pools.static.acquire() as conn:
+        async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
         return "healthy"
     except Exception as e:
-        logger.warning(f"Database health check failed: {e}")
+        logger.warning("%s health check failed: %s", label, e)
         return "unavailable"
+
+
+async def check_database_health() -> str:
+    """Check Supabase (``static`` pool) connectivity. "healthy" or "unavailable"."""
+    return await _check_pool_health(db_pools.static if db_pools else None, label="Database")
 
 
 async def check_ocpp_server_health() -> str:
@@ -10757,45 +10781,35 @@ async def check_ocpp_server_health() -> str:
 
 
 async def check_tiger_cloud_health() -> str:
-    """Check Tiger Cloud (TimescaleDB) connectivity.
+    """Check Tiger Cloud (TimescaleDB ``ts`` pool) connectivity.
 
-    Mirrors :func:`check_database_health` but pings the TimescaleDB (``ts``)
-    pool — ``check_database_health`` covers the Supabase (``static``) pool.
-    "Tiger Cloud" is the product name for the TimescaleDB time-series store.
-
-    Returns:
-        "healthy" if the ts pool is reachable, "unavailable" otherwise.
+    "Tiger Cloud" is the product name for the TimescaleDB time-series store;
+    :func:`check_database_health` covers the separate Supabase (``static``) pool.
+    Returns "healthy" or "unavailable".
     """
-    if not db_pools:
-        return "unavailable"
-    try:
-        async with db_pools.ts.acquire() as conn:
-            await conn.fetchval("SELECT 1")
-        return "healthy"
-    except Exception as e:
-        logger.warning(f"Tiger Cloud health check failed: {e}")
-        return "unavailable"
+    return await _check_pool_health(db_pools.ts if db_pools else None, label="Tiger Cloud")
 
 
-async def check_websocket_health() -> str:
-    """Check the OCPP/WebSocket server health, gracefully.
+async def check_websocket_health() -> tuple[str, str]:
+    """Resolve OCPP/WebSocket health and its source, gracefully.
 
-    Production runs the OCPP WebSocket as a separate legacy service
-    (``src/websocket_handler``) with ``OCPP_SERVER_ENABLED=false`` on the API,
-    so this resolves the status with a cascade:
+    Returns ``(status, source)`` where ``source`` ∈
+    {"in_process", "http_probe", "unknown"}:
 
     * in-process ``ocpp_server`` present → reuse :func:`check_ocpp_server_health`
-      (note: it returns "unavailable" when running but with zero chargers);
+      (note: it returns "unavailable" when running but with zero chargers),
+      source "in_process";
     * else, if ``WEBSOCKET_HEALTH_PROBE_URL`` is set → HTTP-probe it
-      (200 → "healthy", other status → "degraded", error/timeout → "unavailable");
-    * else → "unknown" (in-process disabled and no probe configured).
+      (200 → "healthy", other → "degraded", error/timeout → "unavailable"),
+      source "http_probe";
+    * else → ("unknown", "unknown").
     """
     if ocpp_server is not None:
-        return await check_ocpp_server_health()
+        return await check_ocpp_server_health(), "in_process"
 
     probe_url = os.getenv("WEBSOCKET_HEALTH_PROBE_URL", "").strip()
     if not probe_url:
-        return "unknown"
+        return "unknown", "unknown"
 
     try:
         import httpx  # noqa: PLC0415
@@ -10803,10 +10817,10 @@ async def check_websocket_health() -> str:
         timeout = float(os.getenv("WEBSOCKET_HEALTH_PROBE_TIMEOUT_S", "2.0"))
         async with httpx.AsyncClient(timeout=timeout) as http_client:
             resp = await http_client.get(probe_url)
-        return "healthy" if resp.status_code == 200 else "degraded"
+        return ("healthy" if resp.status_code == 200 else "degraded"), "http_probe"
     except Exception as e:
         logger.warning(f"WebSocket health probe failed: {e}")
-        return "unavailable"
+        return "unavailable", "http_probe"
 
 
 async def build_health_snapshot() -> dict:
@@ -10816,16 +10830,10 @@ async def build_health_snapshot() -> dict:
     source (for engineering triage), and the capture timestamp. Status
     vocabulary: "healthy" | "degraded" | "unavailable" | "unknown".
     """
-    tiger_cloud, websocket = await asyncio.gather(
+    tiger_cloud, (websocket, websocket_source) = await asyncio.gather(
         check_tiger_cloud_health(),
         check_websocket_health(),
     )
-    if ocpp_server is not None:
-        websocket_source = "in_process"
-    elif os.getenv("WEBSOCKET_HEALTH_PROBE_URL", "").strip():
-        websocket_source = "http_probe"
-    else:
-        websocket_source = "unknown"
     return {
         "tiger_cloud": tiger_cloud,
         "websocket": websocket,

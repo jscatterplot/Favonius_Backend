@@ -76,12 +76,14 @@ def test_submit_happy_path(client, mock_db_pool):
     assert resp.status_code == 201, resp.text
     body = resp.json()
     assert body["id"] == NEW_ID
+    assert body["status"] == "received"
     assert body["delivery_status"] == "pending"
-    assert body["summary_text"].startswith(
-        f"User {user['sub']} reported an error while viewing /depots/x/state."
-    )
-    assert "Tiger Cloud healthy, WebSocket unknown" in body["summary_text"]
-    assert body["summary_text"].endswith("Last error log: none.")
+    # The engineering summary_text / logs are NEVER returned to the operator
+    # (the process-wide buffer can contain other tenants' log lines).
+    assert "summary_text" not in body
+    assert "logs_excerpt" not in body
+    assert body["health_snapshot"]["tiger_cloud"] == "healthy"
+    assert body["health_snapshot"]["websocket"] == "unknown"
     assert len(captured) == 1  # delivery scheduled post-commit
 
 
@@ -109,7 +111,9 @@ def test_submit_with_screenshot(client, mock_db_pool):
     assert conn.fetchval.await_count >= 1  # INSERT happened
 
 
-def test_submit_reflects_recent_error_log(client, mock_db_pool):
+def test_submit_reflects_recent_error_in_stored_summary(client, mock_db_pool):
+    """The engineering summary captures the recent error (redacted), but the
+    operator response never carries it (cross-tenant leak fix)."""
     pool, conn = mock_db_pool
     conn.fetchval = AsyncMock(return_value=NEW_ID)
     buf = RingBufferLogHandler(max_records=50, max_age_seconds=0)
@@ -124,18 +128,58 @@ def test_submit_reflects_recent_error_log(client, mock_db_pool):
             exc_info=None,
         )
     )
+    captured_bundles: list = []
+
+    async def _fake_persist(_pool, bundle, *, retention_days):
+        captured_bundles.append(bundle)
+        return NEW_ID
+
     app.dependency_overrides[ensure_tenant_mirrored] = lambda: _operator()
     with (
         patch("src.api.main.db_pools", pool),
         patch("src.api.main.ocpp_server", None),
         patch("src.api.main.get_log_buffer", return_value=buf),
+        patch("src.api.main.persist_support_summary", _fake_persist),
         patch("src.api.main._create_background_task", _capture_task([])),
     ):
         resp = client.post("/support/summary", headers=AUTH, json={"page": "/p"})
     assert resp.status_code == 201, resp.text
-    summary = resp.json()["summary_text"]
-    assert "Last error log: DB exploded" in summary
-    assert "user@example.com" not in summary  # redacted
+    # Operator response must NOT carry the (possibly cross-tenant) error line.
+    assert "summary_text" not in resp.json()
+    # The stored/engineering bundle DOES reflect the error, redacted.
+    assert len(captured_bundles) == 1
+    stored = captured_bundles[0]
+    assert "Last error log: DB exploded" in stored.summary_text
+    assert "user@example.com" not in stored.summary_text  # redacted
+    assert "user@example.com" not in stored.logs_excerpt
+
+
+def test_submit_redacts_page_into_stored_summary(client, mock_db_pool):
+    """A token in the page query string is redacted before persist/email."""
+    pool, conn = mock_db_pool
+    conn.fetchval = AsyncMock(return_value=NEW_ID)
+    captured_bundles: list = []
+
+    async def _fake_persist(_pool, bundle, *, retention_days):
+        captured_bundles.append(bundle)
+        return NEW_ID
+
+    app.dependency_overrides[ensure_tenant_mirrored] = lambda: _operator()
+    with (
+        patch("src.api.main.db_pools", pool),
+        patch("src.api.main.ocpp_server", None),
+        patch("src.api.main.get_log_buffer", return_value=None),
+        patch("src.api.main.persist_support_summary", _fake_persist),
+        patch("src.api.main._create_background_task", _capture_task([])),
+    ):
+        resp = client.post(
+            "/support/summary",
+            headers=AUTH,
+            json={"page": "/x?access_token=eyJabc.eyJdef.sigsigsigsig"},
+        )
+    assert resp.status_code == 201, resp.text
+    assert len(captured_bundles) == 1
+    assert "eyJabc.eyJdef.sigsigsigsig" not in captured_bundles[0].page
 
 
 def test_submit_rejects_bad_content_type(client, mock_db_pool):

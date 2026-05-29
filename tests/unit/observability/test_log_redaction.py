@@ -56,3 +56,48 @@ def test_idempotent():
     twice = redact_log_line(once)
     assert once == twice
     assert "a@b.com" not in once and "secret123" not in once
+
+
+def test_redacts_json_quoted_secret_key():
+    out = redact_log_line('{"password": "hunter2", "user": "bob"}')
+    assert "hunter2" not in out
+    assert "bob" in out  # non-secret value preserved
+
+
+def test_redacts_python_dict_repr_secret():
+    out = redact_log_line("auth payload {'password': 'hunter2'}")
+    assert "hunter2" not in out
+
+
+def test_redacts_space_bearing_value():
+    out = redact_log_line("password = my secret phrase here")
+    assert "secret phrase here" not in out  # the whole value, not just the first word
+    assert "[REDACTED]" in out
+
+
+def test_redacts_connection_string_password():
+    # Password is always removed; a non-FQDN host (no email-shaped @host.tld)
+    # is preserved. (FQDN hosts may be over-redacted by the email pass — safe.)
+    out = redact_log_line("dsn postgres://svcuser:p4ssw0rd@localhost:5432/app")
+    assert "p4ssw0rd" not in out
+    assert "svcuser" in out and "localhost" in out
+
+
+def test_redacts_prefixed_api_key():
+    out = redact_log_line("loaded key sk-proj-AbCdEf0123456789Xyz")
+    assert "sk-proj-AbCdEf0123456789Xyz" not in out
+    assert "[REDACTED_KEY]" in out
+
+
+def test_bearer_header_not_double_mangled_and_secret_free():
+    out = redact_log_line("Authorization: Bearer supersecrettoken12345")
+    assert "supersecrettoken12345" not in out
+    assert "[REDACTED] [REDACTED]" not in out  # single, clean redaction
+
+
+def test_preserves_non_secret_fields_after_value():
+    # The greedy unquoted value must stop at the next field, not eat the line.
+    out = redact_log_line("password=hunter2 http_status=200 duration=5ms")
+    assert "hunter2" not in out
+    assert "http_status=200" in out
+    assert "duration=5ms" in out
