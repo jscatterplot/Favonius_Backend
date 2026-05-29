@@ -20,6 +20,7 @@ in :mod:`src.adapters.rest_client`.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any, AsyncIterator, Optional
@@ -184,4 +185,4 @@ class KempowerClient(BaseRestClient):
             cursor = body.get("lastEvaluatedKey")
             if not cursor:
                 break
-            params["exclusiveStartKey"] = cursor
+            params["exclusiveStartKey"] = json.dumps(cursor)
