@@ -706,11 +706,11 @@ class DepotController:
         # "no recipients for org=…" on every tick forever.
         if not await self._depot_exists_in_supabase():
             logger.info(
-                "skipping readiness alert: depot %s no longer exists in sites "
-                "(org=%s, type=%s)",
+                "skipping readiness alert handling: depot %s no longer exists "
+                "in sites (org=%s, action=%s)",
                 depot_id,
                 org_id,
-                "missing_input" if readiness.is_blocking else "degraded_optimization",
+                "emit missing_input" if readiness.is_blocking else "resolve readiness alerts",
             )
             return
 
