@@ -2020,13 +2020,17 @@ async def _run_document_fill_turn(
     if notes:
         answer_text = (answer_text + "\n\n" + " ".join(notes)).strip()
 
+    if mode == "ask":
+        reply_text = answer_text or "I have a few questions before I finish."
+    else:
+        reply_text = answer_text or "I've updated the document — download it below."
+
     # Append this turn to the conversation log (trimmed).
     new_log = list(message_log)
     new_log.append({"role": "user", "text": message, "run_id": str(run_id), "ts": _now_iso()})
-    if answer_text:
-        new_log.append(
-            {"role": "assistant", "text": answer_text, "run_id": str(run_id), "ts": _now_iso()}
-        )
+    new_log.append(
+        {"role": "assistant", "text": reply_text, "run_id": str(run_id), "ts": _now_iso()}
+    )
     new_log = new_log[-_DOC_FILL_MAX_LOG_TURNS:]
 
     latest_output = output_id or (
@@ -2043,18 +2047,16 @@ async def _run_document_fill_turn(
     )
 
     if mode == "ask":
-        text = answer_text or "I have a few questions before I finish."
         reply = AgentReply.needs_input(
             run_id=run_id,
             session_id=session_id,
-            text=text,
+            text=reply_text,
             questions=questions,
             download=download,
         )
     else:
-        text = answer_text or "I've updated the document — download it below."
         reply = AgentReply.document_ready(
-            run_id=run_id, session_id=session_id, text=text, download=download
+            run_id=run_id, session_id=session_id, text=reply_text, download=download
         )
 
     # The per-turn agent_runs row closes 'success' for both ask and finalize
