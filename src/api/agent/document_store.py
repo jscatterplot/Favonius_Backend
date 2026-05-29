@@ -148,7 +148,9 @@ async def find_session_for_template_user(
             """
             SELECT id
               FROM agent_document_fill_sessions
-             WHERE template_id = $1::uuid AND user_id = $2::uuid
+             WHERE template_id = $1::uuid
+               AND user_id = $2::uuid
+               AND status NOT IN ('finalized', 'abandoned')
              ORDER BY created_at ASC
              LIMIT 1
             """,

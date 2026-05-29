@@ -10,7 +10,6 @@ without replaying raw tool traffic.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from src.api.agent.catalogue import render_catalogue_markdown
@@ -117,14 +116,8 @@ def initial_draft() -> dict[str, Any]:
     return {"field_values": {}, "replacements": [], "open_questions": [], "notes": ""}
 
 
-def serialize_draft(draft: dict[str, Any]) -> str:
-    """JSON form for storage (kept tiny)."""
-    return json.dumps(draft, default=str)
-
-
 __all__ = [
     "build_document_fill_system_prompt",
     "format_document_fill_user_message",
     "initial_draft",
-    "serialize_draft",
 ]

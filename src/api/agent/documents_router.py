@@ -50,6 +50,13 @@ _PDF_MIME = "application/pdf"
 _DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MiB
 
 
+def _sanitize_attachment_filename(name: str) -> str:
+    """Strip path/control chars so ``file_name`` is safe in Content-Disposition."""
+    candidate = name.replace("\\", "/").split("/")[-1]
+    candidate = "".join(ch for ch in candidate if ch.isprintable() and ch not in '"\r\n\t')
+    return candidate.strip(" \"';")[:255]
+
+
 def get_doc_upload_max_bytes() -> int:
     """Per-upload size cap (read at call time so tests can monkeypatch env)."""
     try:
@@ -174,7 +181,8 @@ async def download_document(
         )
     kind = row["kind"]
     media = _DOCX_MIME if kind == "docx" else _PDF_MIME
-    filename = row.get("file_name") or f"document.{'docx' if kind == 'docx' else 'pdf'}"
+    default_name = f"document.{'docx' if kind == 'docx' else 'pdf'}"
+    filename = _sanitize_attachment_filename(row.get("file_name") or default_name) or default_name
     return Response(
         content=bytes(row["raw_payload"]),
         media_type=media,
