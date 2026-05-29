@@ -106,7 +106,37 @@ async def test_startup_recovery_reclaims_running_without_stale_threshold(monkeyp
     )
 
     assert claim.await_args.kwargs["allow_running_reclaim"] is True
-    assert claim.await_args.kwargs["stale_threshold_seconds"] == 0
+    assert "stale_threshold_seconds" not in claim.await_args.kwargs
+
+
+async def test_claim_job_binds_only_referenced_placeholders():
+    # claim_job is mocked in every other test, so its real SQL never runs under
+    # CI. Guard the invariant that every bound positional arg is referenced as a
+    # $n placeholder (and vice versa): an unreferenced bind makes Postgres raise
+    # IndeterminateDatatypeError at prepare time, crashing every ingestion job.
+    import re
+
+    captured: dict[str, Any] = {}
+
+    class _Conn:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+        async def fetchrow(self, sql, *args):
+            captured["sql"] = sql
+            captured["args"] = args
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Conn()
+
+    await repo.claim_job(_Pool(), str(uuid4()))
+    referenced = {int(n) for n in re.findall(r"\$(\d+)", captured["sql"])}
+    assert referenced == set(range(1, len(captured["args"]) + 1))
 
 
 async def test_missing_connection_fails(monkeypatch, patched):

@@ -96,7 +96,6 @@ async def _run(
         static_pool,
         job_id,
         allow_running_reclaim=allow_stale_running_claim,
-        stale_threshold_seconds=0 if allow_stale_running_claim else repo._ORPHAN_THRESHOLD_S,
         expected_running_lease_at=expected_running_lease_at,
     )
     if claimed is None:
