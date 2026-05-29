@@ -55,6 +55,7 @@ from typing import Any, Optional
 from uuid import UUID
 
 from src.api.agent.auth_context import AuthContext
+from src.api.agent_workflows.plan_parsing import extract_vehicle_plan
 from src.api.agent_workflows.tools import ToolRegistry
 from src.security.data_freshness import MAX_TELEMETRY_AGE
 
@@ -379,22 +380,8 @@ def _make_get_charging_plan(
         if run is None or not run["schedule_json"]:
             return {"plan": []}
 
-        payload = run["schedule_json"]
-        if isinstance(payload, str):
-            import json
-
-            try:
-                payload = json.loads(payload)
-            except json.JSONDecodeError:
-                return {"plan": []}
-        if not isinstance(payload, dict):
-            return {"plan": []}
-
-        schedule = payload.get("schedule")
-        if not isinstance(schedule, dict):
-            return {"plan": []}
-        per_vehicle = schedule.get(str(vid))
-        if not isinstance(per_vehicle, dict):
+        per_vehicle = extract_vehicle_plan(run["schedule_json"], vid)
+        if per_vehicle is None:
             return {"plan": []}
         powers = per_vehicle.get("charging_power") or []
         socs = per_vehicle.get("soc") or []

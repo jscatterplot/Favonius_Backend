@@ -235,6 +235,7 @@ properties:
             status:          { type: string, enum: ["active", "acknowledged", "resolved"] }
             alert_type:      { type: string }
             title:           { type: string }
+            detail:          { type: object, description: "Structured cause JSONB, e.g. {station_id, connector_id, error_code}. Surfaces as agent_views.alerts.detail (migration 047)." }
             dedup_key:       { type: string }
       electricity_prices:
         type: array

@@ -6541,8 +6541,8 @@ async def get_depot_savings_summary(
         raise DatabaseError() from exc
 
     return SavingsSummaryResponse(
-        current_month_eur=summary.current_month_eur,
-        baseline_month_eur=summary.baseline_month_eur,
+        current_month_eur=summary.actual_eur,
+        baseline_month_eur=summary.baseline_eur,
         saved_eur=summary.saved_eur,
         saved_pct=summary.saved_pct,
         period_start=summary.period_start.isoformat().replace("+00:00", "Z"),

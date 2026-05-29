@@ -33,7 +33,6 @@ pair is unreachable; fails the job in CI.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -49,6 +48,9 @@ from src.api.agent.prompts import build_sql_agent_system_prompt, format_sql_agen
 from src.api.agent.sql_tools import SQL_AGENT_TOOL_NAMES, build_sql_agent_tool_registry
 from src.api.agent_workflows.eval.runner import FakeAnthropicClient
 from src.api.agent_workflows.runtime import QAResult, run_qa_turn
+from tests.golden._snapshot import coerce_uuid as _coerce_uuid
+from tests.golden._snapshot import maybe_uuid as _maybe_uuid
+from tests.golden._snapshot import resolve_dt as _resolve_dt
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
@@ -155,8 +157,11 @@ _SCENARIO_IDS = [str(s.get("id", f"scenario_{i}")) for i, s in enumerate(_ALL_SC
 
 
 # ── Time resolution ──────────────────────────────────────────────────────────
-
-_DURATION_RE = re.compile(r"^([+-])(\d+)([smhd])$")
+#
+# The UUID coercers and the relative-time resolver are shared with the
+# deterministic-intent gate via tests/golden/_snapshot.py (DRY). Only
+# _parse_scenario_now stays local — this gate anchors at a different default
+# "now" than the intent gate.
 
 
 def _parse_scenario_now(raw: Any) -> datetime:
@@ -166,36 +171,6 @@ def _parse_scenario_now(raw: Any) -> datetime:
         return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
     dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-
-def _resolve_dt(value: Any, scenario_now: datetime) -> datetime:
-    """Resolve an ISO string / numeric-second offset / duration suffix to UTC datetime."""
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if isinstance(value, (int, float)):
-        return scenario_now + timedelta(seconds=float(value))
-    if isinstance(value, str):
-        match = _DURATION_RE.match(value)
-        if match:
-            sign, magnitude, unit = match.groups()
-            seconds = int(magnitude) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
-            return scenario_now + timedelta(seconds=(-seconds if sign == "-" else seconds))
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    raise ScenarioError(f"unsupported time value {value!r} ({type(value).__name__})")
-
-
-def _coerce_uuid(value: Any, *, field_name: str) -> UUID:
-    if isinstance(value, UUID):
-        return value
-    try:
-        return UUID(str(value))
-    except (ValueError, AttributeError) as exc:
-        raise ScenarioError(f"{field_name}: invalid UUID {value!r}") from exc
-
-
-def _maybe_uuid(value: Any, *, field_name: str) -> Optional[UUID]:
-    return None if value is None else _coerce_uuid(value, field_name=field_name)
 
 
 # ── Auth context ─────────────────────────────────────────────────────────────
@@ -461,9 +436,9 @@ async def _load_ts_snapshot(
         await conn.execute(
             """
             INSERT INTO notification_alerts (
-                id, organization_id, depot_id, alert_type, severity, title, dedup_key,
+                id, organization_id, depot_id, alert_type, severity, title, detail, dedup_key,
                 status, first_occurrence_at, last_occurrence_at, created_at, updated_at)
-            VALUES (COALESCE($1, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9, $9, $9, $9)
+            VALUES (COALESCE($1, gen_random_uuid()), $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $10, $10, $10)
             """,
             alert_id,
             org,
@@ -471,6 +446,7 @@ async def _load_ts_snapshot(
             a["alert_type"],
             a["severity"],
             a.get("title", a["alert_type"]),
+            json.dumps(a.get("detail") or {}),
             a.get("dedup_key", f"eval-{a['alert_type']}-{i}"),
             a.get("status", "active"),
             created,
@@ -734,21 +710,26 @@ def test_every_scenario_has_tone_gate() -> None:
 
 
 def test_suite_size_and_distribution() -> None:
-    """Gate the full 20-question shape (7 energy / 7 ops / 6 pricing)."""
+    """Gate the full 21-question shape (7 energy / 8 ops / 6 pricing).
+
+    Was 20 (7/7/6); ops_status gained one scenario (``ops_21``) exercising
+    the alerts-cause columns (``title`` / ``detail``) added to
+    ``agent_views.alerts`` by migration 047.
+    """
     from tests.golden.conftest import _ci_requires_db
 
     n = len(_ALL_SCENARIOS)
-    if n < 20:
-        msg = f"agent_sql suite has {n}/20 scenarios (expected 20)"
+    if n < 21:
+        msg = f"agent_sql suite has {n}/21 scenarios (expected 21)"
         if _ci_requires_db():
             pytest.fail(msg)
         pytest.skip(msg)
     by_cat: dict[str, int] = {}
     for s in _ALL_SCENARIOS:
         by_cat[s.get("category", "?")] = by_cat.get(s.get("category", "?"), 0) + 1
-    assert n == 20, f"expected exactly 20 scenarios, got {n}"
+    assert n == 21, f"expected exactly 21 scenarios, got {n}"
     assert by_cat.get("energy_cost") == 7, f"energy_cost: {by_cat.get('energy_cost')} (want 7)"
-    assert by_cat.get("ops_status") == 7, f"ops_status: {by_cat.get('ops_status')} (want 7)"
+    assert by_cat.get("ops_status") == 8, f"ops_status: {by_cat.get('ops_status')} (want 8)"
     assert (
         by_cat.get("pricing_market") == 6
     ), f"pricing_market: {by_cat.get('pricing_market')} (want 6)"

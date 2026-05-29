@@ -9,12 +9,12 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import asyncpg
 
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
 from ...adapters.weather.storage import DEFAULT_WEATHER_SOURCE
+from ...db.pools import DatabasePools
 from ..models import DepotConfig, DepotState, IncomingVehicle
 from ..scheduling.recurring import (
     RecurringTemplate,
@@ -22,7 +22,6 @@ from ..scheduling.recurring import (
     expand_recurring_templates,
     merge_recurring_with_manual,
 )
-from ...db.pools import DatabasePools
 
 if TYPE_CHECKING:
     pass
@@ -331,6 +330,8 @@ class StateAssembler:
         Raises:
             asyncpg.PostgresError: If database query fails
         """
+        from ...db.queries import fetch_freshest_vehicle_socs
+
         try:
             # Step 1: Get vehicle_ids for this depot from Supabase (static)
             async with self.pools.static.acquire() as conn:
@@ -342,60 +343,20 @@ class StateAssembler:
             if not vehicle_ids:
                 return {}
 
-            # Step 2: Get latest SoC per vehicle from TimescaleDB (ts).
-            # Two sources: charger-side `telemetry` (OCPP MeterValues) and
-            # `vehicle_telemetry` (Navirec telematics feed, migration 044).
-            # UNION both and keep the freshest reading per vehicle so a vehicle
-            # that's unplugged (out on a route) still has a live SoC. The 24h
-            # lower bound confines the DISTINCT ON scan to recent chunks;
-            # telematics rows carry true device timestamps, so the downstream
-            # 15-min freshness check (data_freshness.MAX_TELEMETRY_AGE) still
-            # governs whether a SoC is fresh enough to optimize on. On an exact
-            # (vehicle_id, time) tie, src_priority makes charger telemetry win
-            # deterministically (ground truth when the vehicle is plugged in).
-            merged_sql = """
-                SELECT DISTINCT ON (vehicle_id)
-                    vehicle_id::text AS vehicle_id,
-                    soc
-                FROM (
-                    SELECT vehicle_id, soc, time, 0 AS src_priority
-                    FROM telemetry
-                    WHERE vehicle_id = ANY($1::uuid[])
-                      AND soc IS NOT NULL
-                      AND time > now() - INTERVAL '24 hours'
-                    UNION ALL
-                    SELECT vehicle_id, soc, time, 1 AS src_priority
-                    FROM vehicle_telemetry
-                    WHERE vehicle_id = ANY($1::uuid[])
-                      AND soc IS NOT NULL
-                      AND time > now() - INTERVAL '24 hours'
-                ) merged
-                ORDER BY vehicle_id, time DESC, src_priority
-            """
-            # Fallback when vehicle_telemetry doesn't exist yet (migration 044
-            # not applied / app-rollout skew). Without it, every depot's state
-            # assembly would break — even with Navirec polling disabled.
-            telemetry_only_sql = """
-                SELECT DISTINCT ON (vehicle_id)
-                    vehicle_id::text AS vehicle_id,
-                    soc
-                FROM telemetry
-                WHERE vehicle_id = ANY($1::uuid[])
-                  AND soc IS NOT NULL
-                  AND time > now() - INTERVAL '24 hours'
-                ORDER BY vehicle_id, time DESC
-            """
-            try:
-                async with self.pools.ts.acquire() as conn:
-                    rows = await conn.fetch(merged_sql, vehicle_ids)
-            except asyncpg.exceptions.UndefinedTableError:
-                logger.warning(
-                    "vehicle_telemetry missing (migration 044 not applied?); "
-                    "falling back to charger telemetry only for depot %s",
-                    self.depot_id,
+            # Step 2: Get latest SoC per vehicle from TimescaleDB. The merge of
+            # charger-side `telemetry` (OCPP MeterValues) and `vehicle_telemetry`
+            # (Navirec telematics, migration 044) — keeping the freshest reading
+            # per vehicle so an unplugged vehicle still has a live SoC — plus the
+            # vehicle_telemetry-missing fallback, is shared with the chat agent's
+            # readiness intent via db.queries.fetch_freshest_vehicle_socs. The
+            # 24h floor only bounds the DISTINCT ON scan; the downstream 15-min
+            # freshness check (data_freshness.MAX_TELEMETRY_AGE) still governs
+            # whether a SoC is fresh enough to optimize on.
+            recency_floor = datetime.now(timezone.utc) - timedelta(hours=24)
+            async with self.pools.ts.acquire() as conn:
+                rows = await fetch_freshest_vehicle_socs(
+                    conn, vehicle_ids, recency_floor=recency_floor
                 )
-                async with self.pools.ts.acquire() as conn:
-                    rows = await conn.fetch(telemetry_only_sql, vehicle_ids)
 
             result = {
                 str(row["vehicle_id"]): float(row["soc"]) for row in rows if row["soc"] is not None
@@ -509,7 +470,10 @@ class StateAssembler:
         try:
             async with self.pools.ts.acquire() as conn:
                 price_map = await fetch_or_pull_prices_by_zone(
-                    conn, zone, start_utc, end_utc,
+                    conn,
+                    zone,
+                    start_utc,
+                    end_utc,
                 )
         except asyncpg.PostgresError as e:
             logger.error(
@@ -725,16 +689,13 @@ class StateAssembler:
                 )
         except asyncpg.PostgresError as e:
             logger.warning(
-                f"Failed to load depot timezone for {self.depot_id}: {e}; "
-                "defaulting to UTC."
+                f"Failed to load depot timezone for {self.depot_id}: {e}; " "defaulting to UTC."
             )
             tz = ZoneInfo("UTC")
             self._depot_timezone_cache = tz
             return tz
         if not tz_name:
-            logger.warning(
-                f"sites.timezone is empty for depot {self.depot_id}; defaulting to UTC."
-            )
+            logger.warning(f"sites.timezone is empty for depot {self.depot_id}; defaulting to UTC.")
             tz = ZoneInfo("UTC")
         else:
             try:
@@ -793,6 +754,7 @@ class StateAssembler:
                 # Fetch templates + cancellations on the same connection to
                 # avoid a second pool checkout.
                 from ...db.queries import fetch_recurring_horizon_data
+
                 template_rows, cancellation_rows = await fetch_recurring_horizon_data(
                     conn,
                     depot_id=UUID(self.depot_id),
@@ -807,10 +769,7 @@ class StateAssembler:
         if not template_rows:
             # No recurring templates → strip created_at from manual rows so
             # downstream callers see the original schema.
-            cleaned = [
-                {k: v for k, v in row.items() if k != "created_at"}
-                for row in manual
-            ]
+            cleaned = [{k: v for k, v in row.items() if k != "created_at"} for row in manual]
             logger.debug(f"Retrieved {len(cleaned)} schedules (no templates)")
             return cleaned
 
@@ -827,9 +786,7 @@ class StateAssembler:
                 start_date=row["start_date"],
                 end_date=row["end_date"],
                 required_soc=float(row["required_soc"]),
-                energy_kwh=(
-                    float(row["energy_kwh"]) if row["energy_kwh"] is not None else None
-                ),
+                energy_kwh=(float(row["energy_kwh"]) if row["energy_kwh"] is not None else None),
                 active=bool(row["active"]),
                 created_at=row["created_at"],
             )
@@ -848,9 +805,7 @@ class StateAssembler:
             horizon_start=start,
             horizon_end=end,
         )
-        merged = merge_recurring_with_manual(
-            manual, recurring_rows, depot_tz=depot_tz
-        )
+        merged = merge_recurring_with_manual(manual, recurring_rows, depot_tz=depot_tz)
         logger.debug(
             f"Retrieved {len(merged)} schedules "
             f"({len(manual)} manual + {len(recurring_rows)} recurring expansions)"
