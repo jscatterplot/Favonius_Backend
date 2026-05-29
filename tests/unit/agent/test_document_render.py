@@ -218,3 +218,19 @@ def test_render_acroform_pdf_fills_field_preserved():
     assert fidelity == "preserved"
     fields = pypdf.PdfReader(io.BytesIO(out)).get_fields()
     assert fields["customer_name"].get("/V") == "ACME Fleet"
+
+
+def test_render_acroform_pdf_applies_replacements():
+    pypdf = pytest.importorskip("pypdf")
+    body = _acroform_pdf()
+    out, fidelity = dr.render(
+        kind="pdf",
+        pdf_form_type="acroform",
+        body=body,
+        field_values={"customer_name": "ACME Fleet"},
+        replacements=[{"find": "Customer:", "replace": "Client:"}],
+    )
+    assert fidelity == "preserved"
+    reader = pypdf.PdfReader(io.BytesIO(out))
+    assert "Client:" in (reader.pages[0].extract_text() or "")
+    assert reader.get_fields()["customer_name"].get("/V") == "ACME Fleet"

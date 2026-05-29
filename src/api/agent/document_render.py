@@ -209,7 +209,10 @@ def render(
         return _render_docx(body, field_values, replacements), "preserved"
     if kind == "pdf":
         if pdf_form_type == "acroform":
-            return _fill_acroform_pdf(body, field_values), "preserved"
+            filled = _fill_acroform_pdf(body, field_values)
+            if replacements:
+                filled = _apply_pdf_replacements(filled, replacements)
+            return filled, "preserved"
         # Flat PDF: apply targeted replacements to the extracted text and
         # re-render. Layout is NOT preserved — best-effort.
         text = full_text if full_text is not None else _extract_pdf(body).text
@@ -291,6 +294,84 @@ def _replace_in_paragraph(para: Any, pairs: list[tuple[str, str]]) -> None:
         runs[0].text = joined
         for r in runs[1:]:
             r.text = ""
+
+
+def _apply_pdf_replacements(body: bytes, replacements: list[dict[str, Any]]) -> bytes:
+    """Apply anchored find/replace edits to static PDF text (best-effort).
+
+    Operates on text-showing operators in page content streams so AcroForm
+    field fills and layout are preserved. Complex encodings may not match.
+    """
+    pairs = [
+        (str(r.get("find") or ""), str(r.get("replace") or ""))
+        for r in replacements
+        if str(r.get("find") or "")
+    ]
+    if not pairs:
+        return body
+    try:
+        from pypdf import PdfReader, PdfWriter  # lazy
+        from pypdf.generic import ArrayObject, ContentStream, NameObject, TextStringObject
+    except ImportError as exc:  # pragma: no cover
+        raise DocumentRenderError("pypdf is not installed") from exc
+
+    def _replace_string(s: str) -> str:
+        for find, replace in pairs:
+            s = s.replace(find, replace)
+        return s
+
+    def _patch_content_stream(cs: ContentStream) -> None:
+        for i, (operands, operator) in enumerate(cs.operations):
+            if operator in (b"Tj", b"'", b'"') and operands:
+                if isinstance(operands[0], str):
+                    new_s = _replace_string(operands[0])
+                    if new_s != operands[0]:
+                        operands = (TextStringObject(new_s),) + tuple(operands[1:])
+                        cs.operations[i] = (operands, operator)
+            elif operator == b"TJ" and operands:
+                arr = operands[0]
+                if isinstance(arr, (list, tuple)):
+                    new_arr = list(arr)
+                    changed = False
+                    for j, item in enumerate(new_arr):
+                        if isinstance(item, str):
+                            new_item = _replace_string(item)
+                            if new_item != item:
+                                new_arr[j] = TextStringObject(new_item)
+                                changed = True
+                    if changed:
+                        cs.operations[i] = ((new_arr,) + tuple(operands[1:]), operator)
+
+    try:
+        reader = PdfReader(io.BytesIO(body))
+        writer = PdfWriter()
+        writer.append(reader)
+        for page in writer.pages:
+            contents = page.get_contents()
+            if contents is None:
+                continue
+            if isinstance(contents, ArrayObject):
+                patched: list[Any] = []
+                for stream in contents:
+                    cs = ContentStream(stream, reader)
+                    _patch_content_stream(cs)
+                    patched.append(cs)
+                page[NameObject("/Contents")] = ArrayObject(patched)
+            else:
+                cs = (
+                    contents
+                    if isinstance(contents, ContentStream)
+                    else ContentStream(contents, reader)
+                )
+                _patch_content_stream(cs)
+                page[NameObject("/Contents")] = cs
+        out = io.BytesIO()
+        writer.write(out)
+        return out.getvalue()
+    except DocumentRenderError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise DocumentRenderError(f"pdf replacement failed: {exc}") from exc
 
 
 def _fill_acroform_pdf(body: bytes, field_values: dict[str, Any]) -> bytes:
