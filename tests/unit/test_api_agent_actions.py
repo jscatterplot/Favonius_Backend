@@ -136,7 +136,7 @@ class TestAutonomySettingsShape:
         assert response.status_code == http_status.HTTP_200_OK
         body = response.json()
         assert "rows" in body and "asOf" in body
-        # Defaults: all 5 known action classes at level 'proposed'.
+        # Defaults: all known action classes at level 'proposed'.
         classes = {r["actionClass"] for r in body["rows"]}
         assert classes == {
             "charger_restart",
@@ -144,6 +144,7 @@ class TestAutonomySettingsShape:
             "price_reoptimize",
             "soc_guardrail",
             "report_draft",
+            "schedule_suggestion",
         }
         assert all(r["level"] == "proposed" for r in body["rows"])
         # asOf is an ISO-8601 timestamp
@@ -767,3 +768,236 @@ class TestApproveOneOffReportDraft:
         assert result["actionStatus"] == "executed"
         assert result["report"]["reportId"] == "rep-1"
         assert "scheduleCreated" not in result["report"]
+
+
+# ── schedule_suggestion approve / reject ──────────────────────────────────────
+
+_VALID_SCHEDULE_INPUT = {
+    "name": "Weekly consumption by card",
+    "kind": "monthly_consumption",
+    "groupBy": "card",
+    "frequency": "weekly",
+    "dayOfMonth": None,
+    "dayOfWeek": 1,
+    "timeOfDay": "08:00",
+    "autonomyMode": "proposed",
+    "isActive": True,
+    "recipients": [{"emailAddress": "ops@example.com", "format": "pdf"}],
+}
+
+
+def _as_admin():
+    """Promote the default user to customer_admin for the current test."""
+    app.dependency_overrides[ensure_tenant_mirrored] = _override_token(
+        _valid_user(role="customer_admin")
+    )
+
+
+def _suggestion_row(action_id, *, schedule_input=None, status="pending"):
+    return {
+        "id": action_id,
+        "action_class": "schedule_suggestion",
+        "status": status,
+        "payload": {
+            "signatureKey": "consumption_by_user|card|weekly",
+            "scheduleInput": schedule_input if schedule_input is not None else _VALID_SCHEDULE_INPUT,
+        },
+    }
+
+
+class TestApproveScheduleSuggestion:
+    """Approving a schedule_suggestion creates the report schedule (admin only)."""
+
+    @patch("src.api.main.get_audit_logger", return_value=None)
+    def test_operator_approve_is_forbidden(self, _audit, client, mock_db_pool):
+        # Default user is customer_operator (DEPOT_MANAGE but NOT ADMIN_CONFIG).
+        pool, conn = mock_db_pool
+        action_id = str(uuid4())
+
+        async def _fetchrow(query, *args):
+            if "FROM agent_actions" in query and "FOR UPDATE" in query:
+                return _suggestion_row(action_id)
+            return None
+
+        conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main._create_report_schedule_from_input", new_callable=AsyncMock
+            ) as create,
+        ):
+            resp = client.post(
+                "/commands/execute",
+                json={
+                    "command": "agents.action.approve",
+                    "depot_id": DEPOT_ID,
+                    "params": {"actionId": action_id},
+                    "dry_run": False,
+                },
+                headers=AUTH_HDR,
+            )
+        assert resp.status_code == http_status.HTTP_403_FORBIDDEN, resp.text
+        create.assert_not_called()
+
+    @patch("src.api.main.get_audit_logger", return_value=None)
+    def test_operator_dry_run_is_forbidden(self, _audit, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        action_id = str(uuid4())
+
+        async def _fetchrow(query, *args):
+            if "FROM agent_actions" in query:
+                return _suggestion_row(action_id)
+            return None
+
+        conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        with patch("src.api.main.db_pools", pool):
+            resp = client.post(
+                "/commands/execute",
+                json={
+                    "command": "agents.action.approve",
+                    "depot_id": DEPOT_ID,
+                    "params": {"actionId": action_id},
+                    "dry_run": True,
+                },
+                headers=AUTH_HDR,
+            )
+        assert resp.status_code == http_status.HTTP_403_FORBIDDEN, resp.text
+
+    @patch("src.api.main.get_audit_logger", return_value=None)
+    def test_admin_approve_creates_schedule(self, _audit, client, mock_db_pool):
+        _as_admin()
+        pool, conn = mock_db_pool
+        action_id = str(uuid4())
+        fake_schedule = {"id": "sched-1", "kind": "monthly_consumption", "frequency": "weekly"}
+
+        async def _fetchrow(query, *args):
+            if "FROM agent_actions" in query and "FOR UPDATE" in query:
+                return _suggestion_row(action_id)
+            if "FROM report_schedules" in query:
+                return None  # no existing schedule
+            if "UPDATE agent_actions" in query:
+                return {"id": action_id}
+            return None
+
+        conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main._create_report_schedule_from_input",
+                new_callable=AsyncMock,
+                return_value=fake_schedule,
+            ) as create,
+        ):
+            resp = client.post(
+                "/commands/execute",
+                json={
+                    "command": "agents.action.approve",
+                    "depot_id": DEPOT_ID,
+                    "params": {"actionId": action_id},
+                    "dry_run": False,
+                },
+                headers=AUTH_HDR,
+            )
+        assert resp.status_code == http_status.HTTP_200_OK, resp.text
+        create.assert_awaited_once()
+        result = resp.json()["result"]
+        assert result["actionStatus"] == "executed"
+        assert result["schedule"]["scheduleCreated"] is True
+        assert result["schedule"]["schedule"] == fake_schedule
+
+    @patch("src.api.main.get_audit_logger", return_value=None)
+    def test_admin_approve_skips_when_schedule_already_exists(self, _audit, client, mock_db_pool):
+        _as_admin()
+        pool, conn = mock_db_pool
+        action_id = str(uuid4())
+
+        async def _fetchrow(query, *args):
+            if "FROM agent_actions" in query and "FOR UPDATE" in query:
+                return _suggestion_row(action_id)
+            if "FROM report_schedules" in query:
+                return {"x": 1}  # a matching active schedule already exists
+            if "UPDATE agent_actions" in query:
+                return {"id": action_id}
+            return None
+
+        conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        with (
+            patch("src.api.main.db_pools", pool),
+            patch(
+                "src.api.main._create_report_schedule_from_input", new_callable=AsyncMock
+            ) as create,
+        ):
+            resp = client.post(
+                "/commands/execute",
+                json={
+                    "command": "agents.action.approve",
+                    "depot_id": DEPOT_ID,
+                    "params": {"actionId": action_id},
+                    "dry_run": False,
+                },
+                headers=AUTH_HDR,
+            )
+        assert resp.status_code == http_status.HTTP_200_OK, resp.text
+        create.assert_not_called()
+        result = resp.json()["result"]
+        assert result["schedule"]["scheduleCreated"] is False
+        assert result["schedule"]["alreadyExists"] is True
+
+    @patch("src.api.main.get_audit_logger", return_value=None)
+    def test_admin_approve_rejects_invalid_schedule_input(self, _audit, client, mock_db_pool):
+        _as_admin()
+        pool, conn = mock_db_pool
+        action_id = str(uuid4())
+        bad_input = {**_VALID_SCHEDULE_INPUT, "dayOfMonth": 5}  # weekly must not set dayOfMonth
+
+        async def _fetchrow(query, *args):
+            if "FROM agent_actions" in query and "FOR UPDATE" in query:
+                return _suggestion_row(action_id, schedule_input=bad_input)
+            if "FROM report_schedules" in query:
+                return None
+            return None
+
+        conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        # Do NOT patch _create_report_schedule_from_input — its normalize step
+        # is what must reject the malformed input with a 400.
+        with patch("src.api.main.db_pools", pool):
+            resp = client.post(
+                "/commands/execute",
+                json={
+                    "command": "agents.action.approve",
+                    "depot_id": DEPOT_ID,
+                    "params": {"actionId": action_id},
+                    "dry_run": False,
+                },
+                headers=AUTH_HDR,
+            )
+        assert resp.status_code == http_status.HTTP_400_BAD_REQUEST, resp.text
+
+    @patch("src.api.main.get_audit_logger", return_value=None)
+    def test_reject_schedule_suggestion(self, _audit, client, mock_db_pool):
+        pool, conn = mock_db_pool
+        action_id = str(uuid4())
+
+        async def _fetchrow(query, *args):
+            if "FROM agent_actions" in query and "FOR UPDATE" in query:
+                return {
+                    "action_class": "schedule_suggestion",
+                    "status": "pending",
+                    "payload": {"signatureKey": "consumption_by_user|card|weekly"},
+                }
+            return None
+
+        conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+        with patch("src.api.main.db_pools", pool):
+            resp = client.post(
+                "/commands/execute",
+                json={
+                    "command": "agents.action.reject",
+                    "depot_id": DEPOT_ID,
+                    "params": {"actionId": action_id},
+                    "dry_run": False,
+                },
+                headers=AUTH_HDR,
+            )
+        assert resp.status_code == http_status.HTTP_200_OK, resp.text
+        assert resp.json()["result"]["actionStatus"] == "rejected"

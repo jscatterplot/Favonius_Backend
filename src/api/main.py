@@ -80,7 +80,7 @@ from ..db.exceptions import (
 from ..db.pools import DatabasePools
 from ..db.postgres_url import describe_database_target
 from ..db.snapshot_store import persist_snapshot
-from ..monitoring.metrics import CONTROLLER_MANAGER_UP
+from ..monitoring.metrics import AGENT_AUTOMATION_SUGGESTIONS, CONTROLLER_MANAGER_UP
 from ..security.admin_audit import AdminAuditRow, AdminAuditWriteError, write_admin_audit_row
 from ..security.audit_log import AuditEvent, AuditLogger, get_audit_logger, set_audit_logger
 from ..security.auth import (
@@ -8103,6 +8103,7 @@ _DEFAULT_AGENT_AUTONOMY_CLASSES: tuple[str, ...] = (
     "price_reoptimize",
     "soc_guardrail",
     "report_draft",
+    "schedule_suggestion",
 )
 
 _DEFAULT_AGENT_AUTONOMY_LEVEL: str = "proposed"
@@ -12672,6 +12673,7 @@ async def _handle_agent_action_approve(
         }
 
     report_result: Optional[dict] = None
+    schedule_result: Optional[dict] = None
     if dry_run:
         async with db_pools.ts.acquire() as conn:
             action_row = await conn.fetchrow(
@@ -12705,10 +12707,22 @@ async def _handle_agent_action_approve(
                     dry_run=True,
                     user=user,
                 )
+        elif action_row["action_class"] == "schedule_suggestion":
+            # Approval will create a report schedule → require ADMIN_CONFIG even
+            # in dry-run, then validate the embedded ScheduleCreatePayload.
+            _require_admin_config_for_schedule(user)
+            payload = _coerce_payload(action_row["payload"])
+            try:
+                normalize_create_payload(payload.get("scheduleInput"))
+            except ScheduleValidationError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            schedule_result = {"valid": True}
 
         result: dict = {"actionId": action_id, "actionStatus": "executed"}
         if report_result:
             result["report"] = report_result
+        if schedule_result:
+            result["schedule"] = schedule_result
         return result
 
     scheduled_run_id: Optional[str] = None
@@ -12755,6 +12769,36 @@ async def _handle_agent_action_approve(
                         user=user,
                         ts_conn=conn,
                     )
+
+            elif action_class == "schedule_suggestion":
+                # Approving a suggestion creates the schedule server-side, inside
+                # this same transaction (atomic with the action flip). Re-check
+                # ADMIN_CONFIG first (approve is only DEPOT_MANAGE-gated).
+                _require_admin_config_for_schedule(user)
+                payload = _coerce_payload(action_row["payload"])
+                schedule_input = payload.get("scheduleInput")
+                existing = await conn.fetchrow(
+                    "SELECT 1 FROM report_schedules WHERE depot_id = $1::uuid AND is_active "
+                    "AND kind = 'monthly_consumption' AND group_by = $2 AND frequency = $3 LIMIT 1",
+                    depot_id,
+                    (schedule_input or {}).get("groupBy"),
+                    (schedule_input or {}).get("frequency"),
+                )
+                if existing is not None:
+                    # An admin already created a matching schedule between the
+                    # proposal and this approval — don't duplicate it.
+                    schedule_result = {"scheduleCreated": False, "alreadyExists": True}
+                else:
+                    try:
+                        created_schedule = await _create_report_schedule_from_input(
+                            schedule_input,
+                            depot_id,
+                            created_by=(user or {}).get("sub"),
+                            ts_conn=conn,
+                        )
+                    except ScheduleValidationError as exc:
+                        raise HTTPException(status_code=400, detail=str(exc)) from exc
+                    schedule_result = {"scheduleCreated": True, "schedule": created_schedule}
 
             if not mark_executed_after_delivery:
                 updated = await conn.fetchrow(
@@ -12826,6 +12870,10 @@ async def _handle_agent_action_approve(
     result: dict = {"actionId": action_id, "actionStatus": "executed"}
     if report_result:
         result["report"] = report_result
+    if schedule_result:
+        result["schedule"] = schedule_result
+        # Count a committed approval (created or already-existed) once, post-commit.
+        AGENT_AUTOMATION_SUGGESTIONS.labels(stage="approved").inc()
     return result
 
 
@@ -12889,6 +12937,9 @@ async def _handle_agent_action_reject(
                 action_id,
                 depot_id,
             )
+
+            if action_row["action_class"] == "schedule_suggestion":
+                AGENT_AUTOMATION_SUGGESTIONS.labels(stage="rejected").inc()
 
     return {"actionId": action_id, "actionStatus": "rejected"}
 
@@ -12968,36 +13019,78 @@ async def _resolve_schedule_next_run_at(
     )
 
 
+async def _create_report_schedule_from_input(
+    input_payload: Any,
+    depot_id: str,
+    *,
+    created_by: Optional[str],
+    ts_conn: "Optional[asyncpg.Connection]" = None,
+) -> dict:
+    """Normalize + persist one report schedule (+ recipients); return its wire dict.
+
+    Shared by ``reports.schedule.create`` and the ``schedule_suggestion`` approve
+    branch so both honour the same validation + next-run computation (DRY).
+    Raises ``ScheduleValidationError`` (callers map to HTTP 400). When ``ts_conn``
+    is supplied the insert runs on that connection (sharing the caller's open
+    transaction); otherwise it acquires its own TimescaleDB transaction.
+    """
+    norm = normalize_create_payload(input_payload)
+    next_run_at = await _resolve_schedule_next_run_at(depot_id, norm)
+
+    async def _persist(conn: "asyncpg.Connection") -> dict:
+        row = await _report_schedules.insert_schedule(
+            conn,
+            depot_id=depot_id,
+            norm=norm,
+            next_run_at=next_run_at,
+            created_by=created_by,
+        )
+        await _report_schedules.replace_recipients(conn, str(row["id"]), norm.recipients)
+        return await _report_schedules.serialize_schedule(  # type: ignore[return-value]
+            conn, depot_id, str(row["id"])
+        )
+
+    if ts_conn is not None:
+        return await _persist(ts_conn)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    async with db_pools.ts.acquire() as conn:
+        async with conn.transaction():
+            return await _persist(conn)
+
+
+def _require_admin_config_for_schedule(user: Optional[dict]) -> None:
+    """Re-check ADMIN_CONFIG before a schedule_suggestion approval creates a schedule.
+
+    ``agents.action.approve`` is gated at ``DEPOT_MANAGE`` (operator+), but
+    creating a report schedule requires ``ADMIN_CONFIG`` (customer_admin+). Check
+    explicitly so an operator's approve returns a clear 403 instead of silently
+    creating a schedule with elevated rights (CLAUDE.md documents this gotcha).
+    """
+    role = get_user_role(user or {})
+    if not has_permission(role, Permission.ADMIN_CONFIG):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Approving an automation suggestion creates a scheduled report, "
+                "which requires admin:config (customer_admin or higher)."
+            ),
+        )
+
+
 async def _handle_report_schedule_create(
     params: dict, depot_id: str, dry_run: bool, user: Optional[dict] = None
 ) -> dict:
     """reports.schedule.create — params.input is a ScheduleCreatePayload."""
     try:
-        norm = normalize_create_payload(params.get("input"))
+        if dry_run:
+            normalize_create_payload(params.get("input"))  # validate only
+            return {"valid": True}
+        return await _create_report_schedule_from_input(
+            params.get("input"), depot_id, created_by=(user or {}).get("sub")
+        )
     except ScheduleValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if dry_run:
-        return {"valid": True}
-    if not db_pools:
-        raise DatabaseError("Database not available")
-    try:
-        next_run_at = await _resolve_schedule_next_run_at(depot_id, norm)
-    except ScheduleValidationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    created_by = (user or {}).get("sub")
-    async with db_pools.ts.acquire() as conn:
-        async with conn.transaction():
-            row = await _report_schedules.insert_schedule(
-                conn,
-                depot_id=depot_id,
-                norm=norm,
-                next_run_at=next_run_at,
-                created_by=created_by,
-            )
-            await _report_schedules.replace_recipients(conn, str(row["id"]), norm.recipients)
-            schedule = await _report_schedules.serialize_schedule(conn, depot_id, str(row["id"]))
-    return schedule  # type: ignore[return-value]
 
 
 async def _handle_report_schedule_update(

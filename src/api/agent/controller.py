@@ -46,6 +46,7 @@ from src.api.agent.audit import (
     write_agent_query_audit,
 )
 from src.api.agent.auth_context import ResolvedEntity, ResolvedTimeWindow, build_auth_context
+from src.api.agent.automation_suggestions import maybe_emit_automation_suggestion
 from src.api.agent.intents.consumption_by_user import (
     compile_consumption_by_user,
     summarize_consumption_rows,
@@ -723,6 +724,12 @@ async def run_turn(
         reply = AgentReply.success(run_id=run_id, intent=plan.intent, text=text)
         await agent_runs_close(ts_pool, run_id, "success", reply)
         await _emit_answer_safe(sse, reply, run_id)
+        # Best-effort, post-reply: mine recent history and maybe propose a
+        # scheduled-report automation. Flag-gated, time-boxed, and swallows all
+        # errors — it can never slow or break the turn the user already received.
+        await maybe_emit_automation_suggestion(
+            ts_pool=ts_pool, auth=auth, token_payload=token_payload
+        )
         return reply
 
     except Exception as exc:
