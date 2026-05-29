@@ -724,13 +724,6 @@ async def run_turn(
         reply = AgentReply.success(run_id=run_id, intent=plan.intent, text=text)
         await agent_runs_close(ts_pool, run_id, "success", reply)
         await _emit_answer_safe(sse, reply, run_id)
-        # Best-effort, post-reply: mine recent history and maybe propose a
-        # scheduled-report automation. Flag-gated, time-boxed, and swallows all
-        # errors — it can never slow or break the turn the user already received.
-        await maybe_emit_automation_suggestion(
-            ts_pool=ts_pool, auth=auth, token_payload=token_payload
-        )
-        return reply
 
     except Exception as exc:
         # Stamp the row with status='error' on a best-effort basis so the
@@ -746,6 +739,14 @@ async def run_turn(
         except Exception:  # pragma: no cover - audit close is best-effort
             logger.exception("Failed to close agent_run %s in error state", run_id)
         raise
+
+    # Best-effort, post-reply: mine recent history and maybe propose a
+    # scheduled-report automation. Outside try/except so a leak here cannot
+    # re-close an already-successful run or 502 a turn the user received.
+    await maybe_emit_automation_suggestion(
+        ts_pool=ts_pool, auth=auth, token_payload=token_payload
+    )
+    return reply
 
 
 # ── SQL-mode (general analytics) sub-orchestrator ──────────────────────────
