@@ -12,10 +12,10 @@ Public surface is the iterators / fetchers the CLI consumes:
 - :meth:`get_location`
 - :meth:`get_power_group`
 
-Field names follow the ChargEye reference (``stationId``, ``maxPowerKw``,
-``netBatterySizeKwh``, …). Translation to Favonius shapes happens in
-``mapping.py``, not here. The shared auth / retry / pagination plumbing lives
-in :mod:`src.adapters.rest_client`.
+Field names follow the official ChargEye OpenAPI specs at docs.kempower.io
+(``stationId``, ``maxPowerKw``, ``fullChargeEnergykWh``, …). Translation to
+Favonius shapes happens in ``mapping.py``, not here. The shared auth / retry
+/ pagination plumbing lives in :mod:`src.adapters.rest_client`.
 """
 
 from __future__ import annotations
@@ -163,10 +163,16 @@ class KempowerClient(BaseRestClient):
             yield item
 
     async def iter_vehicles(self, location_id: str) -> AsyncIterator[dict[str, Any]]:
-        """Iterate Vehicle objects scoped to a Location."""
+        """Iterate Vehicle objects scoped to a Location.
+
+        The /vehicles response wraps each vehicle in a ``VehicleRecord``
+        (``{"vehicle": <VehicleDTO>, "v2icp": <…>}``); unwrap to the inner
+        DTO so downstream sees the flat vehicle fields (``id``,
+        ``fullChargeEnergykWh``, …).
+        """
         body = await self._request("GET", "/vehicles", params={"locationUid": location_id})
-        for item in body.get("vehicles") or []:
-            yield item
+        for record in body.get("vehicles") or []:
+            yield record.get("vehicle") or record
 
     async def iter_transactions(
         self,
