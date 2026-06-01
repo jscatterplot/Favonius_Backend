@@ -8910,11 +8910,14 @@ async def _build_data_graph(depot_id: str) -> DataGraphResponse:
     if not station_ids:
         ocpp_status, ocpp_desc = "paused", "No chargers configured for this depot"
     else:
-        faulted = sum(
-            1
-            for v in connector_statuses.values()
-            if v.get("ocpp_status") in ("Faulted", "Unavailable")
-        )
+        def _charger_faulted(station_id: str) -> bool:
+            entry = connector_statuses.get(station_id)
+            if entry is None:
+                return True
+            status = entry.get("ocpp_status")
+            return status is None or status in ("Faulted", "Unavailable")
+
+        faulted = sum(1 for sid in station_ids if _charger_faulted(sid))
         total = len(station_ids)
         if faulted == 0:
             ocpp_status, ocpp_desc = "ok", None
@@ -8999,7 +9002,13 @@ async def _build_data_graph(depot_id: str) -> DataGraphResponse:
             err = str(row["error_detail"]) if row["error_detail"] else "unknown error"
             node_status, node_desc = "danger", f"Last sync failed: {err}"
         elif last_job in ("pending", "running"):
-            node_status, node_desc = "ok", None
+            if conn_status == "error":
+                node_status, node_desc = (
+                    "warn",
+                    "Sync in progress after previous failure",
+                )
+            else:
+                node_status, node_desc = "ok", None
         else:
             node_status, node_desc = "warn", f"Unexpected job status: {last_job}"
 
@@ -9030,7 +9039,10 @@ async def _build_data_graph(depot_id: str) -> DataGraphResponse:
 
     # 4. Navirec — only when the background poller is enabled
     if navirec_enabled:
-        interval_s = int(os.getenv("NAVIREC_POLL_INTERVAL_S", "300"))
+        try:
+            interval_s = int(max(30.0, float(os.getenv("NAVIREC_POLL_INTERVAL_S", "300"))))
+        except (TypeError, ValueError):
+            interval_s = 300
         nav_cadence = (
             f"Every {interval_s // 60} min" if interval_s >= 60 else f"Every {interval_s}s"
         )
