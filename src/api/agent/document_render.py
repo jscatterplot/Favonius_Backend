@@ -226,7 +226,12 @@ def render(
                 filled = _apply_pdf_replacements(filled, replacements)
             return filled, "preserved"
         # Flat PDF: apply targeted replacements to the extracted text and
-        # re-render. Layout is NOT preserved — best-effort.
+        # re-render. Layout is NOT preserved — best-effort. Named fields are not
+        # supported (no AcroForm slots); callers must use replacements only.
+        if field_values:
+            raise DocumentRenderError(
+                "flat PDF rendering does not support field_values; use replacements"
+            )
         text = full_text if full_text is not None else _extract_pdf(body).text
         for rep in replacements:
             find = str(rep.get("find") or "")

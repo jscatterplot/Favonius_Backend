@@ -164,6 +164,19 @@ def test_extract_flat_pdf():
     assert "12340" in ex.text
 
 
+def test_render_flat_pdf_rejects_field_values():
+    pytest.importorskip("pypdf")
+    body = _flat_pdf("Depot report.")
+    with pytest.raises(dr.DocumentRenderError, match="field_values"):
+        dr.render(
+            kind="pdf",
+            pdf_form_type="flat",
+            body=body,
+            field_values={"customer_name": "ACME"},
+            replacements=[],
+        )
+
+
 def test_render_flat_pdf_is_degraded_and_applies_replacement():
     pytest.importorskip("pypdf")
     body = _flat_pdf("Depot report. Total: 12340 kWh.")

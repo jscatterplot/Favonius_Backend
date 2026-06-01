@@ -1930,8 +1930,13 @@ async def _run_document_fill_turn(
             "I wasn't able to work on the document this time. "
             "Please try rephrasing what you'd like changed."
         )
+        if term is None and qa.status == "success":
+            logger.warning(
+                "doc-fill run %s: qa.status=success but no emit_final_answer terminator",
+                run_id,
+            )
         status = (
-            "not_found" if qa.status in ("no_terminator", "max_iterations", "success") else "error"
+            "not_found" if qa.status in ("no_terminator", "max_iterations") else "error"
         )
         new_log = list(message_log)
         new_log.append({"role": "user", "text": message, "run_id": str(run_id), "ts": _now_iso()})
