@@ -47,13 +47,14 @@ def ccs_station() -> dict:
 
 @pytest.fixture
 def bus_vehicle() -> dict:
+    # Field names match the ChargEye Vehicles API VehicleDTO schema
+    # (docs.kempower.io): id, evModel, fullChargeEnergykWh, maxChargePowerkW.
     return {
-        "vehicleId": "veh-42",
+        "id": "veh-42",
         "name": "Bus 042",
-        "make": "eBus",
-        "model": "Citaro G",
-        "netBatterySizeKwh": 350,
-        "maxChargePowerKw": 150,
+        "evModel": "eBus Citaro G",
+        "fullChargeEnergykWh": 350,
+        "maxChargePowerkW": 150,
         "vin": "WMB12345CITARO00042",
         "licensePlate": "JKL-042",
     }
@@ -61,16 +62,18 @@ def bus_vehicle() -> dict:
 
 @pytest.fixture
 def finished_transaction() -> dict:
+    # Field names match the ChargEye Transactions API TxInfo schema
+    # (docs.kempower.io): authorizationToken, startTime, endTime,
+    # chargedEnergyKwh, status, txId. (There's no driverName / vehicleId at
+    # the transaction level — vehicle linkage lives in schedulePlan.evId.)
     return {
         "txId": "tx-99",
         "stationId": "KEM-DC-001",
-        "vehicleId": "veh-42",
-        "idTag": "rfid-abc-1",
+        "authorizationToken": "rfid-abc-1",
         "startTime": "2025-03-01T08:00:00Z",
-        "stopTime": "2025-03-01T10:00:00Z",
-        "energyKwh": 175.5,
-        "status": "Finished",
-        "driverName": "Anna Driver",
+        "endTime": "2025-03-01T10:00:00Z",
+        "chargedEnergyKwh": 175.5,
+        "status": "Ended",
     }
 
 
@@ -188,21 +191,21 @@ def test_vehicle_maps_bus(bus_vehicle):
 
 
 def test_vehicle_missing_battery_size_fails(bus_vehicle):
-    bus_vehicle.pop("netBatterySizeKwh")
-    with pytest.raises(ValueError, match="netBatterySizeKwh"):
+    bus_vehicle.pop("fullChargeEnergykWh")
+    with pytest.raises(ValueError, match="fullChargeEnergykWh"):
         kempower_vehicle_to_identity(bus_vehicle)
 
 
 def test_vehicle_missing_max_charge_fails(bus_vehicle):
-    bus_vehicle.pop("maxChargePowerKw")
-    with pytest.raises(ValueError, match="maxChargePowerKw"):
+    bus_vehicle.pop("maxChargePowerkW")
+    with pytest.raises(ValueError, match="maxChargePowerkW"):
         kempower_vehicle_to_identity(bus_vehicle)
 
 
 def test_vehicle_missing_vehicle_id_fails():
-    with pytest.raises(ValueError, match="vehicleId"):
+    with pytest.raises(ValueError, match="'id'"):
         kempower_vehicle_to_identity(
-            {"netBatterySizeKwh": 200, "maxChargePowerKw": 100}
+            {"fullChargeEnergykWh": 200, "maxChargePowerkW": 100}
         )
 
 
@@ -248,8 +251,9 @@ def test_transaction_maps_finished_session(finished_transaction):
     assert row["energy_delivered_kwh"] == 175.5
     assert row["site_id"] == _DEPOT
     assert row["import_batch_id"] == str(_BATCH)
-    assert row["import_status"] == "Finished"
-    assert row["import_user_full_name"] == "Anna Driver"
+    assert row["import_status"] == "Ended"
+    # TxInfo has no driverName field; we explicitly carry None.
+    assert row["import_user_full_name"] is None
 
 
 def test_transaction_hash_is_deterministic(finished_transaction):
@@ -294,7 +298,7 @@ def test_transaction_hash_matches_main_helper(finished_transaction):
 
 
 def test_transaction_without_id_tag_uses_tx_id_in_hash(finished_transaction):
-    finished_transaction.pop("idTag")
+    finished_transaction.pop("authorizationToken")
     row = kempower_transaction_to_session_row(
         finished_transaction,
         site_id=_DEPOT,
@@ -317,10 +321,10 @@ def test_transaction_without_id_tag_uses_tx_id_in_hash(finished_transaction):
 def test_transaction_without_id_tag_or_tx_id_fails():
     bad = {
         "startTime": "2025-03-01T08:00:00Z",
-        "energyKwh": 10,
-        "stopTime": "2025-03-01T09:00:00Z",
+        "chargedEnergyKwh": 10,
+        "endTime": "2025-03-01T09:00:00Z",
     }
-    with pytest.raises(ValueError, match="idTag"):
+    with pytest.raises(ValueError, match="'idTag'|'txId'|authorizationToken"):
         kempower_transaction_to_session_row(
             bad,
             site_id=_DEPOT,
@@ -331,7 +335,7 @@ def test_transaction_without_id_tag_or_tx_id_fails():
 
 
 def test_transaction_without_stop_time_keeps_end_none(finished_transaction):
-    finished_transaction.pop("stopTime")
+    finished_transaction.pop("endTime")
     row = kempower_transaction_to_session_row(
         finished_transaction,
         site_id=_DEPOT,
@@ -346,9 +350,9 @@ def test_transaction_offset_isoformat_normalises_to_utc():
     tx = {
         "txId": "tx-1",
         "startTime": "2025-03-01T10:00:00+02:00",
-        "stopTime": "2025-03-01T12:00:00+02:00",
-        "energyKwh": 25,
-        "idTag": "rfid",
+        "endTime": "2025-03-01T12:00:00+02:00",
+        "chargedEnergyKwh": 25,
+        "authorizationToken": "rfid",
     }
     row = kempower_transaction_to_session_row(
         tx,
@@ -362,9 +366,9 @@ def test_transaction_offset_isoformat_normalises_to_utc():
 
 
 def test_transaction_missing_energy_fails():
-    with pytest.raises(ValueError, match="energyKwh"):
+    with pytest.raises(ValueError, match="chargedEnergyKwh"):
         kempower_transaction_to_session_row(
-            {"txId": "x", "startTime": "2025-03-01T00:00:00Z", "idTag": "r"},
+            {"txId": "x", "startTime": "2025-03-01T00:00:00Z", "authorizationToken": "r"},
             site_id=_DEPOT,
             station_id="S",
             vehicle_id=None,

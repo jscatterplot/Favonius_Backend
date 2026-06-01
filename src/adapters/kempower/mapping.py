@@ -140,30 +140,33 @@ def kempower_vehicle_to_identity(vehicle: dict[str, Any]) -> KempowerVehiclePayl
     """Map one Kempower ``Vehicle`` JSON object to ``KempowerVehiclePayload``.
 
     ``external_id`` is prefixed with ``kempower:`` so two customers using
-    the same numeric ``vehicleId`` in their respective ChargEye tenants
+    the same vehicle ``id`` in their respective ChargEye tenants
     can co-exist under the Favonius global ``vehicles.external_id`` UNIQUE.
+    Field names mirror the ChargEye Vehicles API ``VehicleDTO`` schema
+    (``id``, ``fullChargeEnergykWh``, ``maxChargePowerkW`` — note the
+    lowercase ``k`` in the last two, per docs.kempower.io).
     """
-    raw_id = vehicle.get("vehicleId")
+    raw_id = vehicle.get("id")
     if raw_id is None or raw_id == "":
-        raise ValueError("Kempower vehicle is missing required field 'vehicleId'")
-    if vehicle.get("netBatterySizeKwh") is None:
+        raise ValueError("Kempower vehicle is missing required field 'id'")
+    if vehicle.get("fullChargeEnergykWh") is None:
         raise ValueError(
-            f"Kempower vehicle {raw_id!r} is missing required field 'netBatterySizeKwh'"
+            f"Kempower vehicle {raw_id!r} is missing required field 'fullChargeEnergykWh'"
         )
-    if vehicle.get("maxChargePowerKw") is None:
+    if vehicle.get("maxChargePowerkW") is None:
         raise ValueError(
-            f"Kempower vehicle {raw_id!r} is missing required field 'maxChargePowerKw'"
+            f"Kempower vehicle {raw_id!r} is missing required field 'maxChargePowerkW'"
         )
 
     return KempowerVehiclePayload(
         external_id=f"{KEMPOWER_EXTERNAL_ID_PREFIX}{raw_id}",
         display_name=vehicle.get("name"),
         vehicle_type=derive_vehicle_type(
-            make=vehicle.get("make"),
-            model=vehicle.get("model"),
+            make=None,
+            model=vehicle.get("evModel"),
         ),
-        battery_kwh=float(vehicle["netBatterySizeKwh"]),
-        max_charge_kw=float(vehicle["maxChargePowerKw"]),
+        battery_kwh=float(vehicle["fullChargeEnergykWh"]),
+        max_charge_kw=float(vehicle["maxChargePowerkW"]),
         # id_tag is left None on backfill — OCPP populates it the first time
         # the vehicle plugs into the Favonius OCPP server with an RFID.
         id_tag=None,
@@ -201,23 +204,23 @@ def kempower_transaction_to_session_row(
         raise ValueError("Kempower transaction is missing required field 'startTime'")
     start_time_utc = _parse_iso_utc(start_raw)
 
-    stop_raw = transaction.get("stopTime")
-    end_time_utc = _parse_iso_utc(stop_raw) if stop_raw else None
+    end_raw = transaction.get("endTime")
+    end_time_utc = _parse_iso_utc(end_raw) if end_raw else None
 
-    energy_kwh_raw = transaction.get("energyKwh")
+    energy_kwh_raw = transaction.get("chargedEnergyKwh")
     if energy_kwh_raw is None:
         raise ValueError(
-            f"Kempower transaction {transaction.get('txId')!r} is missing 'energyKwh'"
+            f"Kempower transaction {transaction.get('txId')!r} is missing 'chargedEnergyKwh'"
         )
     energy_kwh = float(energy_kwh_raw)
 
     # Match the XLSX path's behaviour: when the source row has no
-    # RFID/idTag, classify it as platform-initiated. The XLSX path uses
+    # RFID/auth token, classify it as platform-initiated. The XLSX path uses
     # a richer hash-token to avoid collisions across distinct
     # platform-initiated sessions sharing minute-level start time — we
     # don't have those discriminators here, so we fall back to the
     # Kempower transaction id, which is globally unique on their side.
-    raw_id_tag = transaction.get("idTag")
+    raw_id_tag = transaction.get("authorizationToken")
     if raw_id_tag:
         id_token = str(raw_id_tag)
         hash_id_token = id_token
@@ -247,7 +250,7 @@ def kempower_transaction_to_session_row(
         "site_id": site_id,
         "import_batch_id": str(batch_id),
         "import_row_hash": row_hash,
-        "import_user_full_name": transaction.get("driverName"),
+        "import_user_full_name": None,
         "import_station_owner": None,
         "import_status": transaction.get("status"),
     }

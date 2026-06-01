@@ -234,9 +234,9 @@ async def import_vehicles(
     """Return ``{kempower_vehicle_id → our_vehicle_id (UUID text)}``."""
     vehicle_map: dict[str, str] = {}
     async for kempower_vehicle in kempower.iter_vehicles(kempower_location_id):
-        kempower_vehicle_id = kempower_vehicle.get("vehicleId")
+        kempower_vehicle_id = kempower_vehicle.get("id")
         if not kempower_vehicle_id:
-            counts.vehicles_skipped.append("(missing vehicleId)")
+            counts.vehicles_skipped.append("(missing id)")
             continue
         try:
             identity = kempower_vehicle_to_identity(kempower_vehicle)
@@ -371,7 +371,11 @@ async def backfill_sessions(
             start_iso=start_iso,
             end_iso=end_iso,
         ):
-            kempower_vehicle_id = tx.get("vehicleId")
+            # TxInfo has no top-level vehicle id; the link is on schedulePlan.evId
+            # (per ChargEye Transactions OpenAPI). Falls back to None for guest
+            # / unscheduled charges, in which case the session lands with no
+            # vehicle linkage — acceptable for the historical import.
+            kempower_vehicle_id = (tx.get("schedulePlan") or {}).get("evId")
             our_vehicle_id: Optional[str] = None
             if kempower_vehicle_id:
                 mapped = vehicle_map.get(str(kempower_vehicle_id))
