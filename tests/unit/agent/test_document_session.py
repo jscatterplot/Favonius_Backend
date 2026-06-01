@@ -254,3 +254,40 @@ async def test_unknown_session_returns_not_found(patched, monkeypatch):
     )
     assert reply.status == "not_found"
     assert reply.intent == "document_fill"
+
+
+@pytest.mark.asyncio
+async def test_finalize_render_failure_keeps_session_open(patched, monkeypatch):
+    # Regression (Bugbot high-sev): if the finalize render raises, the session
+    # must NOT be marked 'finalized' (which the finalized-guard would then lock
+    # with nothing to download) — it stays open so the user can retry.
+    import src.api.agent.document_render as dr
+
+    def _boom(**kwargs):
+        raise dr.DocumentRenderError("render boom")
+
+    monkeypatch.setattr(dr, "render", _boom)
+    patched["qa"] = _terminator_qa(
+        {
+            "mode": "finalize",
+            "text": "Done.",
+            "field_values": {"total": "15,000 kWh"},
+            "replacements": [],
+            "questions": [],
+        }
+    )
+    reply = await _run_document_fill_turn(
+        run_id=uuid4(),
+        message="finalize it",
+        auth=_auth(),
+        static_pool=None,
+        ts_pool=None,
+        session_id=patched["session_id"],
+        sse=None,
+        emit_step=_emit_step,
+    )
+    # No downloadable output, session stays open (not finalized), reply not success.
+    assert reply.status == "needs_input"
+    assert reply.download is None
+    assert patched["store_output_calls"] == []
+    assert patched["update_session_calls"][-1]["status"] == "awaiting_input"

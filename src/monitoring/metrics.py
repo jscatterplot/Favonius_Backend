@@ -171,6 +171,29 @@ AGENT_DOC_RENDERS = Counter(
     ["kind", "fidelity", "outcome"],  # kind: docx|pdf ; fidelity: preserved|degraded|none
 )
 
+# Proactive scheduled-report suggestions mined from chat history
+# (src/api/agent/automation_suggestions.py). Gated by
+# AGENT_AUTOMATION_SUGGESTIONS_ENABLED; emitted best-effort after a chat turn.
+AGENT_AUTOMATION_SUGGESTIONS = Counter(
+    "favonius_agent_automation_suggestions_total",
+    "Proactive scheduled-report suggestions by lifecycle stage",
+    ["stage"],  # detected | emitted | approved | rejected
+)
+
+AGENT_AUTOMATION_SUPPRESSED = Counter(
+    "favonius_agent_automation_suppressed_total",
+    "Suggestions computed but not emitted (or informational flags), by reason",
+    # depot_unresolvable | existing_schedule | rejected_cooldown
+    # | duplicate_pending | autonomy_shadow | no_email
+    ["reason"],
+)
+
+AGENT_AUTOMATION_DETECT_DURATION = Histogram(
+    "favonius_agent_automation_detect_seconds",
+    "Wall-clock of post-turn automation-suggestion detection (bounded by AGENT_AUTOMATION_TIMEOUT_S)",
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1, 2],
+)
+
 # Depot workflow agent runtime metrics (PRD §4.3/§4.4, sprint 2).
 # Naming mirrors the existing agent_search metrics one level up.
 WORKFLOW_TURNS = Counter(

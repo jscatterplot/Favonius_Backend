@@ -80,7 +80,7 @@ from ..db.exceptions import (
 from ..db.pools import DatabasePools
 from ..db.postgres_url import describe_database_target
 from ..db.snapshot_store import persist_snapshot
-from ..monitoring.metrics import CONTROLLER_MANAGER_UP
+from ..monitoring.metrics import AGENT_AUTOMATION_SUGGESTIONS, CONTROLLER_MANAGER_UP
 from ..security.admin_audit import AdminAuditRow, AdminAuditWriteError, write_admin_audit_row
 from ..security.audit_log import AuditEvent, AuditLogger, get_audit_logger, set_audit_logger
 from ..security.auth import (
@@ -1866,6 +1866,54 @@ class PowerTimelineResponse(BaseModel):
     )
     plan_meta: Optional[PowerTimelinePlanMeta] = Field(
         None, description="Metadata about the optimization run; null when no run exists"
+    )
+
+
+# ── Data-graph response models ────────────────────────────────────────────────
+
+
+class DataGraphNode(BaseModel):
+    """One node in the depot data-source dependency graph.
+
+    ``id`` uses the ``src:{provider_key}`` convention so the BFF's
+    ``mergeWithScaffold()`` can replace scaffold placeholders with live-status
+    nodes on ID collision.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)
+
+    id: str
+    kind: str = Field(default="source", description='"source" | "entity" | "consumer"')
+    label: str
+    status: str = Field(..., description='"ok" | "warn" | "danger" | "paused" | "system"')
+    last_sync_at: Optional[str] = Field(
+        None, description="ISO 8601 UTC timestamp of most recent data point"
+    )
+    description: Optional[str] = Field(
+        None, description="Human-readable context; populated only when status != ok"
+    )
+    cadence: Optional[str] = Field(
+        None, description='Human-readable refresh cadence, e.g. "Every 5 min"'
+    )
+
+
+class DataGraphResponse(BaseModel):
+    """Response for GET /depots/{id}/data-graph.
+
+    Returns only depot-specific source nodes — the BFF prepends four always-on
+    infrastructure nodes (src:supabase, src:timescale, src:email, and a generic
+    src:ocpp) via ``mergeWithScaffold()``, and backend nodes win on ID collision.
+    ``src:ocpp`` is therefore always returned to replace the scaffold's generic
+    placeholder with live charger-health data.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)
+
+    as_of: str = Field(..., description="ISO 8601 UTC snapshot time")
+    nodes: list[DataGraphNode]
+    edges: list[dict] = Field(
+        default_factory=list,
+        description="Reserved for future use; always empty in this implementation",
     )
 
 
@@ -8123,6 +8171,7 @@ _DEFAULT_AGENT_AUTONOMY_CLASSES: tuple[str, ...] = (
     "price_reoptimize",
     "soc_guardrail",
     "report_draft",
+    "schedule_suggestion",
 )
 
 _DEFAULT_AGENT_AUTONOMY_LEVEL: str = "proposed"
@@ -8739,6 +8788,377 @@ async def get_depot_power_timeline(
             detail={
                 "error_code": ErrorCode.INTERNAL_ERROR.value,
                 "detail": "Failed to build power timeline",
+            },
+        ) from e
+
+
+async def _build_data_graph(depot_id: str) -> DataGraphResponse:
+    """Assemble live source-health nodes for the data-graph endpoint.
+
+    Only depot-specific source nodes are returned; the BFF's
+    ``mergeWithScaffold()`` inserts the four always-on infrastructure nodes
+    (Supabase, TimescaleDB, email, generic OCPP placeholder). Nodes returned
+    here win on ID collision, so ``src:ocpp`` is always returned to replace
+    the scaffold's generic version with live charger-health data.
+
+    Adding a new source
+    -------------------
+    When a new data source integration is added (e.g. Ignitis, Nord Pool,
+    a new telematics provider), wire it into this function so it appears
+    automatically on the Sources page graph:
+
+    1. Detect whether the source is configured for the depot (env flag, DB
+       row, or ``sites.tariff_config`` field).
+    2. Query the appropriate health signal (last sync timestamp, error
+       state) from the correct pool (``db_pools.static`` for Supabase
+       tables, ``db_pools.ts`` for TimescaleDB hypertables).
+    3. Map the signal to one of five statuses:
+       ``ok | warn | danger | paused | system``.
+    4. Append a ``DataGraphNode`` with ``id = "src:{provider_key}"`` —
+       the same key format the BFF scaffold uses, so the live node
+       replaces the scaffold placeholder on ID collision.
+    5. Add unit tests in ``tests/unit/test_api_data_graph.py`` covering
+       the new source's status transitions (ok / warn / danger / absent).
+    """
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    now_utc = datetime.now(tz=timezone.utc)
+
+    # ── Phase 1: static-pool queries (sequential on one connection) ───────────
+    async with db_pools.static.acquire() as conn:
+        bidding_zone = await db_queries.resolve_bidding_zone(conn, UUID(depot_id))
+
+        station_rows = await conn.fetch(
+            "SELECT station_id FROM charging_stations WHERE site_id = $1::uuid",
+            depot_id,
+        )
+        vehicle_rows = await conn.fetch(
+            "SELECT id FROM vehicles WHERE site_id = $1::uuid",
+            depot_id,
+        )
+        conn_rows = await conn.fetch(
+            """
+            SELECT
+                c.id,
+                c.provider_key,
+                c.display_name,
+                c.status            AS connection_status,
+                c.sync_interval_minutes,
+                c.last_run_at,
+                j.status            AS last_job_status,
+                j.error_detail,
+                j.finished_at       AS job_finished_at
+            FROM data_source_connections c
+            LEFT JOIN LATERAL (
+                SELECT status, error_detail, finished_at
+                FROM data_source_ingestion_jobs
+                WHERE connection_id = c.id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) j ON true
+            WHERE c.site_id = $1::uuid
+              AND c.status != 'disabled'
+            ORDER BY c.created_at
+            """,
+            depot_id,
+        )
+
+    station_ids: list[str] = [r["station_id"] for r in station_rows if r["station_id"]]
+    vehicle_ids: list[str] = [str(r["id"]) for r in vehicle_rows]
+    navirec_enabled = os.getenv("NAVIREC_POLL_ENABLED", "false").strip().lower() == "true"
+
+    # ── Phase 2: ts-pool queries (independent — run in parallel) ─────────────
+    async def _fetch_connector_statuses() -> dict:
+        if not station_ids:
+            return {}
+        async with db_pools.ts.acquire() as ts_conn:
+            return await db_queries.latest_connector_status_by_stations(ts_conn, station_ids)
+
+    async def _fetch_entsoe_latest() -> Optional[datetime]:
+        if not bidding_zone:
+            return None
+        async with db_pools.ts.acquire() as ts_conn:
+            row = await ts_conn.fetchrow(
+                """
+                SELECT MAX(time) AS latest_time
+                FROM electricity_prices
+                WHERE node_id = $1 AND market_type = 'ENTSOE_DAM'
+                """,
+                bidding_zone,
+            )
+            return row["latest_time"] if row else None
+
+    async def _fetch_navirec_latest() -> Optional[datetime]:
+        if not navirec_enabled or not vehicle_ids:
+            return None
+        async with db_pools.ts.acquire() as ts_conn:
+            row = await ts_conn.fetchrow(
+                """
+                SELECT MAX(time) AS latest_time
+                FROM vehicle_telemetry
+                WHERE vehicle_id = ANY($1::uuid[])
+                """,
+                vehicle_ids,
+            )
+            return row["latest_time"] if row else None
+
+    connector_statuses, entsoe_latest, navirec_latest = await asyncio.gather(
+        _fetch_connector_statuses(),
+        _fetch_entsoe_latest(),
+        _fetch_navirec_latest(),
+    )
+
+    # ── Build nodes ───────────────────────────────────────────────────────────
+    nodes: list[DataGraphNode] = []
+
+    # 1. OCPP — always returned; replaces the scaffold's generic src:ocpp node
+    ocpp_last_sync: Optional[str] = None
+    if connector_statuses:
+        ts_vals = [
+            v["last_interaction_at"]
+            for v in connector_statuses.values()
+            if v.get("last_interaction_at") is not None
+        ]
+        if ts_vals:
+            latest_ts = max(ts_vals)
+            ocpp_last_sync = (
+                latest_ts.replace(tzinfo=timezone.utc).isoformat()
+                if latest_ts.tzinfo is None
+                else latest_ts.isoformat()
+            )
+
+    if not station_ids:
+        ocpp_status, ocpp_desc = "paused", "No chargers configured for this depot"
+    else:
+        def _charger_faulted(station_id: str) -> bool:
+            entry = connector_statuses.get(station_id)
+            if entry is None:
+                return False
+            status = entry.get("ocpp_status")
+            return status in ("Faulted", "Unavailable")
+
+        faulted = sum(1 for sid in station_ids if _charger_faulted(sid))
+        total = len(station_ids)
+        if faulted == 0:
+            ocpp_status, ocpp_desc = "ok", None
+        elif faulted == total:
+            ocpp_status, ocpp_desc = (
+                "danger",
+                f"All {total} charger(s) are faulted or unavailable",
+            )
+        else:
+            ocpp_status, ocpp_desc = (
+                "warn",
+                f"{faulted} of {total} charger(s) reporting faults or unavailable",
+            )
+
+    nodes.append(
+        DataGraphNode(
+            id="src:ocpp",
+            kind="source",
+            label="Charger Network",
+            status=ocpp_status,
+            last_sync_at=ocpp_last_sync,
+            description=ocpp_desc,
+            cadence="Real-time via OCPP",
+        )
+    )
+
+    # 2. ENTSO-E — only when a bidding zone is configured for the depot
+    if bidding_zone is not None:
+        if entsoe_latest is None:
+            entsoe_status: str = "danger"
+            entsoe_desc: Optional[str] = "No electricity price data received"
+        else:
+            if entsoe_latest.tzinfo is None:
+                entsoe_latest = entsoe_latest.replace(tzinfo=timezone.utc)
+            age_h = (now_utc - entsoe_latest).total_seconds() / 3600
+            if age_h > 48:
+                entsoe_status = "danger"
+                entsoe_desc = (
+                    f"Price data is {int(age_h)}h old — optimization may use stale costs"
+                )
+            elif age_h >= 25:
+                entsoe_status = "warn"
+                entsoe_desc = f"Price data is {int(age_h)}h old"
+            else:
+                entsoe_status, entsoe_desc = "ok", None
+
+        nodes.append(
+            DataGraphNode(
+                id="src:entsoe",
+                kind="source",
+                label="ENTSO-E",
+                status=entsoe_status,
+                last_sync_at=(
+                    entsoe_latest.isoformat() if entsoe_latest is not None else None
+                ),
+                description=entsoe_desc,
+                cadence="Day-ahead prices (daily)",
+            )
+        )
+
+    # 3. Self-serve data-source connections (e.g. Kempower ChargEye)
+    provider_count: dict[str, int] = {}
+    for row in conn_rows:
+        key = str(row["provider_key"])
+        provider_count[key] = provider_count.get(key, 0) + 1
+        suffix = f"-{provider_count[key]}" if provider_count[key] > 1 else ""
+        node_id = f"src:{key}{suffix}"
+
+        conn_status = str(row["connection_status"])
+        last_job = row["last_job_status"]
+
+        if conn_status == "paused":
+            node_status: str = "paused"
+            node_desc: Optional[str] = "Connection paused by operator"
+        elif last_job is None:
+            node_status, node_desc = "warn", "No sync runs yet"
+        elif last_job == "succeeded":
+            node_status, node_desc = "ok", None
+        elif last_job == "partial":
+            node_status, node_desc = "warn", "Last sync completed with partial data"
+        elif last_job == "failed":
+            err = str(row["error_detail"]) if row["error_detail"] else "unknown error"
+            node_status, node_desc = "danger", f"Last sync failed: {err}"
+        elif last_job in ("pending", "running"):
+            if conn_status == "error":
+                node_status, node_desc = (
+                    "warn",
+                    "Sync in progress after previous failure",
+                )
+            else:
+                node_status, node_desc = "ok", None
+        else:
+            node_status, node_desc = "warn", f"Unexpected job status: {last_job}"
+
+        job_ts: Optional[datetime] = row["job_finished_at"] or row["last_run_at"]
+        conn_last_sync: Optional[str] = None
+        if job_ts is not None:
+            conn_last_sync = (
+                job_ts.replace(tzinfo=timezone.utc).isoformat()
+                if job_ts.tzinfo is None
+                else job_ts.isoformat()
+            )
+
+        interval = row["sync_interval_minutes"]
+        cadence = f"Every {interval} min" if interval else "Manual"
+        label = str(row["display_name"]) if row["display_name"] else key.title()
+
+        nodes.append(
+            DataGraphNode(
+                id=node_id,
+                kind="source",
+                label=label,
+                status=node_status,
+                last_sync_at=conn_last_sync,
+                description=node_desc,
+                cadence=cadence,
+            )
+        )
+
+    # 4. Navirec — only when the background poller is enabled
+    if navirec_enabled:
+        try:
+            interval_s = int(max(30.0, float(os.getenv("NAVIREC_POLL_INTERVAL_S", "300"))))
+        except (TypeError, ValueError):
+            interval_s = 300
+        nav_cadence = (
+            f"Every {interval_s // 60} min" if interval_s >= 60 else f"Every {interval_s}s"
+        )
+
+        if navirec_latest is None:
+            nav_status: str = "warn"
+            nav_desc: Optional[str] = "No vehicle telemetry received yet"
+        else:
+            if navirec_latest.tzinfo is None:
+                navirec_latest = navirec_latest.replace(tzinfo=timezone.utc)
+            age_m = (now_utc - navirec_latest).total_seconds() / 60
+            if age_m > 60:
+                nav_status = "danger"
+                nav_desc = f"Vehicle telemetry is {int(age_m)}min old"
+            elif age_m >= 15:
+                nav_status = "warn"
+                nav_desc = f"Vehicle telemetry is {int(age_m)}min old"
+            else:
+                nav_status, nav_desc = "ok", None
+
+        nodes.append(
+            DataGraphNode(
+                id="src:navirec",
+                kind="source",
+                label="Navirec Telematics",
+                status=nav_status,
+                last_sync_at=(
+                    navirec_latest.isoformat() if navirec_latest is not None else None
+                ),
+                description=nav_desc,
+                cadence=nav_cadence,
+            )
+        )
+
+    return DataGraphResponse(as_of=now_utc.isoformat(), nodes=nodes)
+
+
+@app.get(
+    "/depots/{depot_id}/data-graph",
+    response_model=DataGraphResponse,
+    response_model_by_alias=True,
+    tags=["depots"],
+    summary="Depot data-source health graph",
+    description="""
+    Returns live health nodes for all data sources configured for this depot.
+    Intended to drive the status dots on the frontend Sources page.
+
+    The BFF prepends four always-on infrastructure scaffold nodes
+    (``src:supabase``, ``src:timescale``, ``src:email``, generic ``src:ocpp``)
+    via ``mergeWithScaffold()`` and merges backend nodes on top — backend
+    nodes win on ID collision.  This endpoint therefore always returns
+    ``src:ocpp`` with live charger-health data (replacing the scaffold
+    placeholder), and conditionally returns:
+
+    - ``src:entsoe`` — when the depot has an ENTSO-E bidding-zone configured.
+    - ``src:{provider_key}`` — for each active or paused self-serve connection.
+    - ``src:navirec`` — when ``NAVIREC_POLL_ENABLED=true``.
+
+    Node statuses: ``ok`` (green) | ``warn`` (amber) | ``danger`` (red) |
+    ``paused`` (grey) | ``system`` (teal, infrastructure only).
+
+    **Error codes:**
+    - 401: Unauthorized
+    - 403: Depot access denied
+    - 404: Depot not found
+    - 503: Database not available
+    """,
+    responses={
+        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        403: {"model": ErrorResponse, "description": "Depot access denied"},
+        404: {"model": ErrorResponse, "description": "Depot not found"},
+        503: {"model": ErrorResponse, "description": "Database not available"},
+    },
+)
+async def get_depot_data_graph(
+    depot_id: str = Depends(_require_depot_access),
+    user: dict = Depends(ensure_tenant_mirrored),
+) -> DataGraphResponse:
+    """GET /depots/{depot_id}/data-graph."""
+    try:
+        return await _build_data_graph(depot_id)
+    except HTTPException:
+        raise
+    except asyncpg.PostgresError as e:
+        logger.error("Database error in data-graph for %s: %s", depot_id, e, exc_info=True)
+        raise DatabaseError() from e
+    except DatabaseError:
+        raise
+    except Exception as e:
+        logger.error("Failed to build data-graph for %s: %s", depot_id, e, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error_code": ErrorCode.INTERNAL_ERROR.value,
+                "detail": "Failed to build data graph",
             },
         ) from e
 
@@ -12692,6 +13112,7 @@ async def _handle_agent_action_approve(
         }
 
     report_result: Optional[dict] = None
+    schedule_result: Optional[dict] = None
     if dry_run:
         async with db_pools.ts.acquire() as conn:
             action_row = await conn.fetchrow(
@@ -12725,10 +13146,22 @@ async def _handle_agent_action_approve(
                     dry_run=True,
                     user=user,
                 )
+        elif action_row["action_class"] == "schedule_suggestion":
+            # Approval will create a report schedule → require ADMIN_CONFIG even
+            # in dry-run, then validate the embedded ScheduleCreatePayload.
+            _require_admin_config_for_schedule(user)
+            payload = _coerce_payload(action_row["payload"])
+            try:
+                normalize_create_payload(payload.get("scheduleInput"))
+            except ScheduleValidationError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            schedule_result = {"valid": True}
 
         result: dict = {"actionId": action_id, "actionStatus": "executed"}
         if report_result:
             result["report"] = report_result
+        if schedule_result:
+            result["schedule"] = schedule_result
         return result
 
     scheduled_run_id: Optional[str] = None
@@ -12775,6 +13208,36 @@ async def _handle_agent_action_approve(
                         user=user,
                         ts_conn=conn,
                     )
+
+            elif action_class == "schedule_suggestion":
+                # Approving a suggestion creates the schedule server-side, inside
+                # this same transaction (atomic with the action flip). Re-check
+                # ADMIN_CONFIG first (approve is only DEPOT_MANAGE-gated).
+                _require_admin_config_for_schedule(user)
+                payload = _coerce_payload(action_row["payload"])
+                schedule_input = payload.get("scheduleInput")
+                existing = await conn.fetchrow(
+                    "SELECT 1 FROM report_schedules WHERE depot_id = $1::uuid AND is_active "
+                    "AND kind = 'monthly_consumption' AND group_by = $2 AND frequency = $3 LIMIT 1",
+                    depot_id,
+                    (schedule_input or {}).get("groupBy"),
+                    (schedule_input or {}).get("frequency"),
+                )
+                if existing is not None:
+                    # An admin already created a matching schedule between the
+                    # proposal and this approval — don't duplicate it.
+                    schedule_result = {"scheduleCreated": False, "alreadyExists": True}
+                else:
+                    try:
+                        created_schedule = await _create_report_schedule_from_input(
+                            schedule_input,
+                            depot_id,
+                            created_by=(user or {}).get("sub"),
+                            ts_conn=conn,
+                        )
+                    except ScheduleValidationError as exc:
+                        raise HTTPException(status_code=400, detail=str(exc)) from exc
+                    schedule_result = {"scheduleCreated": True, "schedule": created_schedule}
 
             if not mark_executed_after_delivery:
                 updated = await conn.fetchrow(
@@ -12846,6 +13309,10 @@ async def _handle_agent_action_approve(
     result: dict = {"actionId": action_id, "actionStatus": "executed"}
     if report_result:
         result["report"] = report_result
+    if schedule_result:
+        result["schedule"] = schedule_result
+        if schedule_result.get("scheduleCreated"):
+            AGENT_AUTOMATION_SUGGESTIONS.labels(stage="approved").inc()
     return result
 
 
@@ -12909,6 +13376,9 @@ async def _handle_agent_action_reject(
                 action_id,
                 depot_id,
             )
+
+            if action_row["action_class"] == "schedule_suggestion":
+                AGENT_AUTOMATION_SUGGESTIONS.labels(stage="rejected").inc()
 
     return {"actionId": action_id, "actionStatus": "rejected"}
 
@@ -12988,36 +13458,78 @@ async def _resolve_schedule_next_run_at(
     )
 
 
+async def _create_report_schedule_from_input(
+    input_payload: Any,
+    depot_id: str,
+    *,
+    created_by: Optional[str],
+    ts_conn: "Optional[asyncpg.Connection]" = None,
+) -> dict:
+    """Normalize + persist one report schedule (+ recipients); return its wire dict.
+
+    Shared by ``reports.schedule.create`` and the ``schedule_suggestion`` approve
+    branch so both honour the same validation + next-run computation (DRY).
+    Raises ``ScheduleValidationError`` (callers map to HTTP 400). When ``ts_conn``
+    is supplied the insert runs on that connection (sharing the caller's open
+    transaction); otherwise it acquires its own TimescaleDB transaction.
+    """
+    norm = normalize_create_payload(input_payload)
+    next_run_at = await _resolve_schedule_next_run_at(depot_id, norm)
+
+    async def _persist(conn: "asyncpg.Connection") -> dict:
+        row = await _report_schedules.insert_schedule(
+            conn,
+            depot_id=depot_id,
+            norm=norm,
+            next_run_at=next_run_at,
+            created_by=created_by,
+        )
+        await _report_schedules.replace_recipients(conn, str(row["id"]), norm.recipients)
+        return await _report_schedules.serialize_schedule(  # type: ignore[return-value]
+            conn, depot_id, str(row["id"])
+        )
+
+    if ts_conn is not None:
+        return await _persist(ts_conn)
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    async with db_pools.ts.acquire() as conn:
+        async with conn.transaction():
+            return await _persist(conn)
+
+
+def _require_admin_config_for_schedule(user: Optional[dict]) -> None:
+    """Re-check ADMIN_CONFIG before a schedule_suggestion approval creates a schedule.
+
+    ``agents.action.approve`` is gated at ``DEPOT_MANAGE`` (operator+), but
+    creating a report schedule requires ``ADMIN_CONFIG`` (customer_admin+). Check
+    explicitly so an operator's approve returns a clear 403 instead of silently
+    creating a schedule with elevated rights (CLAUDE.md documents this gotcha).
+    """
+    role = get_user_role(user or {})
+    if not has_permission(role, Permission.ADMIN_CONFIG):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Approving an automation suggestion creates a scheduled report, "
+                "which requires admin:config (customer_admin or higher)."
+            ),
+        )
+
+
 async def _handle_report_schedule_create(
     params: dict, depot_id: str, dry_run: bool, user: Optional[dict] = None
 ) -> dict:
     """reports.schedule.create — params.input is a ScheduleCreatePayload."""
     try:
-        norm = normalize_create_payload(params.get("input"))
+        if dry_run:
+            normalize_create_payload(params.get("input"))  # validate only
+            return {"valid": True}
+        return await _create_report_schedule_from_input(
+            params.get("input"), depot_id, created_by=(user or {}).get("sub")
+        )
     except ScheduleValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if dry_run:
-        return {"valid": True}
-    if not db_pools:
-        raise DatabaseError("Database not available")
-    try:
-        next_run_at = await _resolve_schedule_next_run_at(depot_id, norm)
-    except ScheduleValidationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    created_by = (user or {}).get("sub")
-    async with db_pools.ts.acquire() as conn:
-        async with conn.transaction():
-            row = await _report_schedules.insert_schedule(
-                conn,
-                depot_id=depot_id,
-                norm=norm,
-                next_run_at=next_run_at,
-                created_by=created_by,
-            )
-            await _report_schedules.replace_recipients(conn, str(row["id"]), norm.recipients)
-            schedule = await _report_schedules.serialize_schedule(conn, depot_id, str(row["id"]))
-    return schedule  # type: ignore[return-value]
 
 
 async def _handle_report_schedule_update(

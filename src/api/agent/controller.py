@@ -48,6 +48,7 @@ from src.api.agent.audit import (
     write_agent_query_audit,
 )
 from src.api.agent.auth_context import ResolvedEntity, ResolvedTimeWindow, build_auth_context
+from src.api.agent.automation_suggestions import maybe_emit_automation_suggestion
 from src.api.agent.document_prompts import (
     build_document_fill_system_prompt,
     format_document_fill_user_message,
@@ -1195,7 +1196,6 @@ async def run_turn(
         reply = AgentReply.success(run_id=run_id, intent=plan.intent, text=text)
         await agent_runs_close(ts_pool, run_id, "success", reply)
         await _emit_answer_safe(sse, reply, run_id)
-        return reply
 
     except Exception as exc:
         # Stamp the row with status='error' on a best-effort basis so the
@@ -1211,6 +1211,22 @@ async def run_turn(
         except Exception:  # pragma: no cover - audit close is best-effort
             logger.exception("Failed to close agent_run %s in error state", run_id)
         raise
+
+    # Best-effort, post-reply: mine recent history and maybe propose a
+    # scheduled-report automation. Placed outside the main try/except (so a leak
+    # can't re-close the already-success run as error) AND wrapped in its own
+    # guard (so a leak can't 502 a turn the user already received).
+    try:
+        await maybe_emit_automation_suggestion(
+            ts_pool=ts_pool, auth=auth, token_payload=token_payload
+        )
+    except Exception:  # noqa: BLE001 - never let a post-success hook fail the turn
+        logger.warning(
+            "automation suggestion hook raised post-success (run_id=%s)",
+            run_id,
+            exc_info=True,
+        )
+    return reply
 
 
 # ── SQL-mode (general analytics) sub-orchestrator ──────────────────────────
@@ -2045,8 +2061,16 @@ async def _run_document_fill_turn(
     if notes:
         answer_text = (answer_text + "\n\n" + " ".join(notes)).strip()
 
+    # A finalize turn always attempts a render, so output_id is None here only
+    # when that render raised — there is no downloadable result.
+    finalize_failed = mode == "finalize" and output_id is None
     if mode == "ask":
         reply_text = answer_text or "I have a few questions before I finish."
+    elif finalize_failed:
+        reply_text = answer_text or (
+            "I couldn't generate the final document this time. Tell me to finalize "
+            "again, or adjust what you'd like changed and we'll retry."
+        )
     else:
         reply_text = answer_text or "I've updated the document — download it below."
 
@@ -2061,7 +2085,14 @@ async def _run_document_fill_turn(
     latest_output = output_id or (
         UUID(str(session["latest_output_id"])) if session.get("latest_output_id") else None
     )
-    session_status = "awaiting_input" if mode == "ask" else "finalized"
+    # Only mark the session 'finalized' when a finalize turn actually produced a
+    # document. A failed finalize render keeps the session 'awaiting_input' so the
+    # user can retry — otherwise the finalized-guard would lock the session with
+    # nothing to download (Bugbot high-sev).
+    if mode == "ask" or finalize_failed:
+        session_status = "awaiting_input"
+    else:
+        session_status = "finalized"
     await document_store.update_session(
         ts_pool,
         session_id,
@@ -2071,17 +2102,19 @@ async def _run_document_fill_turn(
         latest_output_id=latest_output,
     )
 
-    if mode == "ask":
+    if mode == "finalize" and not finalize_failed:
+        reply = AgentReply.document_ready(
+            run_id=run_id, session_id=session_id, text=reply_text, download=download
+        )
+    else:
+        # ask, OR a finalize whose render failed — the session stays open so the
+        # client knows it isn't done and can retry.
         reply = AgentReply.needs_input(
             run_id=run_id,
             session_id=session_id,
             text=reply_text,
             questions=questions,
             download=download,
-        )
-    else:
-        reply = AgentReply.document_ready(
-            run_id=run_id, session_id=session_id, text=reply_text, download=download
         )
 
     # The per-turn agent_runs row closes 'success' for both ask and finalize
