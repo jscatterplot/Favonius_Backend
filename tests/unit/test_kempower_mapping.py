@@ -172,6 +172,58 @@ def test_station_validation_error_on_zero_kw():
         )
 
 
+def test_station_handles_non_numeric_connector_ids():
+    # ConnectorInfo.connectorId is a string per the OpenAPI spec; the
+    # official example for ``GET /stations`` uses ``"charger1_connector2"``.
+    # The mapper must not crash on int() — it should fall back to
+    # position-based 1..N ids.
+    payload = kempower_station_to_charger_request(
+        {
+            "stationId": "X-6",
+            "name": "Trolley",
+            "maxPowerKw": 200,
+            "connectors": [
+                {"connectorId": "charger1_connector1", "type": "CCS", "maxPowerKw": 200},
+                {"connectorId": "charger1_connector2", "type": "CCS", "maxPowerKw": 200},
+            ],
+        }
+    )
+    assert payload.connector_ids == [1, 2]
+    assert payload.connector_count == 2
+
+
+def test_station_falls_back_to_connector_sum_when_station_maxpower_zero():
+    # StationInfo.maxPowerKw is documented "undefined if not known" and the
+    # official example shows 0 for many stations. ConnectorInfo.maxPowerKw
+    # is required, so we can recover a meaningful rated_kw from the sum.
+    payload = kempower_station_to_charger_request(
+        {
+            "stationId": "X-7",
+            "name": "ChargEye 2x150",
+            "maxPowerKw": 0,
+            "connectors": [
+                {"connectorId": 1, "type": "CCS", "maxPowerKw": 150},
+                {"connectorId": 2, "type": "CCS", "maxPowerKw": 150},
+            ],
+        }
+    )
+    assert payload.rated_kw == 300.0
+
+
+def test_station_falls_back_to_connector_sum_when_station_maxpower_missing():
+    # Same fallback when the field is absent entirely (per spec, it's optional).
+    payload = kempower_station_to_charger_request(
+        {
+            "stationId": "X-8",
+            "name": "ChargEye solo",
+            "connectors": [
+                {"connectorId": 1, "type": "CCS", "maxPowerKw": 200},
+            ],
+        }
+    )
+    assert payload.rated_kw == 200.0
+
+
 # ---------------------------------------------------------------------------
 # Vehicles
 # ---------------------------------------------------------------------------
