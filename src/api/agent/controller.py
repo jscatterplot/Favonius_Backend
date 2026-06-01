@@ -47,6 +47,7 @@ from src.api.agent.audit import (
     write_agent_query_audit,
 )
 from src.api.agent.auth_context import ResolvedEntity, ResolvedTimeWindow, build_auth_context
+from src.api.agent.automation_suggestions import maybe_emit_automation_suggestion
 from src.api.agent.intents.consumption_by_user import (
     compile_consumption_by_user,
     summarize_consumption_rows,
@@ -1089,7 +1090,6 @@ async def run_turn(
         reply = AgentReply.success(run_id=run_id, intent=plan.intent, text=text)
         await agent_runs_close(ts_pool, run_id, "success", reply)
         await _emit_answer_safe(sse, reply, run_id)
-        return reply
 
     except Exception as exc:
         # Stamp the row with status='error' on a best-effort basis so the
@@ -1105,6 +1105,22 @@ async def run_turn(
         except Exception:  # pragma: no cover - audit close is best-effort
             logger.exception("Failed to close agent_run %s in error state", run_id)
         raise
+
+    # Best-effort, post-reply: mine recent history and maybe propose a
+    # scheduled-report automation. Placed outside the main try/except (so a leak
+    # can't re-close the already-success run as error) AND wrapped in its own
+    # guard (so a leak can't 502 a turn the user already received).
+    try:
+        await maybe_emit_automation_suggestion(
+            ts_pool=ts_pool, auth=auth, token_payload=token_payload
+        )
+    except Exception:  # noqa: BLE001 - never let a post-success hook fail the turn
+        logger.warning(
+            "automation suggestion hook raised post-success (run_id=%s)",
+            run_id,
+            exc_info=True,
+        )
+    return reply
 
 
 # ── SQL-mode (general analytics) sub-orchestrator ──────────────────────────
