@@ -8913,9 +8913,9 @@ async def _build_data_graph(depot_id: str) -> DataGraphResponse:
         def _charger_faulted(station_id: str) -> bool:
             entry = connector_statuses.get(station_id)
             if entry is None:
-                return True
+                return False
             status = entry.get("ocpp_status")
-            return status is None or status in ("Faulted", "Unavailable")
+            return status in ("Faulted", "Unavailable")
 
         faulted = sum(1 for sid in station_ids if _charger_faulted(sid))
         total = len(station_ids)
@@ -8958,7 +8958,7 @@ async def _build_data_graph(depot_id: str) -> DataGraphResponse:
                 entsoe_desc = (
                     f"Price data is {int(age_h)}h old — optimization may use stale costs"
                 )
-            elif age_h > 25:
+            elif age_h >= 25:
                 entsoe_status = "warn"
                 entsoe_desc = f"Price data is {int(age_h)}h old"
             else:
@@ -9057,7 +9057,7 @@ async def _build_data_graph(depot_id: str) -> DataGraphResponse:
             if age_m > 60:
                 nav_status = "danger"
                 nav_desc = f"Vehicle telemetry is {int(age_m)}min old"
-            elif age_m > 15:
+            elif age_m >= 15:
                 nav_status = "warn"
                 nav_desc = f"Vehicle telemetry is {int(age_m)}min old"
             else:
@@ -9129,6 +9129,8 @@ async def get_depot_data_graph(
     except asyncpg.PostgresError as e:
         logger.error("Database error in data-graph for %s: %s", depot_id, e, exc_info=True)
         raise DatabaseError() from e
+    except DatabaseError:
+        raise
     except Exception as e:
         logger.error("Failed to build data-graph for %s: %s", depot_id, e, exc_info=True)
         raise HTTPException(
