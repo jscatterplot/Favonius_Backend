@@ -9529,7 +9529,14 @@ async def get_depot_vehicles(
             next_departures: dict[str, dict] = {}
             active_schedules: dict[str, dict] = {}
             if vehicle_ids:
-                async with db_pools.ts.acquire() as ts_conn:
+                # ``schedules`` is a Supabase static table (CLAUDE.md two-DB
+                # invariant); ``telemetry`` and ``charging_sessions`` live on
+                # TimescaleDB. Each query has to go to the right pool, so
+                # acquire both connections up front and dispatch accordingly.
+                async with (
+                    db_pools.ts.acquire() as ts_conn,
+                    db_pools.static.acquire() as schedules_conn,
+                ):
                     telemetry = await _safe_runtime_fetch(
                         lambda: db_queries.latest_telemetry_by_vehicles(ts_conn, vehicle_ids),
                         label="vehicle telemetry",
@@ -9539,11 +9546,15 @@ async def get_depot_vehicles(
                         label="vehicle open sessions",
                     )
                     next_departures = await _safe_runtime_fetch(
-                        lambda: db_queries.next_departures_by_vehicles(ts_conn, vehicle_ids),
+                        lambda: db_queries.next_departures_by_vehicles(
+                            schedules_conn, vehicle_ids
+                        ),
                         label="vehicle next departures",
                     )
                     active_schedules = await _safe_runtime_fetch(
-                        lambda: db_queries.active_schedule_by_vehicles(ts_conn, vehicle_ids),
+                        lambda: db_queries.active_schedule_by_vehicles(
+                            schedules_conn, vehicle_ids
+                        ),
                         label="vehicle active schedules",
                     )
 

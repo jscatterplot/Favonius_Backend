@@ -104,6 +104,13 @@ def _connection_wire(rec: asyncpg.Record) -> dict[str, Any]:
 def _job_wire(rec: asyncpg.Record) -> dict[str, Any]:
     d = dict(rec)
     d["progress"] = _as_dict(d.get("progress"))
+    # The frontend's Zod schema for job status uses ``queued`` for the
+    # not-yet-claimed state; the DB CHECK constraint (mig supabase/043)
+    # uses ``pending``. Translate at the wire boundary so we don't have
+    # to migrate the column type / rewrite every WHERE clause in
+    # repository.py for a pure naming preference.
+    if d.get("status") == "pending":
+        d["status"] = "queued"
     return d
 
 
