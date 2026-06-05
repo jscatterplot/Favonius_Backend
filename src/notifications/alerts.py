@@ -202,6 +202,30 @@ async def mark_notified(conn: Any, alert_id: UUID) -> int:
     return int(new_count)
 
 
+async def list_active_by_types(
+    conn: Any, alert_types: Sequence[str]
+) -> list[Alert]:
+    """Return non-resolved alerts whose ``alert_type`` is in ``alert_types``.
+
+    Used by app-side producers that own a family of alert types (e.g. the
+    offline-charger monitor's ``charger_offline_3h`` / ``charger_offline_24h``)
+    to find the rows they previously raised, so they can resolve the ones whose
+    underlying condition has cleared.
+    """
+    cols = await _alert_select_columns(conn)
+    rows = await conn.fetch(
+        f"""
+        SELECT {cols}
+          FROM notification_alerts
+         WHERE status != 'resolved'
+           AND alert_type = ANY($1::text[])
+         ORDER BY last_occurrence_at DESC
+        """,
+        list(alert_types),
+    )
+    return [Alert.from_record(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # API queries
 # ---------------------------------------------------------------------------
@@ -626,6 +650,7 @@ __all__ = [
     "reset_column_probe",
     "claim_pending_alerts",
     "mark_notified",
+    "list_active_by_types",
     "list_for_depot",
     "list_for_org",
     "get_by_id",

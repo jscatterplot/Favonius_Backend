@@ -67,6 +67,7 @@ class Application:
         self.queue_consumer: Optional[ChargingCommandQueueConsumer] = None
         self._active_tx_reconciler_task: Optional[asyncio.Task] = None
         self._orphan_recovery_task: Optional[asyncio.Task] = None
+        self._offline_monitor_task: Optional[asyncio.Task] = None
 
         # Alerts pipeline (see docs/plans/alerts-pipeline.md). Optional —
         # disabled by default in test envs without a Resend key.
@@ -180,6 +181,14 @@ class Application:
             # are enabled; the migration 022 trigger already produces
             # notification_alerts rows independently.
             await self._initialize_alert_dispatcher()
+
+            # Charger offline-duration monitor: warns after 3h and escalates
+            # after 24h of lost connection. DB-derived from connector_status so
+            # the offline window survives handler restarts; produces alerts that
+            # the dispatcher above delivers.
+            self._offline_monitor_task = asyncio.create_task(
+                self._offline_monitor_loop(), name="offline_charger_monitor"
+            )
 
             # Start WebSocket server
             self.running = True
@@ -411,6 +420,66 @@ class Application:
             except asyncio.CancelledError:
                 raise
 
+    async def _offline_monitor_loop(self) -> None:
+        """Warn when a charger has been disconnected too long.
+
+        DB-derived from ``connector_status`` (the WS close hook marks every
+        connector ``Unavailable/ConnectionLost`` on a drop), so the offline
+        window survives handler restarts. Two escalations, both auto-resolve on
+        reconnect; delivery is handled by the AlertDispatcher.
+
+          * ``CHARGER_OFFLINE_MONITOR_ENABLED`` (default "true") — master switch.
+          * ``CHARGER_OFFLINE_MONITOR_INTERVAL_S`` (default 300s / 5 min) — cadence.
+          * ``CHARGER_OFFLINE_WARN_AFTER_S`` (default 10800s / 3 h) — warning tier.
+          * ``CHARGER_OFFLINE_ESCALATE_AFTER_S`` (default 86400s / 24 h) — critical tier.
+
+        Best-effort housekeeping; errors are caught and never propagate.
+        """
+        import os
+
+        from src.websocket_handler.offline_monitor import OfflineChargerMonitor
+
+        if os.environ.get("CHARGER_OFFLINE_MONITOR_ENABLED", "true").lower() != "true":
+            self.logger.info(
+                "offline_charger_monitor: disabled (CHARGER_OFFLINE_MONITOR_ENABLED=false)"
+            )
+            return
+        if not self.timescale_client or not self.timescale_client.pg_pool:
+            self.logger.warning(
+                "offline_charger_monitor: not started; timescale pg_pool unavailable"
+            )
+            return
+
+        interval = int(os.environ.get("CHARGER_OFFLINE_MONITOR_INTERVAL_S", "300"))
+        warn_after = int(os.environ.get("CHARGER_OFFLINE_WARN_AFTER_S", "10800"))
+        escalate_after = int(os.environ.get("CHARGER_OFFLINE_ESCALATE_AFTER_S", "86400"))
+
+        monitor = OfflineChargerMonitor(
+            pool=self.timescale_client.pg_pool,
+            warn_after_s=warn_after,
+            escalate_after_s=escalate_after,
+            logger=self.logger,
+        )
+
+        # Short initial delay so a freshly-started handler doesn't alert on
+        # chargers that are mid-reconnect during startup — but short enough
+        # that an already-long outage (the rows persist across restarts) is
+        # still reported promptly.
+        try:
+            await asyncio.sleep(min(interval, 60))
+        except asyncio.CancelledError:
+            return
+
+        while self.running:
+            try:
+                await monitor.run_once()
+            except Exception as exc:
+                self.logger.error("offline_charger_monitor sweep failed: %s", exc)
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
+
     async def _active_tx_reconciler(self) -> None:
         """Refresh the ``active_transactions`` gauge from DB every 30 s.
 
@@ -465,6 +534,9 @@ class Application:
         if self._orphan_recovery_task:
             self._orphan_recovery_task.cancel()
             stop_tasks.append(self._orphan_recovery_task)
+        if self._offline_monitor_task:
+            self._offline_monitor_task.cancel()
+            stop_tasks.append(self._offline_monitor_task)
 
         # Stop alert dispatcher before tearing down the DB pool.
         if self.alert_dispatcher:

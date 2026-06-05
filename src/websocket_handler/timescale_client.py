@@ -3072,15 +3072,24 @@ class TimescaleClient:
         we have seen recently rather than UPDATE-in-place. If we have no prior
         rows for the station (a station that never sent StatusNotification),
         this is a no-op — there is nothing meaningful to mark Unavailable.
+
+        The marker row carries ``organization_id`` / ``depot_id`` forward from
+        the most recent prior row per connector, so the migration-022
+        ``fn_alerts_on_connector_status`` trigger fires a ``charger_fault``
+        alert on the drop (it bails when those are NULL — which is why WS-drop
+        disconnects produced no alert before). Reconnect appends an
+        ``Available`` row and the trigger resolves the alert.
         """
         async with self.pg_pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO connector_status (
-                    station_id, connector_id, status, error_code, timestamp
+                    station_id, connector_id, status, error_code, timestamp,
+                    organization_id, depot_id
                 )
                 SELECT DISTINCT ON (connector_id)
-                       station_id, connector_id, 'Unavailable', 'ConnectionLost', NOW()
+                       station_id, connector_id, 'Unavailable', 'ConnectionLost', NOW(),
+                       organization_id, depot_id
                   FROM connector_status
                  WHERE station_id = $1
                  ORDER BY connector_id, timestamp DESC
@@ -3119,15 +3128,18 @@ class TimescaleClient:
                 """
                 WITH latest AS (
                     SELECT DISTINCT ON (connector_id)
-                           station_id, connector_id, status, error_code
+                           station_id, connector_id, status, error_code,
+                           organization_id, depot_id
                       FROM connector_status
                      WHERE station_id = $1
                      ORDER BY connector_id, timestamp DESC
                 )
                 INSERT INTO connector_status (
-                    station_id, connector_id, status, error_code, timestamp
+                    station_id, connector_id, status, error_code, timestamp,
+                    organization_id, depot_id
                 )
-                SELECT station_id, connector_id, 'Available', NULL, NOW()
+                SELECT station_id, connector_id, 'Available', NULL, NOW(),
+                       organization_id, depot_id
                   FROM latest
                  WHERE status = 'Unavailable'
                    AND error_code = 'ConnectionLost'
