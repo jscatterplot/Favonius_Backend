@@ -437,6 +437,7 @@ class Application:
         """
         import os
 
+        from .config import _parse_int_env
         from src.websocket_handler.offline_monitor import OfflineChargerMonitor
 
         if os.environ.get("CHARGER_OFFLINE_MONITOR_ENABLED", "true").lower() != "true":
@@ -450,9 +451,9 @@ class Application:
             )
             return
 
-        interval = int(os.environ.get("CHARGER_OFFLINE_MONITOR_INTERVAL_S", "300"))
-        warn_after = int(os.environ.get("CHARGER_OFFLINE_WARN_AFTER_S", "10800"))
-        escalate_after = int(os.environ.get("CHARGER_OFFLINE_ESCALATE_AFTER_S", "86400"))
+        interval = _parse_int_env("CHARGER_OFFLINE_MONITOR_INTERVAL_S", default=300)
+        warn_after = _parse_int_env("CHARGER_OFFLINE_WARN_AFTER_S", default=10800)
+        escalate_after = _parse_int_env("CHARGER_OFFLINE_ESCALATE_AFTER_S", default=86400)
 
         monitor = OfflineChargerMonitor(
             pool=self.timescale_client.pg_pool,
