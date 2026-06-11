@@ -178,6 +178,23 @@ class TestPlanSweepResolve:
         plan = _plan([_charger("ST1", hours_offline=10, organization_id=org)], active)
         assert plan.resolves == []
 
+    def test_station_changed_tenant_resolves_former_org(self):
+        # ST1 now breaches under new_org, but the former org still holds an
+        # active alert for the same station — it must resolve (breach sets are
+        # keyed by (org, station), not station alone).
+        old_org, new_org = uuid4(), uuid4()
+        plan = _plan(
+            [_charger("ST1", hours_offline=5, organization_id=new_org)],
+            [_active(ALERT_TYPE_3H, "ST1", old_org)],
+        )
+        assert [(r.organization_id, r.dedup_key) for r in plan.resolves] == [
+            (old_org, "charger_offline_3h:ST1")
+        ]
+        assert any(
+            u.alert_type == ALERT_TYPE_3H and u.organization_id == new_org
+            for u in plan.upserts
+        )
+
 
 # ---------------------------------------------------------------------------
 # fetch_offline_chargers — SQL contract
@@ -218,6 +235,8 @@ class TestFetchOfflineChargers:
         assert "'ConnectionLost'" in sql
         assert "EXTRACT(EPOCH FROM (NOW() - l.timestamp))" in sql
         assert "offline_seconds" in sql
+        # Ordered by the server ingestion clock, not the charger timestamp.
+        assert "created_at DESC" in sql
         assert threshold == pytest.approx(float(WARN_AFTER_S))
 
     @pytest.mark.asyncio
@@ -243,6 +262,11 @@ def _monitor_with_fakes(monkeypatch, *, offline, active):
     monkeypatch.setattr(mod, "list_active_by_types", listing)
     monkeypatch.setattr(mod, "upsert_alert", upsert)
     monkeypatch.setattr(mod, "resolve_alert", resolve)
+    # Default TOCTOU re-check: every planned station is still offline (no
+    # suppression). Individual tests override to simulate a mid-sweep reconnect.
+    monkeypatch.setattr(
+        mod, "_stations_still_offline", AsyncMock(side_effect=lambda _conn, ids: set(ids))
+    )
 
     pool = MagicMock()
     conn = AsyncMock()
@@ -297,3 +321,22 @@ class TestRunOnce:
         resolve.assert_awaited_once()
         assert resolve.await_args.kwargs["dedup_key"] == "charger_offline_3h:ST1"
         assert resolve.await_args.kwargs["organization_id"] == org
+
+    @pytest.mark.asyncio
+    async def test_suppresses_upsert_when_charger_reconnects_before_apply(self, monkeypatch):
+        import src.websocket_handler.offline_monitor as mod
+
+        org = uuid4()
+        monitor, _fetch, _listing, upsert, resolve = _monitor_with_fakes(
+            monkeypatch,
+            offline=[_charger("ST1", hours_offline=25, organization_id=org)],
+            active=[],
+        )
+        # Reconnected between the planning fetch and the apply re-check.
+        monkeypatch.setattr(mod, "_stations_still_offline", AsyncMock(return_value=set()))
+
+        plan = await monitor.run_once()
+
+        assert len(plan.upserts) == 2  # planned (3h + 24h)
+        upsert.assert_not_awaited()  # but suppressed at apply time
+        resolve.assert_not_awaited()

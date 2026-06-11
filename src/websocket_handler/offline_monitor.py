@@ -65,6 +65,7 @@ class OfflineCharger:
 
 @dataclass(frozen=True)
 class PlannedUpsert:
+    station_id: str
     organization_id: UUID
     depot_id: Optional[UUID]
     alert_type: str
@@ -126,6 +127,7 @@ def _build_upsert(
     # organization_id is guaranteed non-None by the caller (None ones are skipped).
     assert charger.organization_id is not None
     return PlannedUpsert(
+        station_id=charger.station_id,
         organization_id=charger.organization_id,
         depot_id=charger.depot_id,
         alert_type=alert_type,
@@ -171,17 +173,23 @@ def plan_sweep(
     * Chargers with no resolvable tenant (organization_id) are skipped — we
       cannot scope an alert to an org. Mirrors the migration-022 trigger, which
       bails when ``organization_id IS NULL``.
+
+    Breach sets are keyed by ``(organization_id, station_id)``, not the station
+    alone: ``active`` spans all orgs, so if a station changed tenants between
+    outages the former org's alert must still resolve even though the same
+    station is now breaching under a new org.
     """
     plan = SweepPlan()
-    breach_3h: set[str] = set()
-    breach_24h: set[str] = set()
+    breach_3h: set[tuple[UUID, str]] = set()
+    breach_24h: set[tuple[UUID, str]] = set()
 
     for charger in offline:
         if charger.organization_id is None:
             plan.skipped_no_tenant.append(charger.station_id)
             continue
+        key = (charger.organization_id, charger.station_id)
         if charger.offline_seconds >= escalate_after_s:
-            breach_24h.add(charger.station_id)
+            breach_24h.add(key)
             plan.upserts.append(
                 _build_upsert(
                     charger,
@@ -191,7 +199,7 @@ def plan_sweep(
                 )
             )
         if charger.offline_seconds >= warn_after_s:
-            breach_3h.add(charger.station_id)
+            breach_3h.add(key)
             plan.upserts.append(
                 _build_upsert(
                     charger,
@@ -202,10 +210,10 @@ def plan_sweep(
             )
 
     for alert in active:
-        station = _station_of(alert)
-        if alert.alert_type == ALERT_TYPE_3H and station not in breach_3h:
+        key = (alert.organization_id, _station_of(alert))
+        if alert.alert_type == ALERT_TYPE_3H and key not in breach_3h:
             plan.resolves.append(PlannedResolve(alert.organization_id, alert.dedup_key))
-        elif alert.alert_type == ALERT_TYPE_24H and station not in breach_24h:
+        elif alert.alert_type == ALERT_TYPE_24H and key not in breach_24h:
             plan.resolves.append(PlannedResolve(alert.organization_id, alert.dedup_key))
 
     return plan
@@ -222,13 +230,19 @@ async def fetch_offline_chargers(
     """Return chargers whose latest ``connector_status`` row is a stale disconnect.
 
     A charger is "offline" when its most-recent row (across connectors) is the
-    close hook's ``(Unavailable, 'ConnectionLost')`` marker. ``offline_seconds``
-    is computed with the DB clock (single source of truth, no app/DB skew).
+    close hook's ``(Unavailable, 'ConnectionLost')`` marker.
+
+    "Most recent" is ordered by the server ``created_at`` (ingestion order,
+    migration 048), NOT the charger-supplied ``timestamp`` — a charger with a
+    future-dated clock could otherwise have a stale status outrank the server's
+    ConnectionLost marker and hide the outage. The reported duration still uses
+    the marker's ``timestamp`` (the server writes it as NOW() on the drop), so a
+    genuinely old marker reports its true age even right after a deploy.
 
     Tenant context is read from that row (populated by
-    ``mark_connectors_unavailable`` since the org-stamp fix); for rows written
-    before that fix it falls back to the most recent tenant-stamped row for the
-    same station. Stations that never carried tenant context come back with
+    ``mark_connectors_unavailable``); for rows written before tenant context was
+    resolved it falls back to the most recent tenant-stamped row for the same
+    station. Stations that never carried tenant context come back with
     ``organization_id = None`` and are skipped by ``plan_sweep``.
     """
     rows = await conn.fetch(
@@ -238,14 +252,14 @@ async def fetch_offline_chargers(
                    station_id, status, error_code, timestamp,
                    organization_id, depot_id
               FROM connector_status
-             ORDER BY station_id, timestamp DESC
+             ORDER BY station_id, created_at DESC, timestamp DESC
         ),
         tenant AS (
             SELECT DISTINCT ON (station_id)
                    station_id, organization_id, depot_id
               FROM connector_status
              WHERE organization_id IS NOT NULL
-             ORDER BY station_id, timestamp DESC
+             ORDER BY station_id, created_at DESC, timestamp DESC
         )
         SELECT l.station_id,
                l.timestamp AS offline_since,
@@ -272,6 +286,31 @@ async def fetch_offline_chargers(
         )
         for r in rows
     ]
+
+
+async def _stations_still_offline(conn: Any, station_ids: set[str]) -> set[str]:
+    """Of ``station_ids``, those whose current latest status is still a disconnect.
+
+    Bounded to the just-planned stations so the ``run_once`` TOCTOU re-check
+    stays cheap. Same server ``created_at`` ordering as ``fetch_offline_chargers``
+    so a reconnect (``Available`` row) appended after the planning fetch is seen.
+    """
+    if not station_ids:
+        return set()
+    rows = await conn.fetch(
+        """
+        SELECT DISTINCT ON (station_id) station_id, status, error_code
+          FROM connector_status
+         WHERE station_id = ANY($1::text[])
+         ORDER BY station_id, created_at DESC, timestamp DESC
+        """,
+        list(station_ids),
+    )
+    return {
+        r["station_id"]
+        for r in rows
+        if r["status"] == "Unavailable" and r["error_code"] == "ConnectionLost"
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +357,21 @@ class OfflineChargerMonitor:
                 warn_after_s=self._warn_after_s,
                 escalate_after_s=self._escalate_after_s,
             )
-            for up in plan.upserts:
+
+            # TOCTOU guard: a charger can reconnect between the fetch above and
+            # these writes. Re-check the planned stations' current state so we
+            # don't raise an offline alert for one that just came back (the
+            # dispatcher could deliver it before the next sweep resolves it).
+            # Bounded to the planned stations, so it stays cheap. Resolves are
+            # always safe to apply, so they are not gated.
+            upserts = plan.upserts
+            if upserts:
+                still_offline = await _stations_still_offline(
+                    conn, {u.station_id for u in upserts}
+                )
+                upserts = [u for u in upserts if u.station_id in still_offline]
+
+            for up in upserts:
                 await upsert_alert(
                     conn,
                     organization_id=up.organization_id,
@@ -338,8 +391,9 @@ class OfflineChargerMonitor:
 
         if plan.upserts or plan.resolves or plan.skipped_no_tenant:
             self._logger.info(
-                "offline_charger_monitor: %d alert(s) raised/escalated, "
-                "%d resolved, %d skipped (no tenant)",
+                "offline_charger_monitor: %d alert(s) raised/escalated "
+                "(%d planned), %d resolved, %d skipped (no tenant)",
+                len(upserts),
                 len(plan.upserts),
                 len(plan.resolves),
                 len(plan.skipped_no_tenant),

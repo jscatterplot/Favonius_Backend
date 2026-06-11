@@ -3073,26 +3073,45 @@ class TimescaleClient:
         rows for the station (a station that never sent StatusNotification),
         this is a no-op — there is nothing meaningful to mark Unavailable.
 
-        The marker row carries ``organization_id`` / ``depot_id`` forward from
-        the most recent prior row per connector, so the migration-022
-        ``fn_alerts_on_connector_status`` trigger fires a ``charger_fault``
-        alert on the drop (it bails when those are NULL — which is why WS-drop
-        disconnects produced no alert before). Reconnect appends an
+        The marker row resolves ``organization_id`` / ``depot_id`` from the
+        most recent *tenant-stamped* row for the station (falling back across
+        connectors), so the migration-022 ``fn_alerts_on_connector_status``
+        trigger fires a ``charger_fault`` alert on the drop (it bails when those
+        are NULL — which is why WS-drop disconnects produced no alert before).
+        Resolving from any tenant-stamped row, not just the latest per
+        connector, means a transient NULL row (e.g. a boot before tenant
+        context resolved) does not blank the marker. Reconnect appends an
         ``Available`` row and the trigger resolves the alert.
+
+        NOTE: an OCPP charger whose status-write path never stamps tenant
+        context (e.g. the legacy 2.0 ``EnhancedOCPPChargePoint``) leaves every
+        connector_status row NULL, so there is nothing to resolve here and the
+        drop still raises no alert — that path must stamp org/depot the way
+        ``OCPP16Session._on_status_change`` does.
         """
         async with self.pg_pool.acquire() as conn:
             await conn.execute(
                 """
+                WITH tenant AS (
+                    SELECT DISTINCT ON (station_id)
+                           station_id, organization_id, depot_id
+                      FROM connector_status
+                     WHERE station_id = $1 AND organization_id IS NOT NULL
+                     ORDER BY station_id, created_at DESC, timestamp DESC
+                )
                 INSERT INTO connector_status (
                     station_id, connector_id, status, error_code, timestamp,
                     organization_id, depot_id
                 )
-                SELECT DISTINCT ON (connector_id)
-                       station_id, connector_id, 'Unavailable', 'ConnectionLost', NOW(),
-                       organization_id, depot_id
-                  FROM connector_status
-                 WHERE station_id = $1
-                 ORDER BY connector_id, timestamp DESC
+                SELECT DISTINCT ON (cs.connector_id)
+                       cs.station_id, cs.connector_id, 'Unavailable',
+                       'ConnectionLost', NOW(),
+                       COALESCE(cs.organization_id, t.organization_id),
+                       COALESCE(cs.depot_id, t.depot_id)
+                  FROM connector_status cs
+                  LEFT JOIN tenant t ON t.station_id = cs.station_id
+                 WHERE cs.station_id = $1
+                 ORDER BY cs.connector_id, cs.created_at DESC, cs.timestamp DESC
                 """,
                 station_id,
             )
@@ -3126,23 +3145,32 @@ class TimescaleClient:
         async with self.pg_pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                WITH latest AS (
+                WITH tenant AS (
+                    SELECT DISTINCT ON (station_id)
+                           station_id, organization_id, depot_id
+                      FROM connector_status
+                     WHERE station_id = $1 AND organization_id IS NOT NULL
+                     ORDER BY station_id, created_at DESC, timestamp DESC
+                ),
+                latest AS (
                     SELECT DISTINCT ON (connector_id)
                            station_id, connector_id, status, error_code,
                            organization_id, depot_id
                       FROM connector_status
                      WHERE station_id = $1
-                     ORDER BY connector_id, timestamp DESC
+                     ORDER BY connector_id, created_at DESC, timestamp DESC
                 )
                 INSERT INTO connector_status (
                     station_id, connector_id, status, error_code, timestamp,
                     organization_id, depot_id
                 )
-                SELECT station_id, connector_id, 'Available', NULL, NOW(),
-                       organization_id, depot_id
-                  FROM latest
-                 WHERE status = 'Unavailable'
-                   AND error_code = 'ConnectionLost'
+                SELECT l.station_id, l.connector_id, 'Available', NULL, NOW(),
+                       COALESCE(l.organization_id, t.organization_id),
+                       COALESCE(l.depot_id, t.depot_id)
+                  FROM latest l
+                  LEFT JOIN tenant t ON t.station_id = l.station_id
+                 WHERE l.status = 'Unavailable'
+                   AND l.error_code = 'ConnectionLost'
                 RETURNING connector_id
                 """,
                 station_id,
