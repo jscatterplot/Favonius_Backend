@@ -252,16 +252,16 @@ async def fetch_offline_chargers(
                    station_id, status, error_code, timestamp,
                    organization_id, depot_id
               FROM connector_status
-             ORDER BY station_id, created_at DESC,
-                      (timestamp > NOW()) ASC, timestamp DESC
+             ORDER BY station_id, (timestamp > NOW()) ASC,
+                      created_at DESC, timestamp DESC
         ),
         tenant AS (
             SELECT DISTINCT ON (station_id)
                    station_id, organization_id, depot_id
               FROM connector_status
              WHERE organization_id IS NOT NULL
-             ORDER BY station_id, created_at DESC,
-                      (timestamp > NOW()) ASC, timestamp DESC
+             ORDER BY station_id, (timestamp > NOW()) ASC,
+                      created_at DESC, timestamp DESC
         )
         SELECT l.station_id,
                l.timestamp AS offline_since,
@@ -304,8 +304,8 @@ async def _stations_still_offline(conn: Any, station_ids: set[str]) -> set[str]:
         SELECT DISTINCT ON (station_id) station_id, status, error_code
           FROM connector_status
          WHERE station_id = ANY($1::text[])
-         ORDER BY station_id, created_at DESC,
-                  (timestamp > NOW()) ASC, timestamp DESC
+         ORDER BY station_id, (timestamp > NOW()) ASC,
+                  created_at DESC, timestamp DESC
         """,
         list(station_ids),
     )
