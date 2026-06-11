@@ -252,14 +252,16 @@ async def fetch_offline_chargers(
                    station_id, status, error_code, timestamp,
                    organization_id, depot_id
               FROM connector_status
-             ORDER BY station_id, created_at DESC, timestamp DESC
+             ORDER BY station_id, created_at DESC,
+                      (timestamp > NOW()) ASC, timestamp DESC
         ),
         tenant AS (
             SELECT DISTINCT ON (station_id)
                    station_id, organization_id, depot_id
               FROM connector_status
              WHERE organization_id IS NOT NULL
-             ORDER BY station_id, created_at DESC, timestamp DESC
+             ORDER BY station_id, created_at DESC,
+                      (timestamp > NOW()) ASC, timestamp DESC
         )
         SELECT l.station_id,
                l.timestamp AS offline_since,
@@ -302,7 +304,8 @@ async def _stations_still_offline(conn: Any, station_ids: set[str]) -> set[str]:
         SELECT DISTINCT ON (station_id) station_id, status, error_code
           FROM connector_status
          WHERE station_id = ANY($1::text[])
-         ORDER BY station_id, created_at DESC, timestamp DESC
+         ORDER BY station_id, created_at DESC,
+                  (timestamp > NOW()) ASC, timestamp DESC
         """,
         list(station_ids),
     )
@@ -362,14 +365,32 @@ class OfflineChargerMonitor:
             # these writes. Re-check the planned stations' current state so we
             # don't raise an offline alert for one that just came back (the
             # dispatcher could deliver it before the next sweep resolves it).
-            # Bounded to the planned stations, so it stays cheap. Resolves are
-            # always safe to apply, so they are not gated.
+            # Bounded to the planned stations, so it stays cheap. When a
+            # reconnect suppresses upserts, also resolve any active offline
+            # alerts for that station in the same pass — the planning fetch still
+            # saw it as offline so ``plan.resolves`` would be empty.
             upserts = plan.upserts
+            reconnected: set[str] = set()
             if upserts:
-                still_offline = await _stations_still_offline(
-                    conn, {u.station_id for u in upserts}
-                )
+                planned = {u.station_id for u in upserts}
+                still_offline = await _stations_still_offline(conn, planned)
+                reconnected = planned - still_offline
                 upserts = [u for u in upserts if u.station_id in still_offline]
+
+            resolves = list(plan.resolves)
+            if reconnected:
+                seen_dedup = {r.dedup_key for r in resolves}
+                for alert in active:
+                    station = _station_of(alert)
+                    if (
+                        station in reconnected
+                        and alert.alert_type in OFFLINE_ALERT_TYPES
+                        and alert.dedup_key not in seen_dedup
+                    ):
+                        resolves.append(
+                            PlannedResolve(alert.organization_id, alert.dedup_key)
+                        )
+                        seen_dedup.add(alert.dedup_key)
 
             for up in upserts:
                 await upsert_alert(
@@ -382,20 +403,20 @@ class OfflineChargerMonitor:
                     detail=up.detail,
                     dedup_key=up.dedup_key,
                 )
-            for rs in plan.resolves:
+            for rs in resolves:
                 await resolve_alert(
                     conn,
                     organization_id=rs.organization_id,
                     dedup_key=rs.dedup_key,
                 )
 
-        if plan.upserts or plan.resolves or plan.skipped_no_tenant:
+        if plan.upserts or resolves or plan.skipped_no_tenant:
             self._logger.info(
                 "offline_charger_monitor: %d alert(s) raised/escalated "
                 "(%d planned), %d resolved, %d skipped (no tenant)",
                 len(upserts),
                 len(plan.upserts),
-                len(plan.resolves),
+                len(resolves),
                 len(plan.skipped_no_tenant),
             )
         return plan

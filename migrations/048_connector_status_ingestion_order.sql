@@ -19,12 +19,30 @@
 -- idx_connector_status_latest puts connector_id between the two ordering
 -- columns, so it cannot serve (station_id, created_at DESC)).
 --
--- Idempotent; safe to re-run. NOTE: ADD COLUMN with a volatile DEFAULT now()
--- rewrites the table once (all existing rows get the migration-time value);
--- connector_status is small at pilot scale so this is cheap.
+-- Idempotent; safe to re-run. ADD COLUMN with a volatile DEFAULT now()
+-- rewrites the table once; the backfill below restores per-row ordering so
+-- the offline monitor does not fall back to charger ``timestamp`` ties.
 
 ALTER TABLE connector_status
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+-- Pre-migration rows all received the same volatile DEFAULT from ADD COLUMN;
+-- stamp from ``timestamp`` so DISTINCT ON (station_id, created_at DESC, …)
+-- is not degenerate. Only touch rows still carrying that one-shot batch
+-- stamp (largest shared ``created_at`` cluster) so re-runs do not rewrite
+-- server-ingestion times on rows inserted after this migration.
+UPDATE connector_status AS cs
+   SET created_at = cs.timestamp
+  FROM (
+    SELECT date_trunc('second', created_at) AS batch
+      FROM connector_status
+     GROUP BY date_trunc('second', created_at)
+    HAVING COUNT(*) > 1
+     ORDER BY COUNT(*) DESC
+     LIMIT 1
+  ) batch
+ WHERE date_trunc('second', cs.created_at) = batch.batch
+   AND cs.created_at IS DISTINCT FROM cs.timestamp;
 
 CREATE INDEX IF NOT EXISTS idx_connector_status_ingest_latest
     ON connector_status (station_id, created_at DESC);
