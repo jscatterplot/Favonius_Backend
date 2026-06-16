@@ -118,7 +118,7 @@ from ..security.handoff_validator import (
 )
 from ..security.headers import SecurityHeadersMiddleware
 from ..security.ocpp_auth import verify_ocpp_basic_auth
-from ..security.rate_limiter import RateLimiter, get_rate_limiter, set_rate_limiter
+from ..security.rate_limiter import RateLimitConfig, RateLimiter, get_rate_limiter, set_rate_limiter
 from ..security.rbac import Permission, has_permission, require_favonius_admin
 from ..security.tenant_mirror import ensure_tenant_mirrored, mirror_user_tenant_atomic
 from ..security.validators import (
@@ -375,6 +375,22 @@ async def _agent_budget_reconcile_loop() -> None:
             logger.warning("agent budget reconcile tick failed", exc_info=True)
 
 
+def _rate_limit_config_from_env() -> RateLimitConfig:
+    """Build rate-limiter sync cadence from env (backward-compatible defaults)."""
+
+    def _seconds(name: str, default: float) -> float:
+        raw = os.getenv(name)
+        if raw is None or raw.strip() == "":
+            return default
+        return float(raw)
+
+    return RateLimitConfig(
+        sync_interval_seconds=_seconds("RATE_LIMIT_SYNC_INTERVAL_S", 15.0),
+        merge_interval_seconds=_seconds("RATE_LIMIT_MERGE_INTERVAL_S", 60.0),
+        cleanup_interval_seconds=_seconds("RATE_LIMIT_CLEANUP_INTERVAL_S", 300.0),
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
@@ -439,7 +455,7 @@ async def lifespan(app: FastAPI):
     logger.info("Security audit logger started")
 
     # ── Rate limiter (PostgreSQL-backed for NIS2 persistence) ────────────────
-    hybrid_limiter = RateLimiter(db_pool=ts_pool)
+    hybrid_limiter = RateLimiter(db_pool=ts_pool, config=_rate_limit_config_from_env())
     set_rate_limiter(hybrid_limiter)
     await hybrid_limiter.start()
     logger.info("Hybrid rate limiter started")
