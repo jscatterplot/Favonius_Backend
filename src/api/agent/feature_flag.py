@@ -14,6 +14,23 @@ def is_agent_search_enabled() -> bool:
     return os.environ.get("AGENT_SEARCH_ENABLED", "true").lower() == "true"
 
 
+def is_agent_doc_fill_enabled() -> bool:
+    """Return True iff the collaborative document-fill path is enabled.
+
+    Gates both the upload/session endpoints (``/agent/documents*``) and the
+    ``session_id`` route inside ``run_turn``. Default is **off** — the feature
+    reuses the SQL-mode data tools, so the ``agent_views.*`` functions + the
+    read-only roles must be migrated before turning it on. Set
+    ``AGENT_DOC_FILL_ENABLED=true`` to enable without redeploying code.
+    """
+    return os.environ.get("AGENT_DOC_FILL_ENABLED", "false").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def is_automation_suggestions_enabled() -> bool:
     """Return True iff post-turn automation-suggestion detection runs.
 

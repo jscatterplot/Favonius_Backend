@@ -797,6 +797,7 @@ async def run_qa_turn(
     temperature: float = 0.0,
     effort: str = DEFAULT_EFFORT,
     on_step: Optional[Callable[[ToolCall], Any]] = None,
+    history: Optional[Sequence[dict[str, Any]]] = None,
 ) -> QAResult:
     """Run one Anthropic tool-use loop in Q&A mode (no Decision row).
 
@@ -828,6 +829,14 @@ async def run_qa_turn(
         on_step: Optional async callback invoked after each tool call
             with the populated :class:`ToolCall`. Used by the controller
             to write ``agent_runs.steps_json`` and SSE step events.
+        history: Optional prior conversation turns to seed the message
+            list with, BEFORE ``user_message``. Each entry is a plain
+            ``{"role": "user"|"assistant", "content": <str>}`` dict — text
+            turns only, never raw ``tool_use`` / ``tool_result`` blocks
+            (those would dangle without their counterpart and break the
+            Anthropic contract). Used by the collaborative document-fill
+            path to give the loop multi-turn memory. Default ``None`` ⇒
+            single-turn behaviour identical to every existing caller.
 
     Returns:
         :class:`QAResult`.
@@ -859,7 +868,13 @@ async def run_qa_turn(
             "cache_control": {"type": "ephemeral"},
         }
     ]
-    messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
+    # ``history`` (when supplied) seeds the loop with prior text turns so the
+    # collaborative document-fill path has conversation memory; default None
+    # ⇒ a single fresh user turn, identical to every existing caller.
+    messages: list[dict[str, Any]] = [
+        *(dict(m) for m in (history or [])),
+        {"role": "user", "content": user_message},
+    ]
 
     tool_calls: list[ToolCall] = []
     final_text: str = ""
