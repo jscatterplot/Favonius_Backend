@@ -475,10 +475,17 @@ class SchemaRegistry:
                                             "type": "array",
                                             "items": {
                                                 "type": "object",
-                                                "required": ["chargingPointId", "status"],
+                                                # Field names mirror the official schema and the
+                                                # _charging_point_info_to_dict output so HARD-mode
+                                                # validation passes when this minimal fallback is
+                                                # the only loaded schema (no cache/fetch/bundled).
+                                                "required": [
+                                                    "chargingPointId",
+                                                    "chargingPointStatus",
+                                                ],
                                                 "properties": {
                                                     "chargingPointId": {"type": "string"},
-                                                    "status": {
+                                                    "chargingPointStatus": {
                                                         "type": "string",
                                                         "enum": [
                                                             "Available",
@@ -487,8 +494,8 @@ class SchemaRegistry:
                                                             "Unavailable",
                                                         ],
                                                     },
-                                                    "currentPowerKw": {"type": "number"},
-                                                    "vehicleId": {"type": "string"},
+                                                    "presentPower": {"type": "number"},
+                                                    "vehicleInfo": {"type": "object"},
                                                 },
                                             },
                                         },

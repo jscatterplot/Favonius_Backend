@@ -217,3 +217,46 @@ class TestProvideChargingInformationSchema:
         assert len(st_list) == 1
         assert st_list[0]["chargingPointInfoList"][0]["chargingPointStatus"] == "Occupied"
         assert st_list[0]["chargingPointInfoList"][0]["presentPower"] == 30.0
+
+    def test_hard_mode_passes_with_minimal_fallback_schema(self, monkeypatch):
+        """Builder output validates in HARD mode against the minimal inline fallback.
+
+        Regression: with the vendored schemas removed, an offline / cache-miss
+        registry falls through to the minimal inline schema. Its charging-point
+        field names must match ``_charging_point_info_to_dict`` (chargingPointStatus
+        / presentPower), or HARD-mode validation rejects the depot's own
+        ProvideChargingInformation message and no VDV update is sent. Production
+        defaults SOFT -> HARD, so this path is the production default when GitHub
+        fetch and cache are both unavailable.
+        """
+        import adapters.vdv463.messages as vdv_messages
+
+        # Force the minimal inline fallback: no network fetch, no cache/bundled hit.
+        monkeypatch.setattr(vdv_messages, "_fetch_schemas_to_cache", lambda *a, **k: False)
+        registry = vdv_messages.SchemaRegistry(schema_dir="/nonexistent/vdv463-test-cache")
+        assert registry._schema_source == "minimal"
+
+        depot = DepotInfo(
+            depot_id="d1",
+            charging_station_info_list=[
+                ChargingStationInfo(
+                    charging_station_id="d1",
+                    charging_station_status="Available",
+                    charging_point_info_list=[
+                        ChargingPointInfo(
+                            charging_point_id="cp-1",
+                            charging_point_status="Occupied",
+                            present_power=42.0,
+                        ),
+                    ],
+                )
+            ],
+        )
+        payload = build_provide_charging_information_message("ps1", [depot])[6]
+
+        # HARD mode raises VDV463ValidationError on any violation; a clean pass
+        # returns an empty warning list.
+        warnings = registry.validate_payload(
+            payload, "ProvideChargingInformation", ValidationMode.HARD
+        )
+        assert warnings == []
