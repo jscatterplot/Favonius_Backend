@@ -3317,15 +3317,18 @@ async def open_session_by_vehicles(db, vehicle_ids: list[str]) -> dict[str, dict
     """
     if not vehicle_ids:
         return {}
+    # charging_sessions.vehicle_id is VARCHAR (migration 013 + 045 comment) —
+    # OCPP and the import path both write the UUID as text. Cast the bound
+    # array as text[] so the column comparison matches.
     query = """
         SELECT DISTINCT ON (vehicle_id)
-               vehicle_id::text AS vehicle_id,
+               vehicle_id       AS vehicle_id,
                session_id,
                station_id       AS ocpp_id,
                start_time       AS started_at,
                current_power_kw
         FROM charging_sessions
-        WHERE vehicle_id = ANY($1::uuid[])
+        WHERE vehicle_id = ANY($1::text[])
           AND end_time IS NULL
           AND source = 'live'
         ORDER BY vehicle_id, start_time DESC

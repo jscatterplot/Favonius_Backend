@@ -415,6 +415,60 @@ Health check endpoint.
 
 ---
 
+## Context-Aware Support Summary
+
+A one-click "This isn't right" report. The frontend captures the screen and
+POSTs it (plus the page name and an optional note) to the backend, which bundles
+the screenshot, the last ~5 minutes of API logs, and a live Tiger Cloud
+(TimescaleDB) + WebSocket-server health snapshot into an engineering summary and
+emails it. GDPR: logs/notes are PII-redacted, only the reporter's `user_id` is
+stored (never email), and rows are retention-bounded (`SUPPORT_SUMMARY_RETENTION_DAYS`,
+default 90 days) and auto-purged.
+
+### POST /support/summary
+File a support report. Open to any authenticated tenant user (operators included).
+
+**Request body (JSON):**
+```json
+{
+    "page": "/depots/{id}/state",
+    "user_note": "the SoC looked wrong",
+    "depot_id": "uuid (optional; depot-scoped pages only)",
+    "screenshot_base64": "<base64 or data:image/png;base64,...> (optional)",
+    "screenshot_content_type": "image/png"
+}
+```
+Screenshot content type must be `image/png`, `image/jpeg`, or `image/webp`;
+oversized images (`SUPPORT_SCREENSHOT_MAX_BYTES`, default 5 MiB) return 413.
+
+**Response (201):**
+```json
+{
+    "id": "uuid",
+    "summary_text": "User <id> reported an error while viewing /depots/{id}/state. System status at time of report: Tiger Cloud healthy, WebSocket unknown. Last error log: none.",
+    "health_snapshot": {"tiger_cloud": "healthy", "websocket": "unknown", "websocket_source": "unknown", "captured_at": "..."},
+    "delivery_status": "pending",
+    "created_at": "2026-05-29T10:00:00+00:00"
+}
+```
+`delivery_status` is always `pending` at creation (the email is sent post-commit,
+best-effort). Errors: 400 (bad screenshot type / base64), 403 (missing org or
+cross-tenant `depot_id`), 413 (screenshot too large), 503 (DB unavailable).
+
+### GET /support/summary/{id}
+Fetch a stored report (metadata + redacted logs + health + summary). **favonius_admin only.**
+Returns `has_screenshot` but never the inline image bytes. Every read is audited
+(`support.summary.read`). 404 when missing.
+
+### GET /support/summary/{id}/screenshot
+Return the raw screenshot bytes with the stored content type. **favonius_admin only.** Audited. 404 when absent.
+
+### DELETE /support/summary/{id}
+Hard-delete a report (GDPR right-to-erasure). **favonius_admin only.** Audited
+(`support.summary.deleted`). Returns 204; 404 when missing.
+
+---
+
 ## WebSocket API (OCPP)
 
 The platform implements an OCPP 1.6 Central System at `ws://<host>:9000/{ocpp_id}`.

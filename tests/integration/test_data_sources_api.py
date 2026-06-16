@@ -213,6 +213,18 @@ def test_get_job_ok(client, monkeypatch):
     assert resp.json()["progress"]["chargers_created"] == 2
 
 
+def test_get_job_translates_pending_to_queued(client, monkeypatch):
+    # The DB CHECK constraint (mig supabase/043) stores 'pending'; the
+    # frontend's Zod schema only accepts {queued, running, succeeded,
+    # partial, failed}. The wire serializer translates so an un-claimed
+    # job doesn't blow up the frontend's parser on a fresh sync.
+    job = _job_row(status="pending")
+    monkeypatch.setattr(repo, "get_job", AsyncMock(return_value=job))
+    resp = client.get(f"/admin/data-sources/jobs/{job['id']}")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "queued"
+
+
 def test_list_connections(client, monkeypatch):
     monkeypatch.setattr(repo, "list_connections", AsyncMock(return_value=[_connection_row()]))
     resp = client.get("/admin/data-sources/connections")
