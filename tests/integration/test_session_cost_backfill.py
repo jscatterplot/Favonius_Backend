@@ -47,8 +47,8 @@ def _load_backfill_module():
 
 bf = _load_backfill_module()
 from tests.integration.conftest import (
-    PILOT_SITE_ID,
     IntegrationPools,
+    find_lithuania_site_id,
     integration_db_urls,
 )
 
@@ -942,12 +942,15 @@ async def test_backfill_pilot_pilot_dry_run_split(
     """Dry-run backfill against the pilot depot on TigerCloud + Supabase (no site INSERT)."""
     if not db_pools.is_split or not db_pools.static_sites_readable:
         pytest.skip("needs TIMESCALE_SERVICE_URL + STATIC_DATABASE_URL / SUPABASE_DB_*")
+    site_id = await find_lithuania_site_id(db_pools.static_pool)
+    if site_id is None:
+        pytest.skip("no Lithuania-resolving site in Supabase")
     ts_url, static_url = integration_db_urls
     monkeypatch.setenv("DATABASE_URL", ts_url)
     monkeypatch.setenv("STATIC_DATABASE_URL", static_url)
     rc = await bf._run(
         _args(
-            depot_id=UUID(PILOT_SITE_ID),
+            depot_id=site_id,
             dry_run=True,
             max_rows=25,
             database_url=ts_url,
