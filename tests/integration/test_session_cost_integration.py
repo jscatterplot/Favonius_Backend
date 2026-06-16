@@ -36,7 +36,11 @@ from src.core.billing.session_cost import (
     write_session_cost,
 )
 from src.db.queries import fetch_prices_by_zone, resolve_bidding_zone
-from tests.integration.conftest import PILOT_SITE_ID, IntegrationPools
+from tests.integration.conftest import (
+    LITHUANIA_BIDDING_ZONE,
+    IntegrationPools,
+    find_lithuania_site_id,
+)
 
 
 # A real ENTSO-E EIC code (Lithuania, the pilot zone). The bidding
@@ -365,10 +369,16 @@ async def test_resolve_bidding_zone_falls_back_to_timezone(
             timezone_name="Europe/Vilnius", tariff_config=None,
         )
     else:
-        site_id = UUID(PILOT_SITE_ID)
+        site_id = await find_lithuania_site_id(
+            db_pools.static_pool, timezone_fallback_only=True,
+        )
+        if site_id is None:
+            pytest.skip(
+                "no Europe/Vilnius site without entsoe_zone override in Supabase"
+            )
     async with db_pools.static_pool.acquire() as conn:
         zone = await resolve_bidding_zone(conn, site_id)
-    assert zone == "10YLT-1001A0008Q"  # Lithuania
+    assert zone == LITHUANIA_BIDDING_ZONE
 
 
 @pytest.mark.asyncio
@@ -396,10 +406,12 @@ async def test_resolve_pilot_pilot_site_readonly(db_pools: IntegrationPools):
     """Read-only check against Supabase ``sites`` (TigerCloud + Supabase split)."""
     if not db_pools.is_split or not db_pools.static_sites_readable:
         pytest.skip("needs split pools + Supabase STATIC_DATABASE_URL / SUPABASE_DB_*")
-    site_id = UUID(PILOT_SITE_ID)
+    site_id = await find_lithuania_site_id(db_pools.static_pool)
+    if site_id is None:
+        pytest.skip("no Lithuania-resolving site in Supabase")
     async with db_pools.static_pool.acquire() as conn:
         zone = await resolve_bidding_zone(conn, site_id)
-    assert zone == "10YLT-1001A0008Q"
+    assert zone == LITHUANIA_BIDDING_ZONE
 
 
 @pytest.mark.asyncio
