@@ -11,10 +11,11 @@ and ``VehicleIdentityBase``) but are **defined locally** to avoid pulling
 the entire FastAPI app into the import tree — a CLI / unit-test friendly
 shape. If you tighten a constraint in ``src/api/main.py``, mirror it here.
 
-All field names follow the public ChargEye reference (``stationId``,
-``maxPowerKw``, ``netBatterySizeKwh``, …). When the live API uses a
-slightly different shape, only this module needs to change — the CLI and
-service-layer call sites are independent.
+All field names follow the public ChargEye OpenAPI reference at
+docs.kempower.io (``stationId``, ``maxPowerKw``, ``fullChargeEnergykWh``,
+``chargedEnergyKwh``, …). When the live API uses a slightly different
+shape, only this module needs to change — the CLI and service-layer call
+sites are independent.
 """
 
 from __future__ import annotations
@@ -103,32 +104,66 @@ def kempower_station_to_charger_request(
             f"Kempower station {station.get('stationId')!r} has no connectors"
         )
     connector_types = {(c.get("type") or "").upper() for c in connectors}
-    # Accept the canonical CCS variants. Kempower's enum hasn't been pinned
-    # — some deployments report "CCS", some "CCS1", "CCS2", "CCS_TYPE_2".
+    # ChargEye's EVSEType enum is {AC, CCS, CHAdeMO, Type2, mcs, oppcharge}.
+    # Use ``startswith("CCS")`` so a stray variant ("CCS1", "CCS2") still
+    # matches — overly permissive but safe; the canonical value is "CCS".
     if not all(t.startswith("CCS") for t in connector_types):
         raise UnsupportedConnectorError(
             f"Kempower station {station.get('stationId')!r} has non-CCS connectors: "
             f"{sorted(connector_types)}"
         )
 
-    connector_ids = sorted(
-        {int(c["connectorId"]) for c in connectors if "connectorId" in c}
-    )
-    if not connector_ids:
-        # Connector list present but no numeric ids — fall back to a 1-based
-        # sequence matching len(connectors). ChargerCreateRequest validates
-        # uniqueness and positivity.
+    # ConnectorInfo.connectorId is a string in the spec; examples include
+    # both numeric ("11", "12") and non-numeric ("charger1_connector2") ids.
+    # If every id parses as int, use those (preserves the human-visible
+    # connector numbering). Otherwise fall back to a 1-based sequence —
+    # ChargerCreateRequest only requires uniqueness + positivity.
+    numeric_ids: list[int] = []
+    parse_failed = False
+    for c in connectors:
+        raw = c.get("connectorId")
+        if raw is None:
+            parse_failed = True
+            break
+        try:
+            numeric_ids.append(int(raw))
+        except (TypeError, ValueError):
+            parse_failed = True
+            break
+    if parse_failed or not numeric_ids:
         connector_ids = list(range(1, len(connectors) + 1))
+    else:
+        connector_ids = sorted(set(numeric_ids))
+
+    # StationInfo.maxPowerKw is optional in the spec (description: "MAX
+    # output power (kW) of the station undefined if not known") and the
+    # official example shows 0 for stations whose power isn't pinned.
+    # Fall back to summing per-connector maxPowerKw (ConnectorInfo.maxPowerKw
+    # IS required). Pydantic still enforces ``rated_kw > 0`` at the end.
+    rated_kw_raw = station.get("maxPowerKw")
+    try:
+        rated_kw = float(rated_kw_raw) if rated_kw_raw is not None else 0.0
+    except (TypeError, ValueError):
+        rated_kw = 0.0
+    if rated_kw <= 0:
+        rated_kw = sum(
+            float(c.get("maxPowerKw") or 0) for c in connectors
+        )
 
     return KempowerChargerPayload(
         display_name=station.get("name")
         or station.get("stationId")
         or "Kempower charger",
         vendor="Kempower",
+        # ``model`` / ``serialNumber`` / ``firmwareVersion`` are on
+        # ``ChargingStationRow`` (returned by ``/locations/{uid}/stations``),
+        # NOT on the ``StationInfo`` shape ``/stations`` returns. They
+        # silently stay None for the StationInfo path; this is acceptable
+        # because ChargerCreateRequest leaves all three Optional.
         model=station.get("model"),
         serial_number=station.get("serialNumber"),
         firmware=station.get("firmwareVersion"),
-        rated_kw=float(station["maxPowerKw"]),
+        rated_kw=rated_kw,
         connector_type="CCS",
         connector_count=len(connector_ids),
         connector_ids=connector_ids,
@@ -140,30 +175,33 @@ def kempower_vehicle_to_identity(vehicle: dict[str, Any]) -> KempowerVehiclePayl
     """Map one Kempower ``Vehicle`` JSON object to ``KempowerVehiclePayload``.
 
     ``external_id`` is prefixed with ``kempower:`` so two customers using
-    the same numeric ``vehicleId`` in their respective ChargEye tenants
+    the same vehicle ``id`` in their respective ChargEye tenants
     can co-exist under the Favonius global ``vehicles.external_id`` UNIQUE.
+    Field names mirror the ChargEye Vehicles API ``VehicleDTO`` schema
+    (``id``, ``fullChargeEnergykWh``, ``maxChargePowerkW`` — note the
+    lowercase ``k`` in the last two, per docs.kempower.io).
     """
-    raw_id = vehicle.get("vehicleId")
+    raw_id = vehicle.get("id")
     if raw_id is None or raw_id == "":
-        raise ValueError("Kempower vehicle is missing required field 'vehicleId'")
-    if vehicle.get("netBatterySizeKwh") is None:
+        raise ValueError("Kempower vehicle is missing required field 'id'")
+    if vehicle.get("fullChargeEnergykWh") is None:
         raise ValueError(
-            f"Kempower vehicle {raw_id!r} is missing required field 'netBatterySizeKwh'"
+            f"Kempower vehicle {raw_id!r} is missing required field 'fullChargeEnergykWh'"
         )
-    if vehicle.get("maxChargePowerKw") is None:
+    if vehicle.get("maxChargePowerkW") is None:
         raise ValueError(
-            f"Kempower vehicle {raw_id!r} is missing required field 'maxChargePowerKw'"
+            f"Kempower vehicle {raw_id!r} is missing required field 'maxChargePowerkW'"
         )
 
     return KempowerVehiclePayload(
         external_id=f"{KEMPOWER_EXTERNAL_ID_PREFIX}{raw_id}",
         display_name=vehicle.get("name"),
         vehicle_type=derive_vehicle_type(
-            make=vehicle.get("make"),
-            model=vehicle.get("model"),
+            make=None,
+            model=vehicle.get("evModel"),
         ),
-        battery_kwh=float(vehicle["netBatterySizeKwh"]),
-        max_charge_kw=float(vehicle["maxChargePowerKw"]),
+        battery_kwh=float(vehicle["fullChargeEnergykWh"]),
+        max_charge_kw=float(vehicle["maxChargePowerkW"]),
         # id_tag is left None on backfill — OCPP populates it the first time
         # the vehicle plugs into the Favonius OCPP server with an RFID.
         id_tag=None,
@@ -201,23 +239,23 @@ def kempower_transaction_to_session_row(
         raise ValueError("Kempower transaction is missing required field 'startTime'")
     start_time_utc = _parse_iso_utc(start_raw)
 
-    stop_raw = transaction.get("stopTime")
-    end_time_utc = _parse_iso_utc(stop_raw) if stop_raw else None
+    end_raw = transaction.get("endTime")
+    end_time_utc = _parse_iso_utc(end_raw) if end_raw else None
 
-    energy_kwh_raw = transaction.get("energyKwh")
+    energy_kwh_raw = transaction.get("chargedEnergyKwh")
     if energy_kwh_raw is None:
         raise ValueError(
-            f"Kempower transaction {transaction.get('txId')!r} is missing 'energyKwh'"
+            f"Kempower transaction {transaction.get('txId')!r} is missing 'chargedEnergyKwh'"
         )
     energy_kwh = float(energy_kwh_raw)
 
     # Match the XLSX path's behaviour: when the source row has no
-    # RFID/idTag, classify it as platform-initiated. The XLSX path uses
+    # RFID/auth token, classify it as platform-initiated. The XLSX path uses
     # a richer hash-token to avoid collisions across distinct
     # platform-initiated sessions sharing minute-level start time — we
     # don't have those discriminators here, so we fall back to the
     # Kempower transaction id, which is globally unique on their side.
-    raw_id_tag = transaction.get("idTag")
+    raw_id_tag = transaction.get("authorizationToken")
     if raw_id_tag:
         id_token = str(raw_id_tag)
         hash_id_token = id_token
@@ -225,8 +263,8 @@ def kempower_transaction_to_session_row(
         tx_id = transaction.get("txId")
         if tx_id is None:
             raise ValueError(
-                "Kempower transaction has neither 'idTag' nor 'txId'; "
-                "cannot construct a stable import row hash"
+                "Kempower transaction has neither 'authorizationToken' nor "
+                "'txId'; cannot construct a stable import row hash"
             )
         id_token = "platform-start"
         hash_id_token = f"kempower-tx:{tx_id}"
@@ -247,7 +285,7 @@ def kempower_transaction_to_session_row(
         "site_id": site_id,
         "import_batch_id": str(batch_id),
         "import_row_hash": row_hash,
-        "import_user_full_name": transaction.get("driverName"),
+        "import_user_full_name": None,
         "import_station_owner": None,
         "import_status": transaction.get("status"),
     }

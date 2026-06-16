@@ -104,10 +104,11 @@ def test_optimization_runs_trigger_reason_vocab_matches_emitters():
 
 def test_alerts_alert_type_documents_emitted_values():
     """`alerts.alert_type` is TEXT, not enum-constrained. Migration 022
-    emits 'charger_fault'; src/core/controller.py emits three more via
-    upsert_alert ('missing_input', 'degraded_optimization',
-    'stale_telemetry'). The LLM needs all four to answer ops-status
-    questions without undercounting non-fault alerts.
+    emits 'charger_fault' and src/core/controller.py emits 'missing_input'
+    via upsert_alert. 'degraded_optimization' and 'stale_telemetry' are no
+    longer emitted (silenced as noise) but persist as historical/resolved
+    rows, so the catalogue must still document all four — the LLM needs them
+    to answer ops-status questions without undercounting non-fault alerts.
     """
     note = _column_note(TS_FUNCTIONS, "alerts", "alert_type")
     for value in (

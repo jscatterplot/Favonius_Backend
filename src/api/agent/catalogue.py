@@ -128,7 +128,10 @@ TS_FUNCTIONS: tuple[FunctionSpec, ...] = (
     ),
     FunctionSpec(
         name="alerts",
-        purpose="Per-depot notification alerts (charger faults, low SoC, etc.).",
+        purpose=(
+            "Per-depot notification alerts (charger faults, low SoC, etc.). "
+            "Use `title` / `detail` to explain WHY an alert fired."
+        ),
         columns=(
             ColumnSpec("alert_id", "uuid"),
             ColumnSpec("depot_id", "uuid"),
@@ -148,10 +151,28 @@ TS_FUNCTIONS: tuple[FunctionSpec, ...] = (
                 "threshold). Column is TEXT, not enum-constrained — "
                 "future versions may add types.",
             ),
+            ColumnSpec(
+                "title",
+                "text",
+                "Human one-liner describing the alert, e.g. "
+                "'Charger CP-07 connector 1: Faulted'. Prefer this over "
+                "alert_type when telling the operator what happened.",
+            ),
+            ColumnSpec(
+                "detail",
+                "jsonb",
+                "Structured cause. For 'charger_fault' it carries "
+                "{station_id, connector_id, error_code} — read the OCPP "
+                "error_code with detail->>'error_code' to explain the fault. "
+                "Empty object {} when the alert type has no extra context.",
+            ),
         ),
         examples=(
             "SELECT severity_level, COUNT(*) FROM agent_views.alerts($1) "
             "WHERE created_at >= now() - interval '7 days' GROUP BY severity_level",
+            "SELECT alert_type, title, detail->>'error_code' AS error_code "
+            "FROM agent_views.alerts($1) WHERE status = 'active' "
+            "ORDER BY severity_level DESC",
         ),
     ),
     FunctionSpec(

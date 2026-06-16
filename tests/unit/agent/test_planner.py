@@ -270,3 +270,119 @@ def test_sql_mode_off_routes_everything_to_fast_path(monkeypatch, message):
     is_sql_mode_enabled.cache_clear()
     d = classify(message, sql_mode_allowed=False)
     assert d.route == "consumption_by_user", f"{message!r} routed to {d.route!r}"
+
+
+# ── Readiness + savings deterministic fast-path routing ──────────────────────
+
+SAVINGS_MESSAGES: tuple[str, ...] = (
+    "How much did we save overnight?",
+    "How much have we saved this month?",
+    "What were our savings last week?",
+    "Did we save money charging last night?",
+    "How much did we save by charging overnight?",  # also matches consumption trigger
+)
+
+READINESS_MESSAGES: tuple[str, ...] = (
+    "Are we ready to depart?",
+    "Is bus 42 ready to go?",
+    "What's our departure readiness for tomorrow?",
+    "Are all vehicles ready for the morning?",
+    "readiness check please",
+)
+
+
+@pytest.mark.parametrize("message", SAVINGS_MESSAGES, ids=[m[:30] for m in SAVINGS_MESSAGES])
+def test_savings_messages_route_to_savings(monkeypatch, message):
+    monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
+    is_sql_mode_enabled.cache_clear()
+    d = classify(message, sql_mode_allowed=True)
+    assert d.route == "savings", f"{message!r} → {d.route!r} ({d.reason!r})"
+
+
+@pytest.mark.parametrize("message", READINESS_MESSAGES, ids=[m[:30] for m in READINESS_MESSAGES])
+def test_readiness_messages_route_to_readiness(monkeypatch, message):
+    monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
+    is_sql_mode_enabled.cache_clear()
+    d = classify(message, sql_mode_allowed=True)
+    assert d.route == "readiness", f"{message!r} → {d.route!r} ({d.reason!r})"
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [(m, "savings") for m in SAVINGS_MESSAGES] + [(m, "readiness") for m in READINESS_MESSAGES],
+)
+def test_readiness_savings_independent_of_sql_mode(monkeypatch, message, expected):
+    """Both fast-path intents route the same whether SQL mode is on or off
+    and regardless of the per-org flag — they have their own deterministic
+    handler, like the consumption fast path."""
+    monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "false")
+    is_sql_mode_enabled.cache_clear()
+    assert classify(message, sql_mode_allowed=False).route == expected
+
+
+def test_new_routes_do_not_steal_eval_questions(monkeypatch):
+    """Guard: none of the 20 SQL-eval questions route to savings/readiness."""
+    monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
+    is_sql_mode_enabled.cache_clear()
+    for qid, question, _ in EVAL_QUESTIONS_ROUTING:
+        route = classify(question, sql_mode_allowed=True).route
+        assert route not in ("savings", "readiness"), f"{qid}: {question!r} stolen by {route!r}"
+
+
+def test_consumption_overnight_not_stolen_by_savings(monkeypatch):
+    """'consume … last night' stays consumption; only 'save' triggers savings."""
+    monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
+    is_sql_mode_enabled.cache_clear()
+    d = classify("How much power did the renault vans consume last night?", sql_mode_allowed=True)
+    assert d.route == "consumption_by_user"
+
+
+# Non-departure "is X ready?" questions must NOT be stolen by the readiness
+# intent — they need a fleet/vehicle/we/depot subject to qualify.
+_NOT_READINESS = (
+    "Is the report ready?",
+    "Are the new chargers ready to install?",
+    "Is the data ready for export?",
+    "Is the firmware update ready?",
+    # Optimization-readiness / input-checklist flow — belongs in SQL mode, not
+    # the departure-SoC handler.
+    "What is blocking optimization readiness?",
+    "Show me the optimization readiness checklist",
+    "Are the solver inputs ready?",
+)
+_IS_READINESS = (
+    "Are we ready?",
+    "Is the fleet ready?",
+    "Are the vehicles ready?",
+    "Is everything ready?",
+)
+
+
+@pytest.mark.parametrize("message", _NOT_READINESS, ids=[m[:25] for m in _NOT_READINESS])
+def test_non_departure_ready_questions_not_routed_to_readiness(monkeypatch, message):
+    monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
+    is_sql_mode_enabled.cache_clear()
+    assert classify(message, sql_mode_allowed=True).route != "readiness", message
+
+
+_NOT_SAVINGS = (
+    "Can you save this configuration?",
+    "I want to save an export",
+    "Is there a way to save the schedule?",
+    "How do I save the report as PDF?",
+    "Please save my settings",
+)
+
+
+@pytest.mark.parametrize("message", _NOT_SAVINGS, ids=[m[:25] for m in _NOT_SAVINGS])
+def test_non_financial_save_questions_not_routed_to_savings(monkeypatch, message):
+    monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
+    is_sql_mode_enabled.cache_clear()
+    assert classify(message, sql_mode_allowed=True).route != "savings", message
+
+
+@pytest.mark.parametrize("message", _IS_READINESS, ids=[m[:25] for m in _IS_READINESS])
+def test_fleet_ready_questions_route_to_readiness(monkeypatch, message):
+    monkeypatch.setenv("AGENT_SQL_MODE_ENABLED", "true")
+    is_sql_mode_enabled.cache_clear()
+    assert classify(message, sql_mode_allowed=True).route == "readiness", message

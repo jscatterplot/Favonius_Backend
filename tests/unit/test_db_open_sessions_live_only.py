@@ -64,3 +64,10 @@ async def test_open_session_by_vehicles_filters_to_live_source():
     assert "veh-1" in result
     query = db.fetch.await_args.args[0]
     assert "source = 'live'" in query
+    # charging_sessions.vehicle_id is VARCHAR (migration 013 + 045's own
+    # comment). Casting the bound array as ``uuid[]`` instead of ``text[]``
+    # crashes with ``operator does not exist: character varying = uuid``
+    # the moment a real UUID-shaped vehicle_id appears (e.g. the Kempower
+    # historical import path).
+    assert "::text[]" in query
+    assert "::uuid[]" not in query

@@ -360,7 +360,6 @@ async def claim_job(
     job_id: str,
     *,
     allow_running_reclaim: bool = False,
-    stale_threshold_seconds: int = 120,
     expected_running_lease_at: Optional[datetime] = None,
 ) -> Optional[asyncpg.Record]:
     """Single-winner start.
@@ -385,8 +384,8 @@ async def claim_job(
                     $2::boolean
                     AND status = 'running'
                     AND (
-                        $4::timestamptz IS NULL
-                        OR COALESCE(heartbeat_at, started_at, created_at) = $4::timestamptz
+                        $3::timestamptz IS NULL
+                        OR COALESCE(heartbeat_at, started_at, created_at) = $3::timestamptz
                     )
                 )
               )
@@ -394,7 +393,6 @@ async def claim_job(
             """,
             job_id,
             allow_running_reclaim,
-            stale_threshold_seconds,
             expected_running_lease_at,
         )
 

@@ -26,27 +26,43 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Optional
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from ..db import queries as db_queries
+from .timezone import safe_zone
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class SavingsSummary:
-    """Plain dataclass mirror of the response shape (snake_case)."""
+    """Savings figures for one depot over an arbitrary UTC window.
 
-    current_month_eur: float
-    baseline_month_eur: float
+    Field names are window-agnostic; :func:`compute_savings_summary` and
+    :func:`compute_savings_for_window` both populate the same shape. The
+    ``GET /depots/{id}/savings-summary`` route maps ``actual_eur`` /
+    ``baseline_eur`` to ``current_month_eur`` / ``baseline_month_eur`` on the
+    wire for the month-to-date dashboard card.
+    """
+
+    actual_eur: float
+    baseline_eur: float
     saved_eur: float
     saved_pct: float
     period_start: datetime
     period_end: datetime
     as_of: datetime
+    # True when a flat-rate baseline could actually be computed (a bidding
+    # zone resolved AND priced energy existed in the window). False means the
+    # baseline is *unknown* (no zone / no prices / no energy), not genuinely
+    # zero — callers must not interpret a 0.0 baseline as "no savings". The
+    # ``/savings-summary`` route ignores this; the chat-agent savings intent
+    # uses it to avoid mis-reporting "no price data" after multi-depot
+    # aggregation (where signed baselines could otherwise cancel to 0).
+    baseline_known: bool = True
 
 
 def _month_start_local_as_utc(now_utc: datetime, tz_name: Optional[str]) -> datetime:
@@ -56,19 +72,71 @@ def _month_start_local_as_utc(now_utc: datetime, tz_name: Optional[str]) -> date
     to a 500 here; the small month-boundary skew is acceptable for the
     "savings month-to-date" summary.
     """
-    if tz_name:
-        try:
-            tz = ZoneInfo(tz_name)
-        except Exception:  # pragma: no cover - belt-and-braces
-            tz = ZoneInfo("UTC")
-    else:
-        tz = ZoneInfo("UTC")
-
+    tz = safe_zone(tz_name)
     local_now = now_utc.astimezone(tz)
-    month_start_local = local_now.replace(
-        day=1, hour=0, minute=0, second=0, microsecond=0
-    )
+    month_start_local = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     return month_start_local.astimezone(timezone.utc)
+
+
+# Depot-local overnight window edges: charging typically runs from the
+# evening return (17:00) through the morning departure (07:00).
+OVERNIGHT_START_HOUR = 17
+OVERNIGHT_END_HOUR = 7
+
+
+def overnight_window_utc(now_utc: datetime, tz_name: Optional[str]) -> tuple[datetime, datetime]:
+    """Most-recent overnight window in depot tz, returned as UTC bounds.
+
+    "Overnight" is the completed evening→morning window anchored on the
+    depot's *current* local date: depot-local 17:00 of the previous day
+    (inclusive) to 07:00 of the current day (exclusive). Asked in the
+    morning this is "last night"; asked late evening it is still the
+    night that just ended (deterministic, complete data) rather than the
+    one in progress.
+
+    DST-aware via :class:`ZoneInfo`: the local wall-clock edges stay
+    17:00 / 07:00 across a transition while the UTC instants shift (so a
+    spring-forward night spans 13 UTC hours, a fall-back night 15). Falls
+    back to UTC when ``tz_name`` is missing or invalid.
+
+    Args:
+        now_utc: Current instant (UTC-aware). The window is anchored to
+            this instant's local calendar day.
+        tz_name: Depot IANA timezone (e.g. ``Europe/Vilnius``).
+
+    Returns:
+        ``(start_utc, end_utc)`` — both timezone-aware UTC datetimes,
+        ``start_utc < end_utc``.
+    """
+    tz = safe_zone(tz_name)
+    local_now = now_utc.astimezone(tz)
+    end_local = local_now.replace(hour=OVERNIGHT_END_HOUR, minute=0, second=0, microsecond=0)
+    start_local = (end_local - timedelta(days=1)).replace(
+        hour=OVERNIGHT_START_HOUR, minute=0, second=0, microsecond=0
+    )
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+def tonight_window_utc(now_utc: datetime, tz_name: Optional[str]) -> tuple[datetime, datetime]:
+    """Depot-local window for ``tonight``: current or in-progress overnight cycle.
+
+    After 17:00 local, ``tonight`` is the evening that has already started
+    (today 17:00 → tomorrow 07:00). Before 07:00 local, delegates to
+    :func:`overnight_window_utc` (the night still in progress). Between
+    07:00 and 17:00, also delegates — the upcoming ``tonight`` has not
+    started yet, so the most recent completed overnight window is used.
+    """
+    tz = safe_zone(tz_name)
+    local_now = now_utc.astimezone(tz)
+    if local_now.hour >= OVERNIGHT_START_HOUR:
+        start_local = local_now.replace(
+            hour=OVERNIGHT_START_HOUR, minute=0, second=0, microsecond=0
+        )
+        end_local = (start_local + timedelta(days=1)).replace(
+            hour=OVERNIGHT_END_HOUR, minute=0, second=0, microsecond=0
+        )
+        return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+    return overnight_window_utc(now_utc, tz_name)
 
 
 async def _aggregate_priced_sessions(
@@ -166,35 +234,26 @@ async def _avg_price_eur_per_kwh(
     return float(row["avg_eur_mwh"]) / 1000.0
 
 
-async def compute_savings_summary(
+async def _compute_savings(
     static_pool,
     ts_pool,
     depot_id: str,
     *,
-    now: Optional[datetime] = None,
+    now: Optional[datetime],
+    window: "Callable[[dict], tuple[datetime, datetime]]",
 ) -> SavingsSummary:
-    """Compute the month-to-date savings summary for one depot.
+    """Single-fetch savings core shared by both public entry points.
 
-    A *missing depot* (no ``sites`` row for ``depot_id``) raises
-    ``ValueError("Depot ... not found")`` — the API's global ValueError
-    handler maps "not found" to HTTP 404, matching the route's documented
-    contract. This matters for ``favonius_admin``, whose access check
-    bypasses the depot-existence lookup; without this, a bad UUID would
-    return a misleading all-zero 200 instead of a 404.
+    Loads the depot's timezone + charger roster + bidding zone in **one**
+    static-pool acquisition, then asks ``window(depot_row)`` for the UTC
+    ``[start, end)`` bounds (the month-to-date wrapper needs the depot tz;
+    the explicit-window wrapper ignores the row). Centralising the fetch
+    here removes the previous double ``get_depot_by_id`` read.
 
-    Every other "missing data" path is treated as a zero-valued summary
-    rather than an error: no sessions yet → zeros; no bidding zone →
-    zero baseline; no electricity-price rows in the window → zero
-    baseline. The frontend's "TodayEmpty" panel renders these as ``—``.
-
-    Args:
-        static_pool: Supabase / static schema pool (``sites`` + ``charging_stations``).
-        ts_pool: TimescaleDB pool (``charging_sessions`` + ``electricity_prices``).
-        depot_id: Depot UUID.
-        now: Test injection point for "current time". Defaults to ``datetime.now(UTC)``.
-
-    Raises:
-        ValueError: When no depot exists for ``depot_id`` (→ HTTP 404).
+    A *missing depot* raises ``ValueError("Depot ... not found")`` — the
+    API's global handler maps "not found" to HTTP 404. Every other
+    "missing data" path degrades to an *unknown* baseline
+    (``baseline_known=False``) rather than raising.
     """
     as_of = now if now is not None else datetime.now(timezone.utc)
 
@@ -202,14 +261,10 @@ async def compute_savings_summary(
         depot = await db_queries.get_depot_by_id(static_conn, depot_id)
         if depot is None:
             raise ValueError(f"Depot {depot_id} not found")
-        ocpp_id_map = await db_queries.charger_id_by_ocpp_id(
-            static_conn, depot_id=depot_id
-        )
+        ocpp_id_map = await db_queries.charger_id_by_ocpp_id(static_conn, depot_id=depot_id)
         bidding_zone = await db_queries.resolve_bidding_zone(static_conn, UUID(depot_id))
 
-    timezone_name = depot.get("timezone")
-    period_start = _month_start_local_as_utc(as_of, timezone_name)
-    period_end = as_of
+    period_start, period_end = window(depot)
     station_ids = list(ocpp_id_map.keys())
 
     async with ts_pool.acquire() as ts_conn:
@@ -232,29 +287,94 @@ async def compute_savings_summary(
 
     # avg_price is None only when there are no price rows for the window
     # (or no zone / no energy, so we never queried) — that's the genuine
-    # "unknown baseline" case and degrades to 0. A *negative* average is
-    # NOT missing data: ENTSO-E day-ahead prices go negative in
-    # high-renewable hours, and a depot exposed to them has a real
-    # (negative) unmanaged baseline. Preserve the sign.
-    baseline_cost = (
-        round(total_energy_kwh * avg_price, 2) if avg_price is not None else 0.0
-    )
+    # "unknown baseline" case (baseline_known=False) and degrades to 0. A
+    # *negative* average is NOT missing data: ENTSO-E day-ahead prices go
+    # negative in high-renewable hours, and a depot exposed to them has a
+    # real (negative) unmanaged baseline. Preserve the sign.
+    baseline_known = avg_price is not None
+    # Narrow on ``avg_price is not None`` directly (not the bool alias) so the
+    # type checker can prove the multiplication operands are both floats.
+    baseline_cost = round(total_energy_kwh * avg_price, 2) if avg_price is not None else 0.0
     actual_cost = round(actual_cost, 2)
     saved = round(baseline_cost - actual_cost, 2)
     # Percentage is signed against the baseline's magnitude: a negative
     # baseline with a worse-than-baseline actual must read as a negative
     # saved_pct (we did worse), not flip positive from sign cancellation.
     # Only a zero baseline is undefined → 0.0.
-    saved_pct = (
-        round((saved / abs(baseline_cost)) * 100.0, 1) if baseline_cost != 0 else 0.0
-    )
+    saved_pct = round((saved / abs(baseline_cost)) * 100.0, 1) if baseline_cost != 0 else 0.0
 
     return SavingsSummary(
-        current_month_eur=actual_cost,
-        baseline_month_eur=baseline_cost,
+        actual_eur=actual_cost,
+        baseline_eur=baseline_cost,
         saved_eur=saved,
         saved_pct=saved_pct,
         period_start=period_start,
         period_end=period_end,
         as_of=as_of,
+        baseline_known=baseline_known,
+    )
+
+
+async def compute_savings_for_window(
+    static_pool,
+    ts_pool,
+    depot_id: str,
+    *,
+    period_start: datetime,
+    period_end: datetime,
+    now: Optional[datetime] = None,
+) -> SavingsSummary:
+    """Compute the savings summary for one depot over an explicit window.
+
+    The window bounds are already resolved to UTC by the caller (the chat
+    agent's savings intent for an overnight / relative window). Loads the
+    depot context once and aggregates priced sessions + the average
+    day-ahead price over ``[period_start, period_end)``.
+
+    Args:
+        static_pool: Supabase / static schema pool (``sites`` + ``charging_stations``).
+        ts_pool: TimescaleDB pool (``charging_sessions`` + ``electricity_prices``).
+        depot_id: Depot UUID.
+        period_start: Inclusive UTC window start.
+        period_end: Exclusive UTC window end.
+        now: Test injection point for the response's ``as_of``.
+
+    Raises:
+        ValueError: When no depot exists for ``depot_id`` (→ HTTP 404).
+    """
+    return await _compute_savings(
+        static_pool,
+        ts_pool,
+        depot_id,
+        now=now,
+        window=lambda _depot: (period_start, period_end),
+    )
+
+
+async def compute_savings_summary(
+    static_pool,
+    ts_pool,
+    depot_id: str,
+    *,
+    now: Optional[datetime] = None,
+) -> SavingsSummary:
+    """Compute the month-to-date savings summary for one depot.
+
+    The only month-specific work is placing the period start at the first
+    instant of the current calendar month in the depot's local timezone
+    (so a Vilnius depot's "this month" starts at Vilnius midnight on the
+    1st, not UTC midnight) and ending the window at ``now``. The depot row
+    is fetched once inside :func:`_compute_savings`; the window callable
+    reads its timezone — no separate pre-fetch.
+
+    Raises:
+        ValueError: When no depot exists for ``depot_id`` (→ HTTP 404).
+    """
+    as_of = now if now is not None else datetime.now(timezone.utc)
+    return await _compute_savings(
+        static_pool,
+        ts_pool,
+        depot_id,
+        now=as_of,
+        window=lambda depot: (_month_start_local_as_utc(as_of, depot.get("timezone")), as_of),
     )

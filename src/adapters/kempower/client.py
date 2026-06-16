@@ -12,14 +12,15 @@ Public surface is the iterators / fetchers the CLI consumes:
 - :meth:`get_location`
 - :meth:`get_power_group`
 
-Field names follow the ChargEye reference (``stationId``, ``maxPowerKw``,
-``netBatterySizeKwh``, …). Translation to Favonius shapes happens in
-``mapping.py``, not here. The shared auth / retry / pagination plumbing lives
-in :mod:`src.adapters.rest_client`.
+Field names follow the official ChargEye OpenAPI specs at docs.kempower.io
+(``stationId``, ``maxPowerKw``, ``fullChargeEnergykWh``, …). Translation to
+Favonius shapes happens in ``mapping.py``, not here. The shared auth / retry
+/ pagination plumbing lives in :mod:`src.adapters.rest_client`.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any, AsyncIterator, Optional
@@ -147,21 +148,33 @@ class KempowerClient(BaseRestClient):
         """Fetch one Power Group (load-balancing) object by Kempower id."""
         return await self._request("GET", f"/power-groups/{group_id}")
 
-    def iter_charging_stations(self, location_id: str) -> AsyncIterator[dict[str, Any]]:
+    # ChargEye's list endpoints, per the official OpenAPI specs at
+    # docs.kempower.io: stations + vehicles are unversioned bare resources and
+    # take ``locationUid`` (the system-internal location id; ``locationId`` is
+    # a *customer-supplied* reference field, NOT the right query param name).
+    # Transactions are scoped under their charging station and paginate with
+    # DynamoDB-style ``exclusiveStartKey`` / ``lastEvaluatedKey`` instead of a
+    # generic ``{items, nextPage}`` envelope, so we drive iteration directly
+    # rather than going through BaseRestClient._iter_paginated.
+    async def iter_charging_stations(self, location_id: str) -> AsyncIterator[dict[str, Any]]:
         """Iterate ChargingStation objects scoped to a Location."""
-        return self._iter_paginated(
-            "/charging-stations",
-            params={"locationId": location_id},
-        )
+        body = await self._request("GET", "/stations", params={"locationUid": location_id})
+        for item in body.get("stations") or []:
+            yield item
 
-    def iter_vehicles(self, location_id: str) -> AsyncIterator[dict[str, Any]]:
-        """Iterate Vehicle objects scoped to a Location."""
-        return self._iter_paginated(
-            "/vehicles",
-            params={"locationId": location_id},
-        )
+    async def iter_vehicles(self, location_id: str) -> AsyncIterator[dict[str, Any]]:
+        """Iterate Vehicle objects scoped to a Location.
 
-    def iter_transactions(
+        The /vehicles response wraps each vehicle in a ``VehicleRecord``
+        (``{"vehicle": <VehicleDTO>, "v2icp": <…>}``); unwrap to the inner
+        DTO so downstream sees the flat vehicle fields (``id``,
+        ``fullChargeEnergykWh``, …).
+        """
+        body = await self._request("GET", "/vehicles", params={"locationUid": location_id})
+        for record in body.get("vehicles") or []:
+            yield record.get("vehicle") or record
+
+    async def iter_transactions(
         self,
         *,
         station_id: str,
@@ -169,11 +182,13 @@ class KempowerClient(BaseRestClient):
         end_iso: str,
     ) -> AsyncIterator[dict[str, Any]]:
         """Iterate Transaction objects for a station within a time window."""
-        return self._iter_paginated(
-            "/transactions",
-            params={
-                "stationId": station_id,
-                "from": start_iso,
-                "to": end_iso,
-            },
-        )
+        path = f"/chargingStations/{station_id}/transactions"
+        params: dict[str, Any] = {"startDate": start_iso, "endDate": end_iso}
+        while True:
+            body = await self._request("GET", path, params=params)
+            for item in body.get("transactions") or []:
+                yield item
+            cursor = body.get("lastEvaluatedKey")
+            if not cursor:
+                break
+            params["exclusiveStartKey"] = json.dumps(cursor)

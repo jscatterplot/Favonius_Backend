@@ -237,6 +237,81 @@ async def test_close_marks_connector_unavailable(db_pool, timescale_client, clea
 
 
 @pytest.mark.asyncio
+async def test_close_carries_tenant_and_fires_charger_fault(
+    db_pool, timescale_client, cleanup_station
+):
+    """Org-stamp fix: a WS drop copies organization_id/depot_id onto the
+    Unavailable row, so the migration-022 trigger raises a ``charger_fault``
+    alert on disconnect; reconnect appends ``Available`` and resolves it."""
+    station_id = cleanup_station
+    org_id = uuid.uuid4()
+    depot_id = uuid.uuid4()
+    dedup_key = f"charger_fault:{station_id}:1"
+
+    async with db_pool.acquire() as conn:
+        # Prior online status carrying tenant context (as the OCPP handler
+        # writes it on a StatusNotification).
+        await conn.execute(
+            """
+            INSERT INTO connector_status (
+                station_id, connector_id, status, error_code, timestamp,
+                organization_id, depot_id
+            ) VALUES ($1, 1, 'Available', 'NoError', NOW() - INTERVAL '1 minute', $2, $3)
+            """,
+            station_id,
+            org_id,
+            depot_id,
+        )
+
+    try:
+        await timescale_client.mark_connectors_unavailable(station_id)
+
+        async with db_pool.acquire() as conn:
+            marker = await conn.fetchrow(
+                """
+                SELECT status, error_code, organization_id, depot_id
+                  FROM connector_status
+                 WHERE station_id = $1 AND connector_id = 1
+                 ORDER BY timestamp DESC LIMIT 1
+                """,
+                station_id,
+            )
+            assert marker["status"] == "Unavailable"
+            assert marker["error_code"] == "ConnectionLost"
+            # Tenant context carried forward — this is what lets the trigger fire.
+            assert marker["organization_id"] == org_id
+            assert marker["depot_id"] == depot_id
+
+            alert = await conn.fetchrow(
+                """
+                SELECT alert_type, status, organization_id
+                  FROM notification_alerts WHERE dedup_key = $1
+                """,
+                dedup_key,
+            )
+            assert alert is not None
+            assert alert["alert_type"] == "charger_fault"
+            assert alert["status"] == "active"
+            assert alert["organization_id"] == org_id
+
+        # Reconnect clears the marker and the trigger resolves the alert.
+        cleared = await timescale_client.mark_connectors_available_after_reconnect(station_id)
+        assert cleared == 1
+
+        async with db_pool.acquire() as conn:
+            resolved = await conn.fetchval(
+                "SELECT status FROM notification_alerts WHERE dedup_key = $1",
+                dedup_key,
+            )
+            assert resolved == "resolved"
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM notification_alerts WHERE dedup_key = $1", dedup_key
+            )
+
+
+@pytest.mark.asyncio
 async def test_offline_profile_is_queued_then_replayed_on_boot(
     db_pool, timescale_client, cleanup_station
 ):
