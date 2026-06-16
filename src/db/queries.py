@@ -172,44 +172,56 @@ _TELEMETRY_ONLY_VEHICLE_SOC_SQL = """
 
 # Full latest row per vehicle (charger fields + telematics SoC merge). Telematics
 # rows contribute soc/time only; charger telemetry carries power/plug state.
+# soc/time come from the fresher feed (charger wins ties); plug/power fields
+# always come from the latest charger row within the scan window.
 _MERGED_VEHICLE_TELEMETRY_SQL = """
-    SELECT DISTINCT ON (vehicle_id)
-        vehicle_id::text AS vehicle_id,
-        time,
-        soc,
-        charging_kw,
-        charger_id::text AS charger_id,
-        is_plugged,
-        energy_kwh
-    FROM (
-        SELECT
+    WITH charger_latest AS (
+        SELECT DISTINCT ON (vehicle_id)
             vehicle_id,
-            time,
-            soc,
+            time AS charger_time,
+            soc AS charger_soc,
             charging_kw,
             charger_id,
             is_plugged,
-            energy_kwh,
-            0 AS src_priority
+            energy_kwh
         FROM telemetry
         WHERE vehicle_id = ANY($1::uuid[])
           AND time > $2
-        UNION ALL
-        SELECT
+        ORDER BY vehicle_id, time DESC
+    ),
+    telematics_latest AS (
+        SELECT DISTINCT ON (vehicle_id)
             vehicle_id,
-            time,
-            soc,
-            NULL::double precision AS charging_kw,
-            NULL::uuid AS charger_id,
-            NULL::boolean AS is_plugged,
-            NULL::double precision AS energy_kwh,
-            1 AS src_priority
+            time AS telematics_time,
+            soc AS telematics_soc
         FROM vehicle_telemetry
         WHERE vehicle_id = ANY($1::uuid[])
           AND soc IS NOT NULL
           AND time > $2
-    ) merged
-    ORDER BY vehicle_id, time DESC, src_priority
+        ORDER BY vehicle_id, time DESC
+    )
+    SELECT
+        COALESCE(c.vehicle_id, t.vehicle_id)::text AS vehicle_id,
+        CASE
+            WHEN c.vehicle_id IS NULL THEN t.telematics_time
+            WHEN t.vehicle_id IS NULL THEN c.charger_time
+            WHEN t.telematics_time > c.charger_time THEN t.telematics_time
+            WHEN c.charger_time > t.telematics_time THEN c.charger_time
+            ELSE c.charger_time
+        END AS time,
+        CASE
+            WHEN c.vehicle_id IS NULL THEN t.telematics_soc
+            WHEN t.vehicle_id IS NULL THEN c.charger_soc
+            WHEN t.telematics_time > c.charger_time THEN t.telematics_soc
+            WHEN c.charger_time > t.telematics_time THEN c.charger_soc
+            ELSE c.charger_soc
+        END AS soc,
+        c.charging_kw,
+        c.charger_id::text AS charger_id,
+        c.is_plugged,
+        c.energy_kwh
+    FROM charger_latest c
+    FULL OUTER JOIN telematics_latest t USING (vehicle_id)
 """
 
 _TELEMETRY_ONLY_VEHICLE_TELEMETRY_SQL = """
