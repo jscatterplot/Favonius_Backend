@@ -475,20 +475,33 @@ class SchemaRegistry:
                                             "type": "array",
                                             "items": {
                                                 "type": "object",
-                                                "required": ["chargingPointId", "status"],
+                                                # Field names mirror the official schema and the
+                                                # _charging_point_info_to_dict output so HARD-mode
+                                                # validation passes when this minimal fallback is
+                                                # the only loaded schema (no cache/fetch/bundled).
+                                                "required": [
+                                                    "chargingPointId",
+                                                    "chargingPointStatus",
+                                                ],
                                                 "properties": {
                                                     "chargingPointId": {"type": "string"},
-                                                    "status": {
+                                                    "chargingPointStatus": {
                                                         "type": "string",
+                                                        # Mirror the official
+                                                        # ChargingPointStatus enum
+                                                        # (incl. Reserved) so HARD
+                                                        # mode accepts every status
+                                                        # the builder may copy.
                                                         "enum": [
                                                             "Available",
                                                             "Occupied",
-                                                            "Faulted",
+                                                            "Reserved",
                                                             "Unavailable",
+                                                            "Faulted",
                                                         ],
                                                     },
-                                                    "currentPowerKw": {"type": "number"},
-                                                    "vehicleId": {"type": "string"},
+                                                    "presentPower": {"type": "number"},
+                                                    "vehicleInfo": {"type": "object"},
                                                 },
                                             },
                                         },
@@ -500,6 +513,14 @@ class SchemaRegistry:
                 },
             },
         }
+
+        # MessageStructure uses the draft-04/07 tuple form (`items: [...]`). Declare
+        # the draft explicitly on every inline schema so modern jsonschema meta-
+        # validates them as draft-07 rather than the latest draft (2020-12), under
+        # which tuple `items` raises SchemaError before any message can be parsed.
+        # Only reachable on the offline / cache-miss fallback path.
+        for _schema in self.schemas.values():
+            _schema.setdefault("$schema", "http://json-schema.org/draft-07/schema#")
 
         self.logger.info(
             "Created minimal inline schemas (fallback when fetch and bundled unavailable)"

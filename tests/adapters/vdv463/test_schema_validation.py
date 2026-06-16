@@ -217,3 +217,78 @@ class TestProvideChargingInformationSchema:
         assert len(st_list) == 1
         assert st_list[0]["chargingPointInfoList"][0]["chargingPointStatus"] == "Occupied"
         assert st_list[0]["chargingPointInfoList"][0]["presentPower"] == 30.0
+
+
+@pytest.fixture
+def minimal_registry(monkeypatch):
+    """A SchemaRegistry forced onto its inline fallback (no network/cache/bundled).
+
+    This is the offline / cache-miss path that became reachable once the vendored
+    VDV 463 schemas were removed from the tree.
+    """
+    import adapters.vdv463.messages as vdv_messages
+
+    monkeypatch.setattr(vdv_messages, "_fetch_schemas_to_cache", lambda *a, **k: False)
+    registry = vdv_messages.SchemaRegistry(schema_dir="/nonexistent/vdv463-test-cache")
+    assert registry._schema_source == "minimal"
+    return registry
+
+
+class TestMinimalFallbackSchemas:
+    """Offline / cache-miss fallback: the inline schemas must be meta-valid and
+    accept everything the builders and dataclasses emit, or HARD-mode validation
+    (the production default) silently drops VDV messages.
+    """
+
+    @pytest.mark.parametrize(
+        "status", ["Available", "Occupied", "Reserved", "Unavailable", "Faulted"]
+    )
+    def test_provide_charging_information_status_enum(self, minimal_registry, status):
+        """Every official ChargingPointStatus validates against the minimal fallback.
+
+        Regression: the fallback enum omitted ``Reserved`` and used field names
+        (`status`/`currentPowerKw`) that diverged from the builder output, so a
+        HARD-mode depot would reject its own ProvideChargingInformation message.
+        """
+        depot = DepotInfo(
+            depot_id="d1",
+            charging_station_info_list=[
+                ChargingStationInfo(
+                    charging_station_id="d1",
+                    charging_station_status="Available",
+                    charging_point_info_list=[
+                        ChargingPointInfo(
+                            charging_point_id="cp-1",
+                            charging_point_status=status,
+                            present_power=42.0,
+                        ),
+                    ],
+                )
+            ],
+        )
+        payload = build_provide_charging_information_message("ps1", [depot])[6]
+        # HARD raises VDV463ValidationError on any violation; a clean pass -> [].
+        warnings = minimal_registry.validate_payload(
+            payload, "ProvideChargingInformation", ValidationMode.HARD
+        )
+        assert warnings == []
+
+    def test_message_structure_parses_offline(self, minimal_registry):
+        """The inline MessageStructure schema must itself be a valid schema.
+
+        It uses the draft-04/07 tuple form ``items: [...]``; without an explicit
+        ``$schema`` modern jsonschema meta-validates it as draft 2020-12 and raises
+        SchemaError, breaking every offline parse before HARD/SOFT handling.
+        """
+        message = [
+            1,
+            "BMS",
+            "presystem_001",
+            "2025-01-01T00:00:00Z",
+            "11111111-1111-4111-8111-111111111111",
+            "BootNotification",
+            {"presystem": "BMS"},
+        ]
+        # Must not raise: SchemaError (invalid schema) or VDV463ValidationError
+        # (valid message). A clean return means the fallback works offline.
+        minimal_registry.validate_message_structure(message)

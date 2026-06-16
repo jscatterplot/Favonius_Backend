@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Optional
 from urllib.parse import quote_plus, urlparse
+from uuid import UUID
 
 import asyncpg
 import pytest
@@ -15,9 +17,11 @@ import pytest_asyncio
 from prometheus_client import REGISTRY, CollectorRegistry
 
 from src.db.postgres_url import prepare_asyncpg_url_and_ssl
+from src.db.queries import resolve_bidding_zone
 
 _DEFAULT_TEST_DB_URL = "postgresql://postgres:postgres@localhost:5432/favonius_test"
-HRX_PILOT_SITE_ID = "f6a8acca-d9c2-4db1-9174-f43641f291cf"
+PILOT_SITE_ID = "a1b2c3d4-0000-4000-8000-000000000001"
+LITHUANIA_BIDDING_ZONE = "10YLT-1001A0008Q"
 
 
 @dataclass(frozen=True)
@@ -86,6 +90,44 @@ async def create_pool_from_url(url: str) -> asyncpg.Pool:
 async def create_integration_pool() -> asyncpg.Pool:
     """asyncpg pool for integration tests (local or TigerCloud via TEST_DATABASE_URL)."""
     return await create_pool_from_url(resolve_integration_ts_url())
+
+
+async def find_lithuania_site_id(
+    static_pool: asyncpg.Pool,
+    *,
+    timezone_fallback_only: bool = False,
+) -> Optional[UUID]:
+    """Find a live ``sites`` row that resolves to Lithuania's ENTSO-E zone.
+
+    Split-database staging runs cannot INSERT into Supabase; tests that used
+    a scrubbed placeholder ``PILOT_SITE_ID`` must discover a real depot instead.
+    """
+    if timezone_fallback_only:
+        query = """
+            SELECT id
+              FROM sites
+             WHERE timezone = 'Europe/Vilnius'
+               AND (
+                 tariff_config IS NULL
+                 OR tariff_config->>'entsoe_zone' IS NULL
+                 OR trim(tariff_config->>'entsoe_zone') = ''
+               )
+             LIMIT 1
+        """
+        async with static_pool.acquire() as conn:
+            row = await conn.fetchrow(query)
+        return row["id"] if row else None
+
+    async with static_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id FROM sites WHERE timezone = 'Europe/Vilnius' LIMIT 20"
+        )
+    for row in rows:
+        async with static_pool.acquire() as conn:
+            zone = await resolve_bidding_zone(conn, row["id"])
+        if zone == LITHUANIA_BIDDING_ZONE:
+            return row["id"]
+    return None
 
 
 async def _static_schema_available(pool: asyncpg.Pool) -> bool:

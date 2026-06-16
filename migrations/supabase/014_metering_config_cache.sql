@@ -12,7 +12,7 @@
 --
 -- Without a per-firmware cache the handler re-runs the full sequence on
 -- every WebSocket reconnect. Each ``ChangeConfiguration`` takes ~2 s on
--- ABB Terra AC, and a mid-bootstrap drop (observed at HRX Vilnius —
+-- ABB Terra AC, and a mid-bootstrap drop (observed at the pilot depot —
 -- chargers reconnect every ~60 s) leaves the rest of the keys stranded
 -- and the cycle loops indefinitely.
 --

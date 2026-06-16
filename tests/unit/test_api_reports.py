@@ -1903,7 +1903,7 @@ def _approved_report_row(kind: str = "monthly_consumption", *, status: str = "ap
         "group_by": "card",
         "period_start": datetime(2026, 4, 1, tzinfo=ZoneInfo("UTC")),
         "period_end": datetime(2026, 5, 1, tzinfo=ZoneInfo("UTC")),
-        "data": {"group_by": "card", "rows": [], "totals": None, "depot_name": "HRX"},
+        "data": {"group_by": "card", "rows": [], "totals": None, "depot_name": "the pilot depot"},
     }
 
 

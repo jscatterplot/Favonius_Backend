@@ -2492,7 +2492,7 @@ class DepotBillingPayload(BaseModel):
 class BuildingLoadSourcePayload(BaseModel):
     """Building load source configuration.
 
-    Per PRD §9.4 (post-HRX revision), building load is OPTIONAL for
+    Per PRD §9.4 (post-pilot revision), building load is OPTIONAL for
     initial onboarding. When ``type == 'static_assumption'``, the depot
     supplies a single ``assumption_kw`` value that the optimizer applies
     as a constant baseline load on the grid (so the site-power
@@ -2502,7 +2502,7 @@ class BuildingLoadSourcePayload(BaseModel):
         - ``meter`` — live Modbus/SCADA meter
         - ``api`` — building management system API
         - ``manual`` — manually entered baseline schedule
-        - ``static_assumption`` — single-scalar derate (HRX day-one)
+        - ``static_assumption`` — single-scalar derate (pilot day-one)
         - ``none`` — no source configured (read-only flag, never used
           to drive optimization)
     """
@@ -4719,7 +4719,7 @@ def _resolve_import_end_time(
 
     if computed_end is None:
         # File-end-only path — no duration to corroborate, so insane ends are
-        # rejected rather than silently stored. This is the bug the broken HRX
+        # rejected rather than silently stored. This is the bug the broken pilot
         # XLSX import created in production.
         if not _is_sane(end_time_utc):
             raise HTTPException(
@@ -4739,7 +4739,7 @@ def _resolve_import_end_time(
 
     # Both present: trust the file end only when it is sane AND agrees with
     # the duration-derived end within tolerance. Disagreement is a strong
-    # signal that the file end is the bad column (this is the HRX scenario).
+    # signal that the file end is the bad column (this is the pilot scenario).
     if (
         _is_sane(end_time_utc)
         and abs(end_time_utc - computed_end) <= _IMPORT_END_MISMATCH_TOLERANCE
@@ -5049,7 +5049,7 @@ async def import_historical_charging_session(
             },
         )
 
-    # Use rfid_label when present (new TOKS flow); fall back to id_tag (legacy).
+    # Use rfid_label when present (new rfid-label flow); fall back to id_tag (legacy).
     # When both identifiers are absent, classify as platform-initiated import.
     id_token = request.rfid_label or request.id_tag or _PLATFORM_IMPORT_ID_TOKEN
     # Platform-initiated dedup hashing MUST always use the raw file end_time,
@@ -5124,7 +5124,7 @@ async def import_historical_charging_session(
                     card_id               = COALESCE(charging_sessions.card_id, EXCLUDED.card_id),
                     -- Overwrite end_time when the new payload provides one.
                     -- A re-import is the customer's signal that the previously
-                    -- stored end was wrong (e.g. the broken HRX XLSX with bad
+                    -- stored end was wrong (e.g. the broken pilot XLSX with bad
                     -- end_time cells fixed by `session_duration_seconds`).
                     -- The resolver already sanitised the incoming value, so a
                     -- non-NULL EXCLUDED.end_time is always more trustworthy.

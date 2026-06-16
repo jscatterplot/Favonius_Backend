@@ -81,7 +81,7 @@ def _first_depot_payload(max_grid_kw: float = 1200.0) -> dict:
     """Valid first depot setup payload."""
     return {
         "depot": {
-            "name": "TOKS Vilnius Depot",
+            "name": "Pilot Depot",
             "address": {
                 "line1": "Main street 1",
                 "line2": "optional",
@@ -508,7 +508,7 @@ class TestMyDepots:
     def test_unprovisioned_role_with_org_id_signals_setup(self, client, mock_db_pool):
         """User with org_id but no favonius_role in app_metadata still sees needs_setup=True.
 
-        Regression: gustas.diksa@hrx.lt had an organization but app_metadata.favonius_role
+        Regression: operator@pilot.lt had an organization but app_metadata.favonius_role
         was unset, so role resolved to 'authenticated'. The early role-check returned
         needs_setup=False, hiding the depot wizard entirely.
         """
@@ -1024,7 +1024,7 @@ class TestChargerVehicleAccessEndpoint:
         )
         conn.fetchval = AsyncMock(side_effect=[True, "explicit_matrix"])
         depot_row = {
-            "name": "TOKS Vilnius Depot",
+            "name": "Pilot Depot",
             "timezone": "Europe/Vilnius",
             "currency": "EUR",
             "max_grid_kw": 1200.0,
@@ -1875,7 +1875,7 @@ class TestDepotMetadata:
             return_value={
                 "depot_id": DEPOT_ID,
                 "organization_id": DEFAULT_ORG_ID,
-                "name": "TOKS Vilnius",
+                "name": "Pilot Depot",
                 "timezone": "Europe/Vilnius",
                 "currency": "EUR",
                 "max_grid_kw": 800.0,

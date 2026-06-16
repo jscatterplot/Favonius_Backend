@@ -1,7 +1,7 @@
 """Integration tests for GET /depots/{id}/power-timeline against real TimescaleDB.
 
 Exercises the history-aggregation SQL the unit tests can't fake (they mock the
-query's output rows). The regression of record: a real depot (HRX Vilnius) runs
+query's output rows). The regression of record: a real depot (the pilot depot) runs
 ABB Terra chargers whose firmware emits only the cumulative
 ``Energy.Active.Import.Register`` measurand and no instantaneous
 ``Power.Active.Import`` — so ``telemetry.charging_kw`` is NULL and the

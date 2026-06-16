@@ -60,7 +60,7 @@ async def test_recover_orphaned_sessions_closes_stale_row_with_running_meter():
         return_value=[
             {
                 "session_id": "00000000-0000-0000-0000-000000000001",
-                "station_id": "hrx-station-1",
+                "station_id": "pilot-station-1",
                 "transaction_id": 42,
                 "meter_start_wh": 1000,
                 "last_meter_wh": 5000,
@@ -72,7 +72,7 @@ async def test_recover_orphaned_sessions_closes_stale_row_with_running_meter():
     conn.fetchrow = AsyncMock(
         return_value={
             "session_id": "00000000-0000-0000-0000-000000000001",
-            "station_id": "hrx-station-1",
+            "station_id": "pilot-station-1",
             "transaction_id": 42,
             "meter_start_wh": 1000,
             "meter_stop_wh": 5000,
@@ -108,7 +108,7 @@ async def test_recover_orphaned_sessions_closes_without_meter_writes_null_energy
         return_value=[
             {
                 "session_id": "00000000-0000-0000-0000-000000000002",
-                "station_id": "hrx-station-2",
+                "station_id": "pilot-station-2",
                 "transaction_id": 43,
                 "meter_start_wh": 1000,
                 "last_meter_wh": None,  # MeterValues never carried register
@@ -120,7 +120,7 @@ async def test_recover_orphaned_sessions_closes_without_meter_writes_null_energy
     conn.fetchrow = AsyncMock(
         return_value={
             "session_id": "00000000-0000-0000-0000-000000000002",
-            "station_id": "hrx-station-2",
+            "station_id": "pilot-station-2",
             "transaction_id": 43,
             "meter_start_wh": 1000,
             "meter_stop_wh": None,
@@ -188,7 +188,7 @@ async def test_recover_orphaned_sessions_idempotent_when_update_loses_race():
         return_value=[
             {
                 "session_id": "00000000-0000-0000-0000-000000000004",
-                "station_id": "hrx-station-4",
+                "station_id": "pilot-station-4",
                 "transaction_id": 45,
                 "meter_start_wh": 1000,
                 "last_meter_wh": 5000,

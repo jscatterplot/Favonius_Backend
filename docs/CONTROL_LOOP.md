@@ -135,7 +135,7 @@ imported. See `src/core/state/assembler.py` (presence captured before
 |---|---|---|
 | `meter` | `building_load` table has rows for the horizon | `ready` |
 | `forecast_fallback` | Live source configured but data missing/stale | `degraded` (substitutes a deterministic business-hours pattern) |
-| `static_assumption` | Depot configured `building_load_assumption_kw > 0` (HRX day-one) | `degraded`; MILP grid-balance adds a constant baseline equal to `building_load_assumption_kw` so `max_grid_kw` is still respected |
+| `static_assumption` | Depot configured `building_load_assumption_kw > 0` (pilot day-one) | `degraded`; MILP grid-balance adds a constant baseline equal to `building_load_assumption_kw` so `max_grid_kw` is still respected |
 | `absent` | Source could not be resolved at all (e.g. n_steps=0) | `not_ready` |
 
 ## Error Handling and Resilience

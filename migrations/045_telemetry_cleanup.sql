@@ -8,7 +8,7 @@
 --      fallback path, backfill_terra_meter_start.py) have been rewired to
 --      telemetry.energy_kwh in the same PR.
 --   3. NULL out poisoned soc values (fabricated 0.0 only). The ABB Terra AC
---      chargers deployed at HRX do not send SoC measurands; the `soc or 0.0`
+--      chargers deployed at the pilot depot do not send SoC measurands; the `soc or 0.0`
 --      bug wrote 0.0 when soc was absent. Real SoC from the SoC measurand is
 --      preserved (any non-zero fraction, and 0.0 when samples prove SoC).
 

@@ -570,7 +570,7 @@ Additional constraints that originate outside the optimiser but are equally bind
 
 - Driver hours of service (per applicable jurisdiction).
 - Contractual SLAs per route / contract.
-- Regulatory and security constraints (geo-blocking, wireless-module prohibition, NIS2 obligations) — see `docs/COMPLIANCE_GAP_ANALYSIS.md`, `docs/SECURITY_NETWORK_ARCHITECTURE.md`, `docs/WIRELESS_PROHIBITION_POLICY.md`.
+- Regulatory and security constraints (geo-blocking, wireless-module prohibition, NIS2 obligations) — see `docs/SECURITY_NETWORK_ARCHITECTURE.md`, `docs/WIRELESS_PROHIBITION_POLICY.md`.
 
 ### 10.4 Audit immutability
 
@@ -694,7 +694,7 @@ This PRD describes the product layer. The underlying systems are documented sepa
 - **OCPP runbook & smoke tests:** `docs/PILOT_RUNBOOK.md`, `docs/EVEREST_TESTING.md`.
 - **OCPP local auth list roadmap:** `docs/plans/ocpp_local_auth_list_roadmap.md`.
 - **Manual charger authorize (frontend):** `docs/frontend/manual_charger_authorize.md`.
-- **Regulatory / security:** `docs/COMPLIANCE_GAP_ANALYSIS.md` (Article 73-3, NIS2/TIS2, IEC 62443), `docs/SECURITY_NETWORK_ARCHITECTURE.md`, `docs/SECURITY_DECLARATION_ESO.md`, `docs/WIRELESS_PROHIBITION_POLICY.md`, `docs/VULNERABILITY_DISCLOSURE_POLICY.md`.
+- **Regulatory / security:** `docs/SECURITY_NETWORK_ARCHITECTURE.md` (IEC 62443 zones), `docs/WIRELESS_PROHIBITION_POLICY.md`, `docs/VULNERABILITY_DISCLOSURE_POLICY.md`.
 - **Engineering preferences & repository conventions:** `CLAUDE.md` (project root).
 - **Customer pilot scopes:** to be added per pilot.
 

@@ -52,7 +52,7 @@ legacy `src/websocket_handler` orchestrates per session
   consult the list (`LocalAuthListEnabled`, `LocalPreAuthorize`,
   `AuthorizationCacheEnabled`) and disables the ABB vendor key `FreevendEnabled`.
   A fail-fast bootstrap short-circuits when the critical key is rejected.
-- Capability handling beyond the original plan, hardened against the HRX Vilnius ABB
+- Capability handling beyond the original plan, hardened against the pilot depot ABB
   Terra AC V1.8.x firmware: a `GetConfiguration` probe
   (`SupportedFeatureProfiles`, `LocalAuthListMaxLength`) plus a firmware-scoped
   negative cache short-circuit every subsequent reconnect for chargers that don't

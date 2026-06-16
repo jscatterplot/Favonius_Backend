@@ -1,5 +1,5 @@
 -- Add ISO 4217 currency code to depots for frontend display of pricing.
--- Defaults to EUR for existing rows (TOKS Vilnius and European depots).
+-- Defaults to EUR for existing rows (the pilot depot and other European depots).
 -- Update individual depots to USD, GBP, etc. as needed.
 
 DO $$

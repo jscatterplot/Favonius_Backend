@@ -65,7 +65,7 @@ class TestGetDepotActiveSessions:
         pool, _ = mock_db_pool
         app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
 
-        ocpp_id = "hrx-uab_hrx-vilnius-001"
+        ocpp_id = "pilot-depot-001"
         ocpp_id_map = {ocpp_id: str(uuid4())}
         active_rows = [
             {
@@ -155,7 +155,7 @@ class TestGetDepotActiveSessions:
         pool, _ = mock_db_pool
         app.dependency_overrides[ensure_tenant_mirrored] = _override_token(_user(org_id))
 
-        ocpp_id = "hrx-uab_hrx-vilnius-005"
+        ocpp_id = "pilot-depot-005"
         active_rows = [
             {
                 "session_id": str(uuid4()),
@@ -221,7 +221,7 @@ class TestGetDepotActiveSessions:
             patch(
                 "src.api.main.db_queries.charger_id_by_ocpp_id",
                 new_callable=AsyncMock,
-                return_value={"hrx-uab_hrx-vilnius-001": str(uuid4())},
+                return_value={"pilot-depot-001": str(uuid4())},
             ),
             patch(
                 "src.api.main.db_queries.list_active_sessions_for_depot",
@@ -256,7 +256,7 @@ class TestGetDepotActiveSessions:
             patch(
                 "src.api.main.db_queries.charger_id_by_ocpp_id",
                 new_callable=AsyncMock,
-                return_value={"hrx-001": str(uuid4())},
+                return_value={"pilot-001": str(uuid4())},
             ) as map_mock,
             patch(
                 "src.api.main.db_queries.list_active_sessions_for_depot", list_mock
@@ -296,7 +296,7 @@ class TestGetDepotSessions:
         rows = [
             {
                 "session_id": sid_a,
-                "ocpp_id": "hrx-001",
+                "ocpp_id": "pilot-001",
                 "connector_id": 1,
                 "vehicle_id": str(uuid4()),
                 "driver_id": None,
@@ -332,7 +332,7 @@ class TestGetDepotSessions:
             patch(
                 "src.api.main.db_queries.charger_id_by_ocpp_id",
                 new_callable=AsyncMock,
-                return_value={"hrx-001": str(uuid4())},
+                return_value={"pilot-001": str(uuid4())},
             ),
             patch(
                 "src.api.main.db_queries.list_completed_sessions_for_depot",
@@ -363,7 +363,7 @@ class TestGetDepotSessions:
         rows = [
             {
                 "session_id": str(uuid4()),
-                "ocpp_id": "hrx-001",
+                "ocpp_id": "pilot-001",
                 "connector_id": 1,
                 "vehicle_id": None,
                 "driver_id": None,
@@ -384,7 +384,7 @@ class TestGetDepotSessions:
             patch(
                 "src.api.main.db_queries.charger_id_by_ocpp_id",
                 new_callable=AsyncMock,
-                return_value={"hrx-001": str(uuid4())},
+                return_value={"pilot-001": str(uuid4())},
             ),
             patch(
                 "src.api.main.db_queries.list_completed_sessions_for_depot",
@@ -432,7 +432,7 @@ class TestGetDepotSessions:
         page1_rows = [
             {
                 "session_id": last_session_id,
-                "ocpp_id": "hrx-001",
+                "ocpp_id": "pilot-001",
                 "connector_id": 1,
                 "vehicle_id": None,
                 "driver_id": None,
@@ -454,7 +454,7 @@ class TestGetDepotSessions:
             patch(
                 "src.api.main.db_queries.charger_id_by_ocpp_id",
                 new_callable=AsyncMock,
-                return_value={"hrx-001": str(uuid4())},
+                return_value={"pilot-001": str(uuid4())},
             ),
             patch(
                 "src.api.main.db_queries.list_completed_sessions_for_depot", list_mock

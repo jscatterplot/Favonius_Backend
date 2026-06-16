@@ -58,8 +58,8 @@ def _row_payload(**overrides) -> dict:
         "id_tag": "ED8503",
         "status": "Finished",
         "transaction_type": "RFID",
-        "user_full_name": "HRX Transport",
-        "station_owner_full_name": "Gustas Diksa",
+        "user_full_name": "Pilot Transport",
+        "station_owner_full_name": "Pilot Operator",
     }
     payload.update(overrides)
     return payload
@@ -252,8 +252,8 @@ class TestPureHelpers:
             "rfid_label": None,
             "status": "Finished",
             "transaction_type": "Dashboard",
-            "user_full_name": "HRX Transport",
-            "station_owner_full_name": "Gustas Diksa",
+            "user_full_name": "Pilot Transport",
+            "station_owner_full_name": "Pilot Operator",
         }
         request_base = HistoricalSessionImport(**common)
         end_time = datetime(2026, 5, 10, 22, 17, tzinfo=timezone.utc)
@@ -324,7 +324,7 @@ class TestPureHelpers:
 class TestResolveImportEndTime:
     """Pin the decision table from `_resolve_import_end_time`.
 
-    Motivated by the HRX bug: the XLSX `end_time` column held absurd values
+    Motivated by the pilot bug: the XLSX `end_time` column held absurd values
     (Dec 2026 etc.) while the duration column was trustworthy. The resolver
     prefers `start + duration` whenever the two disagree or the file end is
     insane, and refuses to silently persist far-future / multi-week ends.
@@ -425,7 +425,7 @@ class TestResolveImportEndTime:
             )
 
     def test_bad_file_end_with_good_duration_uses_computed(self):
-        """The HRX scenario: file end is Dec 2026 but duration is 90 minutes."""
+        """The pilot scenario: file end is Dec 2026 but duration is 90 minutes."""
         start = self._utc(2026, 5, 5, 12, 0)
         bad_end = self._utc(2026, 12, 31, 12, 0)
         result = _resolve_import_end_time(
@@ -1141,7 +1141,7 @@ class TestHistoricalChargingSessionImport:
         assert response.json()["error_code"] == "DEPOT_NOT_FOUND"
 
     # ---------------------------------------------------------------------- #
-    # rfid_label resolution (TOKS export flow)
+    # rfid_label resolution (rfid-label export flow)
     # ---------------------------------------------------------------------- #
 
     def test_rfid_label_matches_card_label_case_insensitive(self, client, mock_db_pool):
@@ -1401,7 +1401,7 @@ class TestHistoricalChargingSessionImport:
         assert bind[6] == datetime(2026, 5, 5, 11, 26, tzinfo=timezone.utc)
 
     def test_bad_file_end_with_duration_uses_computed_end(self, client, mock_db_pool):
-        """The HRX bug: file end is Dec 2026 but duration is 90 min.
+        """The pilot bug: file end is Dec 2026 but duration is 90 min.
 
         Pre-fix this row landed with end_time = Dec 2026; cost backfill then
         tried to pull 7 months of ENTSO-E prices and gave up. After the fix

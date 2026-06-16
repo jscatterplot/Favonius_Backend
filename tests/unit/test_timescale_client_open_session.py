@@ -94,7 +94,7 @@ async def test_insert_open_session_lock_binds_single_text_param():
     client, _ = _client_with_conn(conn)
 
     await client.insert_open_session(
-        station_id="hrx-uab_hrx-vilnius-001",
+        station_id="pilot-depot-001",
         transaction_id=42,
         evse_id=1,
         connector_id=1,
@@ -107,7 +107,7 @@ async def test_insert_open_session_lock_binds_single_text_param():
     assert len(lock_args) == 1, "lock query should bind exactly one parameter"
     lock_key = lock_args[0]
     assert isinstance(lock_key, str)
-    assert lock_key == "hrx-uab_hrx-vilnius-001:42"
+    assert lock_key == "pilot-depot-001:42"
 
 
 # =====================================================================

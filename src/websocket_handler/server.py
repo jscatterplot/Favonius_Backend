@@ -601,8 +601,8 @@ class OCPPWebSocketServer:
         # Extract station ID from path.
         #
         # Most chargers send the OCPP-spec single-segment path
-        # ``/ocpp/{charge_point_id}``, but some integrations (e.g. the HRX
-        # Vilnius pilot's ABB Terra AC wallboxes) embed the depot routing
+        # ``/ocpp/{charge_point_id}``, but some integrations (e.g. the pilot
+        # depot's ABB Terra AC wallboxes) embed the depot routing
         # in the path: ``/ocpp/{canonical_station_id}/{charger_serial}``.
         # The OCPP 1.6 spec treats charge_point_id as opaque, so we accept
         # any number of segments after ``/ocpp/`` and use the LAST segment

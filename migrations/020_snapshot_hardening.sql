@@ -17,7 +17,7 @@
 --        promoted to a TimescaleDB hypertable on captured_at
 --      - hypertable + 90-day retention policy on captured_at
 --
--- HRX onboarding: building_load_assumption_kw is set at depot setup time;
+-- pilot onboarding: building_load_assumption_kw is set at depot setup time;
 -- the readiness check downgrades runs to 'degraded' when the source is
 -- 'static_assumption'.
 

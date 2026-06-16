@@ -382,7 +382,7 @@ def test_imported_rows_appear_alongside_live_rows_in_monthly_report(client):
     with patch("src.api.main.db_pools", pools), patch(
         "src.api.main.verify_depot_access", new_callable=AsyncMock
     ), patch("src.api.main._audit_identity_write", new_callable=AsyncMock):
-        # Import row #1: HRX example, Finished, 24.044 kWh.
+        # Import row #1: pilot example, Finished, 24.044 kWh.
         r1 = client.post(
             f"/admin/depots/{depot_id}/charging-sessions/import",
             headers=AUTH_HDR,
@@ -395,8 +395,8 @@ def test_imported_rows_appear_alongside_live_rows_in_monthly_report(client):
                 "id_tag": "ED8503",
                 "status": "Finished",
                 "transaction_type": "RFID",
-                "user_full_name": "HRX Transport",
-                "station_owner_full_name": "Gustas Diksa",
+                "user_full_name": "Pilot Transport",
+                "station_owner_full_name": "Pilot Operator",
             },
         )
         assert r1.status_code == status.HTTP_201_CREATED, r1.text
@@ -414,8 +414,8 @@ def test_imported_rows_appear_alongside_live_rows_in_monthly_report(client):
                 "id_tag": "Opel Mokka",
                 "status": "Finished",
                 "transaction_type": "RFID",
-                "user_full_name": "HRX Transport",
-                "station_owner_full_name": "Gustas Diksa",
+                "user_full_name": "Pilot Transport",
+                "station_owner_full_name": "Pilot Operator",
             },
         )
         assert r2.status_code == status.HTTP_201_CREATED, r2.text
@@ -454,7 +454,7 @@ def test_imported_rows_appear_alongside_live_rows_in_monthly_report(client):
 def test_imported_only_depot_still_renders_in_monthly_report(client):
     """A depot with zero live rows still surfaces imported XLSX rows in reports.
 
-    Pilots without OCPP-emitted sessions (HRX-style) rely on this path. The
+    Pilots without OCPP-emitted sessions (pilot-style) rely on this path. The
     report query must NOT short-circuit when the depot has no chargers in
     ``charging_stations``.
     """
@@ -489,8 +489,8 @@ def test_imported_only_depot_still_renders_in_monthly_report(client):
                 "id_tag": "ED8503",
                 "status": "Finished",
                 "transaction_type": "RFID",
-                "user_full_name": "HRX Transport",
-                "station_owner_full_name": "Gustas Diksa",
+                "user_full_name": "Pilot Transport",
+                "station_owner_full_name": "Pilot Operator",
             },
         )
         assert post_resp.status_code == status.HTTP_201_CREATED, post_resp.text
@@ -543,8 +543,8 @@ def test_imported_rows_outside_window_are_excluded(client):
                 "id_tag": "ED8503",
                 "status": "Finished",
                 "transaction_type": "RFID",
-                "user_full_name": "HRX Transport",
-                "station_owner_full_name": "Gustas Diksa",
+                "user_full_name": "Pilot Transport",
+                "station_owner_full_name": "Pilot Operator",
             },
         ).raise_for_status()
 
@@ -591,8 +591,8 @@ def test_platform_initiated_import_without_rfid_fields_is_reported(client):
                 "rfid_label": None,
                 "status": "Finished",
                 "transaction_type": "Dashboard",
-                "user_full_name": "HRX Transport",
-                "station_owner_full_name": "Gustas Diksa",
+                "user_full_name": "Pilot Transport",
+                "station_owner_full_name": "Pilot Operator",
             },
         )
         assert post_resp.status_code == status.HTTP_201_CREATED, post_resp.text

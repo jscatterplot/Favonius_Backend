@@ -25,7 +25,7 @@ from src.websocket_handler.meter_value_utils import DEFAULT_SYNTHESIZED_DELTA_CA
 def _row(**overrides):
     base = {
         "session_id": "sess-1",
-        "station_id": "hrx-uab_hrx-vilnius-005",
+        "station_id": "pilot-depot-005",
         "transaction_id": 18,
         "start_time": datetime(2026, 5, 14, 9, 11, 42, tzinfo=timezone.utc),
         "end_time": datetime(2026, 5, 14, 9, 30, 0, tzinfo=timezone.utc),

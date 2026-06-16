@@ -218,8 +218,8 @@ class OCPP16Session:
         # for every OCPP frame the charger sends. ``_force_boot_notification``
         # reads this after the grace period to decide whether the charger is
         # silent (trigger needed) or already chatting (skip — re-bootstrapping
-        # a clearly-alive charger on every reconnect is what caused the HRX
-        # Vilnius reconfig loop).
+        # a clearly-alive charger on every reconnect is what caused the pilot depot
+        # reconfig loop).
         self._inbound_frame_count: int = 0
         self._replay_task: Optional[asyncio.Task[None]] = None
         self._local_auth_sync_task: Optional[asyncio.Task[None]] = None
@@ -1088,7 +1088,7 @@ class OCPP16Session:
         current BootNotification. A match means every key in
         ``_METERING_CONFIG_KEYS`` was confirmed by the charger on this
         firmware — re-pushing on reconnect is wasted work and exactly the
-        round-trip storm that caused the HRX Vilnius reconfig loop.
+        round-trip storm that caused the pilot depot reconfig loop.
 
         Returns ``False`` in three cases:
           1. The current firmware is unknown (no BootNotification yet, or
@@ -1265,7 +1265,7 @@ class OCPP16Session:
         ``_METERING_CONFIG_KEYS`` was accepted by the charger on its
         current firmware, the bootstrap is short-circuited on subsequent
         reconnects until the charger reports a new ``firmware_version``.
-        This is the fix for the HRX Vilnius reconfig loop where ABB Terra
+        This is the fix for the pilot depot reconfig loop where ABB Terra
         AC chargers reconnected every ~60 s and the full ~15 s bootstrap
         re-ran on every cycle. See migration 014.
 

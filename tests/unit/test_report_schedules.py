@@ -150,7 +150,7 @@ def _report_row():
         "group_by": "card",
         "period_start": _dt(2026, 5, 1),
         "period_end": _dt(2026, 5, 31),
-        "data": {"group_by": "card", "rows": [], "totals": None, "depot_name": "HRX"},
+        "data": {"group_by": "card", "rows": [], "totals": None, "depot_name": "the pilot depot"},
     }
 
 

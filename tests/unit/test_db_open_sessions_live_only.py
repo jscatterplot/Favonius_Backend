@@ -39,7 +39,7 @@ async def test_open_sessions_by_stations_filters_to_live_source():
     assert "source = 'live'" in query
     # ``id_token AS id_tag`` is part of the projection so the chargers
     # endpoint can render the raw RFID when the cards-only auth path
-    # leaves ``vehicle_id`` null (HRX cards-only fleet pattern).
+    # leaves ``vehicle_id`` null (pilot cards-only fleet pattern).
     assert "id_token" in query
     assert "AS id_tag" in query
 
