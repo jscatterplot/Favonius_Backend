@@ -80,7 +80,26 @@ from ..db.exceptions import (
 from ..db.pools import DatabasePools
 from ..db.postgres_url import describe_database_target
 from ..db.snapshot_store import persist_snapshot
-from ..monitoring.metrics import AGENT_AUTOMATION_SUGGESTIONS, CONTROLLER_MANAGER_UP
+from ..monitoring.metrics import CONTROLLER_MANAGER_UP
+from ..observability.log_buffer import (
+    get_log_buffer,
+    install_log_buffer,
+    redact_log_line,
+    uninstall_log_buffer,
+)
+from ..observability.support_summary import (
+    ScreenshotRejected,
+    SupportSummaryBundle,
+    build_summary_text,
+    decode_screenshot,
+    delete_support_summary,
+    deliver_support_summary,
+    extract_last_error_line,
+    fetch_support_summary,
+    persist_support_summary,
+    render_logs_excerpt,
+    run_support_summary_purge_loop,
+)
 from ..security.admin_audit import AdminAuditRow, AdminAuditWriteError, write_admin_audit_row
 from ..security.audit_log import AuditEvent, AuditLogger, get_audit_logger, set_audit_logger
 from ..security.auth import (
@@ -623,6 +642,22 @@ async def lifespan(app: FastAPI):
     _create_background_task(run_navirec_poll_loop(static_pool, ts_pool))
     logger.info("Navirec telematics poller task started")
 
+    # ── Support-summary log ring buffer + retention purge ────────────────────
+    # The "This isn't right" support report attaches the last ~5 minutes of API
+    # logs, so capture them in-process via a bounded ring buffer (count + age).
+    # The purge loop hard-deletes support reports past their GDPR retention.
+    install_log_buffer(
+        max_records=int(os.getenv("SUPPORT_LOG_BUFFER_MAX_RECORDS", "5000")),
+        max_age_seconds=float(os.getenv("SUPPORT_LOG_BUFFER_MAX_AGE_SECONDS", "900")),
+    )
+    _create_background_task(
+        run_support_summary_purge_loop(
+            ts_pool,
+            interval_seconds=float(os.getenv("SUPPORT_SUMMARY_PURGE_INTERVAL_SECONDS", "3600")),
+        )
+    )
+    logger.info("Support summary log buffer installed + purge loop started")
+
     # ── SQL-agent token-budget reconcile ──────────────────────────────────────
     # Flushes low-traffic usage that never trips the on-write threshold and
     # re-hydrates cross-worker totals on a timer (bounds multi-worker over-spend).
@@ -722,6 +757,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Error stopping audit logger: {e}", exc_info=True)
 
+    try:
+        uninstall_log_buffer()
+        logger.info("Support log ring-buffer uninstalled")
+    except Exception as e:
+        logger.error(f"Error uninstalling log buffer: {e}", exc_info=True)
+
     await static_pool.close()
     logger.info("Static (Supabase) pool closed")
     if ts_pool is not static_pool:
@@ -778,6 +819,22 @@ _MAX_BODY_SIZE = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(1 * 1024 * 1024))) 
 _CHARGER_LOG_UPLOAD_PATH = UPLOAD_PATH
 
 
+# Support-summary ("This isn't right") report endpoint. The screenshot arrives
+# as a base64 image inside a JSON body, so the body cap must allow the decoded
+# screenshot cap plus base64 inflation (~4/3) and the small text fields.
+_SUPPORT_SUMMARY_PATH = "/support/summary"
+
+
+def get_support_screenshot_max_bytes() -> int:
+    """Decoded-screenshot size cap (read at call time so tests can override)."""
+    return int(os.getenv("SUPPORT_SCREENSHOT_MAX_BYTES", str(5 * 1024 * 1024)))
+
+
+def _support_summary_body_limit() -> int:
+    # base64 inflates ~4/3; add 256 KiB headroom for JSON envelope + note.
+    return (get_support_screenshot_max_bytes() * 4) // 3 + (256 * 1024)
+
+
 def _body_size_limit_for_path(path: str) -> int:
     if path == _CHARGER_LOG_UPLOAD_PATH:
         # Lazy import: the upload-token helper reads env at call time so
@@ -785,6 +842,8 @@ def _body_size_limit_for_path(path: str) -> int:
         from ..adapters.chargers.upload_token import get_max_upload_bytes
 
         return get_max_upload_bytes()
+    if path == _SUPPORT_SUMMARY_PATH:
+        return _support_summary_body_limit()
     return _MAX_BODY_SIZE
 
 
@@ -10794,44 +10853,358 @@ async def upload_charger_log_endpoint(
     )
 
 
+# ── Context-aware support summary ("This isn't right") ────────────────────────
+
+
+class SupportSummaryRequest(BaseModel):
+    """Body for ``POST /support/summary`` (the "This isn't right" report).
+
+    The frontend captures the screen and sends it as base64 — a bare base64
+    string with ``screenshot_content_type``, or a ``data:image/...;base64,...``
+    URL. JSON (not multipart) is used so no extra server dependency is needed.
+    """
+
+    page: str = Field(..., max_length=200, description="Frontend page/route the user was viewing")
+    user_note: Optional[str] = Field(None, max_length=2000, description="Optional free-text note")
+    depot_id: Optional[str] = Field(None, description="Depot UUID when the page is depot-scoped")
+    screenshot_base64: Optional[str] = Field(
+        None, description="UI screenshot as base64 or a data: URL (image/png|jpeg|webp)"
+    )
+    screenshot_content_type: Optional[str] = Field(
+        None, description="Screenshot MIME type when screenshot_base64 is a bare base64 string"
+    )
+
+
+class SupportSummaryResponse(BaseModel):
+    """Acknowledgement returned to the reporter.
+
+    Deliberately omits the engineering ``summary_text`` and any log excerpt:
+    those are derived from the process-wide log buffer and can contain other
+    tenants' request data, so they are stored + emailed to engineering
+    (favonius_admin) only — never returned to the submitting tenant user.
+    """
+
+    id: str = Field(..., description="Support summary UUID")
+    status: str = Field(..., description="Always 'received'")
+    health_snapshot: dict = Field(..., description="Tiger Cloud + WebSocket status at report time")
+    delivery_status: str = Field(..., description="Always 'pending' at creation (email is async)")
+    created_at: str = Field(..., description="Creation timestamp (ISO 8601)")
+
+
+@app.post(
+    "/support/summary",
+    response_model=SupportSummaryResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["support"],
+    summary="File a context-aware support report ('This isn't right')",
+    description=(
+        "Bundle a UI screenshot, the last ~5 minutes of API logs, and a live "
+        "Tiger Cloud / WebSocket health snapshot into an engineering summary. "
+        "Open to any authenticated tenant user. Logs / note are PII-redacted, "
+        "the row is GDPR-retention-bounded, and it is emailed to engineering "
+        "post-commit (best-effort)."
+    ),
+    responses={
+        400: {"model": ErrorResponse},
+        401: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+        413: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+)
+async def submit_support_summary(
+    request: Request,
+    body: SupportSummaryRequest,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Assemble and persist a support report, then deliver it to engineering."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+
+    user_id = str(user.get("sub") or "")
+    org_id = get_user_organization_id(user)
+    if not user_id:
+        return _build_error_response(request, ErrorCode.UNAUTHORIZED)
+    if not org_id:
+        return _build_error_response(
+            request,
+            ErrorCode.FORBIDDEN,
+            detail="Access denied: missing organization_id in token app_metadata",
+        )
+
+    depot_id = body.depot_id
+    if depot_id:
+        validate_depot_id(depot_id)
+        await verify_depot_access(depot_id, user, db_pools.static)
+
+    # Decode + validate the optional screenshot.
+    try:
+        decoded = decode_screenshot(
+            body.screenshot_base64,
+            body.screenshot_content_type,
+            max_bytes=get_support_screenshot_max_bytes(),
+        )
+    except ScreenshotRejected as exc:
+        return _build_error_response(
+            request, ErrorCode.INVALID_INPUT, status_code=exc.status_code, detail=exc.reason
+        )
+
+    screenshot_bytes: Optional[bytes] = None
+    screenshot_ct: Optional[str] = None
+    screenshot_sha: Optional[str] = None
+    screenshot_size: Optional[int] = None
+    if decoded is not None:
+        screenshot_bytes, screenshot_ct = decoded
+        screenshot_sha = hashlib.sha256(screenshot_bytes).hexdigest()
+        screenshot_size = len(screenshot_bytes)
+
+    # Gather context — best-effort; never fail the report on these. The ring
+    # buffer is process-wide, so logs_excerpt / last_error_line are recent
+    # SERVER logs (may span requests/tenants); they are persisted + emailed to
+    # engineering only and never returned to the reporter (see the response
+    # model). One buffer scan; derive the last error from the same records.
+    buf = get_log_buffer()
+    if buf is not None:
+        records = buf.get_records(since_seconds=300)
+        logs_excerpt = render_logs_excerpt(
+            records,
+            max_bytes=int(os.getenv("SUPPORT_LOG_EXCERPT_MAX_BYTES", str(64 * 1024))),
+        )
+        last_error_rec = next((r for r in reversed(records) if r.level >= logging.ERROR), None)
+        last_error_line = extract_last_error_line(last_error_rec)
+    else:
+        logs_excerpt = ""
+        last_error_line = None
+
+    # Redact the user-supplied page (query strings can carry tokens/PII) before
+    # it enters the stored/emailed summary.
+    redacted_page = redact_log_line(body.page)
+    health = await build_health_snapshot()
+    summary_text = build_summary_text(
+        user_id=user_id,
+        page=redacted_page,
+        tiger_cloud_status=health["tiger_cloud"],
+        websocket_status=health["websocket"],
+        last_error_line=last_error_line,
+    )
+
+    bundle = SupportSummaryBundle(
+        user_id=user_id,
+        organization_id=org_id,
+        depot_id=depot_id,
+        page=redacted_page,
+        user_note=redact_log_line(body.user_note) if body.user_note else None,
+        screenshot=screenshot_bytes,
+        screenshot_content_type=screenshot_ct,
+        screenshot_size_bytes=screenshot_size,
+        screenshot_sha256=screenshot_sha,
+        logs_excerpt=logs_excerpt,
+        health_snapshot=health,
+        summary_text=summary_text,
+    )
+
+    retention_days = int(os.getenv("SUPPORT_SUMMARY_RETENTION_DAYS", "90"))
+    new_id = await persist_support_summary(db_pools.ts, bundle, retention_days=retention_days)
+
+    # Audit (best-effort) — never put PII / bytes in metadata.
+    await write_admin_audit_row(
+        db_pools.ts,
+        AdminAuditRow(
+            action="support.summary.created",
+            actor_user_id=user_id,
+            actor_role=get_user_role(user),
+            organization_id=org_id,
+            depot_id=depot_id,
+            target_type="support_summary",
+            target_id=new_id,
+            metadata={
+                "page": redacted_page,
+                "has_screenshot": screenshot_bytes is not None,
+                "tiger_cloud": health["tiger_cloud"],
+                "websocket": health["websocket"],
+            },
+        ),
+    )
+
+    # Deliver to engineering post-commit (best-effort, off the request path).
+    _create_background_task(
+        deliver_support_summary(
+            db_pools.ts,
+            report_email_client,
+            summary_id=new_id,
+            default_from=report_email_from,
+            eng_recipient=os.getenv("SUPPORT_ENG_RECIPIENT", "").strip() or None,
+        )
+    )
+
+    return SupportSummaryResponse(
+        id=new_id,
+        status="received",
+        health_snapshot=health,
+        delivery_status="pending",
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+async def _audit_support_summary_access(
+    user: dict, summary_id: str, action: str, target_type: str
+) -> None:
+    """Write an audit row for a support-report read/delete (accountability)."""
+    if not db_pools:
+        return
+    await write_admin_audit_row(
+        db_pools.ts,
+        AdminAuditRow(
+            action=action,
+            actor_user_id=str(user.get("sub") or ""),
+            actor_role=get_user_role(user),
+            organization_id=get_user_organization_id(user),
+            target_type=target_type,
+            target_id=summary_id,
+        ),
+    )
+
+
+@app.get(
+    "/support/summary/{summary_id}",
+    tags=["support"],
+    summary="Fetch a support report (engineering only)",
+    dependencies=[Depends(require_favonius_admin())],
+    responses={
+        401: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+    },
+)
+async def get_support_summary(
+    summary_id: str,
+    request: Request,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Return a stored support report (metadata + logs + health, no inline image)."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    validate_uuid(summary_id, "summary_id")
+    row = await fetch_support_summary(db_pools.ts, summary_id)
+    if row is None:
+        return _build_error_response(request, ErrorCode.NOT_FOUND)
+    await _audit_support_summary_access(user, summary_id, "support.summary.read", "support_summary")
+    for key in ("created_at", "expires_at"):
+        if row.get(key) is not None and hasattr(row[key], "isoformat"):
+            row[key] = row[key].isoformat()
+    row["has_screenshot"] = row.get("screenshot_size_bytes") is not None
+    return row
+
+
+@app.get(
+    "/support/summary/{summary_id}/screenshot",
+    tags=["support"],
+    summary="Fetch a support report's screenshot (engineering only)",
+    dependencies=[Depends(require_favonius_admin())],
+    responses={
+        401: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+    },
+)
+async def get_support_summary_screenshot(
+    summary_id: str,
+    request: Request,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Return the raw screenshot bytes for a stored support report."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    validate_uuid(summary_id, "summary_id")
+    row = await fetch_support_summary(db_pools.ts, summary_id, include_screenshot=True)
+    if row is None or not row.get("screenshot"):
+        return _build_error_response(request, ErrorCode.NOT_FOUND)
+    await _audit_support_summary_access(
+        user, summary_id, "support.summary.read", "support_summary_screenshot"
+    )
+    return Response(
+        content=bytes(row["screenshot"]),
+        media_type=row.get("screenshot_content_type") or "application/octet-stream",
+    )
+
+
+@app.delete(
+    "/support/summary/{summary_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["support"],
+    summary="Delete a support report (GDPR erasure; engineering only)",
+    dependencies=[Depends(require_favonius_admin())],
+    responses={
+        401: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+    },
+)
+async def delete_support_summary_endpoint(
+    summary_id: str,
+    request: Request,
+    user: dict = Depends(ensure_tenant_mirrored),
+):
+    """Hard-delete a support report (right-to-erasure)."""
+    if not db_pools:
+        raise DatabaseError("Database not available")
+    validate_uuid(summary_id, "summary_id")
+    deleted = await delete_support_summary(db_pools.ts, summary_id)
+    if not deleted:
+        return _build_error_response(request, ErrorCode.NOT_FOUND)
+    await _audit_support_summary_access(
+        user, summary_id, "support.summary.deleted", "support_summary"
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 # ── Health checks ─────────────────────────────────────────────────────────────
 
 
-async def check_database_health() -> str:
-    """Check database connectivity.
+async def _check_pool_health(pool: Any, *, label: str) -> str:
+    """Ping an asyncpg pool with ``SELECT 1``.
 
-    Returns:
-        "healthy" if database is accessible, "unavailable" otherwise
+    Returns "healthy" if reachable, "unavailable" otherwise (incl. ``pool is None``).
     """
-    if not db_pools:
+    if pool is None:
         return "unavailable"
-
     try:
-        async with db_pools.static.acquire() as conn:
+        async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
         return "healthy"
     except Exception as e:
-        logger.warning(f"Database health check failed: {e}")
+        logger.warning("%s health check failed: %s", label, e)
         return "unavailable"
 
 
-async def check_ocpp_server_health() -> str:
+async def check_database_health() -> str:
+    """Check Supabase (``static`` pool) connectivity. "healthy" or "unavailable"."""
+    return await _check_pool_health(db_pools.static if db_pools else None, label="Database")
+
+
+async def check_ocpp_server_health(server: Any | None = None) -> str:
     """Check OCPP server health.
+
+    Args:
+        server: Optional in-process server instance. When omitted, uses the
+            module-level ``ocpp_server``. Pass a captured reference to avoid
+            TOCTOU if the global is cleared between check and use.
 
     Returns:
         "healthy", "unavailable", or "unknown"
     """
     global ocpp_server
 
-    if ocpp_server is None:
+    active = ocpp_server if server is None else server
+    if active is None:
         return "unknown"
 
     try:
         # Check if server is running
-        if hasattr(ocpp_server, "_running") and ocpp_server._running:
+        if hasattr(active, "_running") and active._running:
             # Check if any charge points are connected
-            if hasattr(ocpp_server, "charge_points"):
-                connected_count = len(ocpp_server.charge_points)
+            if hasattr(active, "charge_points"):
+                connected_count = len(active.charge_points)
                 if connected_count > 0:
                     return "healthy"
                 else:
@@ -10842,6 +11215,69 @@ async def check_ocpp_server_health() -> str:
     except Exception as e:
         logger.debug(f"OCPP server health check error: {e}")
         return "unknown"
+
+
+async def check_tiger_cloud_health() -> str:
+    """Check Tiger Cloud (TimescaleDB ``ts`` pool) connectivity.
+
+    "Tiger Cloud" is the product name for the TimescaleDB time-series store;
+    :func:`check_database_health` covers the separate Supabase (``static``) pool.
+    Returns "healthy" or "unavailable".
+    """
+    return await _check_pool_health(db_pools.ts if db_pools else None, label="Tiger Cloud")
+
+
+async def check_websocket_health() -> tuple[str, str]:
+    """Resolve OCPP/WebSocket health and its source, gracefully.
+
+    Returns ``(status, source)`` where ``source`` ∈
+    {"in_process", "http_probe", "unknown"}:
+
+    * in-process ``ocpp_server`` present → reuse :func:`check_ocpp_server_health`
+      (note: it returns "unavailable" when running but with zero chargers),
+      source "in_process";
+    * else, if ``WEBSOCKET_HEALTH_PROBE_URL`` is set → HTTP-probe it
+      (200 → "healthy", other → "degraded", error/timeout → "unavailable"),
+      source "http_probe";
+    * else → ("unknown", "unknown").
+    """
+    active = ocpp_server
+    if active is not None:
+        return await check_ocpp_server_health(active), "in_process"
+
+    probe_url = os.getenv("WEBSOCKET_HEALTH_PROBE_URL", "").strip()
+    if not probe_url:
+        return "unknown", "unknown"
+
+    try:
+        import httpx  # noqa: PLC0415
+
+        timeout = float(os.getenv("WEBSOCKET_HEALTH_PROBE_TIMEOUT_S", "2.0"))
+        async with httpx.AsyncClient(timeout=timeout) as http_client:
+            resp = await http_client.get(probe_url)
+        return ("healthy" if resp.status_code == 200 else "degraded"), "http_probe"
+    except Exception as e:
+        logger.warning(f"WebSocket health probe failed: {e}")
+        return "unavailable", "http_probe"
+
+
+async def build_health_snapshot() -> dict:
+    """Assemble the system-health snapshot for a support summary.
+
+    Returns the Tiger Cloud + WebSocket statuses, the resolved WebSocket
+    source (for engineering triage), and the capture timestamp. Status
+    vocabulary: "healthy" | "degraded" | "unavailable" | "unknown".
+    """
+    tiger_cloud, (websocket, websocket_source) = await asyncio.gather(
+        check_tiger_cloud_health(),
+        check_websocket_health(),
+    )
+    return {
+        "tiger_cloud": tiger_cloud,
+        "websocket": websocket,
+        "websocket_source": websocket_source,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def check_gurobi_license() -> str:
