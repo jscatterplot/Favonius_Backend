@@ -12,7 +12,7 @@ The readiness checker inspects the depot configuration plus the assembled
     2. A :class:`OptimizationInputSnapshot` that captures the full input
        bundle for persistence and replay.
 
-Building load is the canonical "degrade" trigger. Per the post-HRX PRD
+Building load is the canonical "degrade" trigger. Per the post-pilot PRD
 update (§9.4) building load is OPTIONAL for initial onboarding: when no
 live source is configured the depot supplies a static
 ``building_load_assumption_kw`` and the optimizer treats it as a constant
@@ -108,7 +108,7 @@ def evaluate_readiness(
             "note": "meter data missing; substituted business-hours forecast pattern",
         }
     elif building_load_source == BUILDING_LOAD_STATIC:
-        # Depot opted into the static-derate path (e.g. HRX day-one with
+        # Depot opted into the static-derate path (e.g. pilot day-one with
         # no meter integration). max_grid_kw is derated by
         # config.building_load_assumption_kw inside the MILP.
         degraded.append("building_load_static_assumption")

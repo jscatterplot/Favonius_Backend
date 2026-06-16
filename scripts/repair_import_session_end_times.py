@@ -37,13 +37,13 @@ Usage
 =====
 ::
 
-    # HRX pilot — dry-run first
+    # pilot — dry-run first
     python scripts/repair_import_session_end_times.py \\
-        --depot-id f6a8acca-d9c2-4db1-9174-f43641f291cf
+        --depot-id a1b2c3d4-0000-4000-8000-000000000001
 
     # Commit the same scope
     python scripts/repair_import_session_end_times.py \\
-        --depot-id f6a8acca-d9c2-4db1-9174-f43641f291cf \\
+        --depot-id a1b2c3d4-0000-4000-8000-000000000001 \\
         --apply
 
     # Audit all imports (no depot filter, dry-run)

@@ -1,6 +1,6 @@
 """Tests for the depot-level static building-load derate.
 
-Reference: migration 020, PRD §9.4 (post-HRX revision).
+Reference: migration 020, PRD §9.4 (post-pilot revision).
 
 When a depot has no live meter/forecast source it can opt into a static
 ``building_load_assumption_kw`` value. The optimizer treats this as a

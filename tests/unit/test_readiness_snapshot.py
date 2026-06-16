@@ -353,7 +353,7 @@ class TestSnapshotReplayPayloadIntegrity:
         assert payload["chargers"]["total"] == 4
 
 
-# ── 6. Static-assumption building load (HRX day-one) ────────────────────────
+# ── 6. Static-assumption building load (pilot day-one) ────────────────────────
 
 
 class TestStaticAssumptionBuildingLoad:

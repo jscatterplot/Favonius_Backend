@@ -484,7 +484,7 @@ class TestBootstrapConfig:
 
     @pytest.mark.asyncio
     async def test_critical_key_timeout_returns_unknown_and_skips_rest(self) -> None:
-        """The HRX Vilnius failure mode: bootstrap hangs because the charger
+        """The pilot depot failure mode: bootstrap hangs because the charger
         ACKed the WS at TCP level but never returned the ChangeConfiguration
         result. The per-call wait_for must catch this."""
 
@@ -557,7 +557,7 @@ class TestSyncChargerBootstrapUnsupportedSkipsSendLocalList:
     """L3 contract: when the bootstrap returns UNSUPPORTED, the caller MUST
     cache the firmware-scoped negative AND skip ``SendLocalList`` entirely.
     Without this branch a charger stuck in first-sync re-fires the whole
-    sequence on every reconnect (HRX Vilnius ABB Terra AC V1.8.x)."""
+    sequence on every reconnect (the pilot depot ABB Terra AC V1.8.x)."""
 
     @pytest.mark.asyncio
     async def test_critical_key_notsupported_skips_send_and_writes_cache(self, monkeypatch) -> None:
@@ -1035,7 +1035,7 @@ class TestProbeLocalAuthSupport:
 
     @pytest.mark.asyncio
     async def test_profiles_missing_local_auth_list_returns_false(self) -> None:
-        """The HRX/ABB Terra AC V1.8.x case: profile is omitted."""
+        """The pilot depot/ABB Terra AC V1.8.x case: profile is omitted."""
         cp = _make_cp(
             get_configuration_response={
                 "configuration_key": [

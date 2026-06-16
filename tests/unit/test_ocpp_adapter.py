@@ -114,14 +114,14 @@ async def test_boot_notification_invokes_callback_without_kwarg_clash(
     response = await cp.on_boot_notification(
         "ABB",
         "TerraAC",
-        charge_point_serial_number="TACW1141622G1433",
+        charge_point_serial_number="TACW1000000G0001",
         firmware_version="V1.8.36",
         iccid="89000000000000000000",
     )
 
     assert isinstance(response, call_result.BootNotification)
     assert captured["firmware_version"] == "V1.8.36"
-    assert captured["serial_number"] == "TACW1141622G1433"
+    assert captured["serial_number"] == "TACW1000000G0001"
     # firmware_version must be stripped from kwargs to prevent the TypeError;
     # other extra fields (charge_point_serial_number, iccid, ...) must survive.
     assert "firmware_version" not in captured["extra_kwargs"]

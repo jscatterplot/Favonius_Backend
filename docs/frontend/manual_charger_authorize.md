@@ -196,7 +196,7 @@ provides quick context when something goes wrong.
   a small follow-up but isn't in the initial PR.
 - **Showing the synthetic id_tag.** It's an internal implementation detail;
   the UI never needs to reveal `OP-<uuid>` to operators.
-- **OCPP 2.0.1 chargers.** This brief covers OCPP 1.6 (the HRX pilot's chargers).
+- **OCPP 2.0.1 chargers.** This brief covers OCPP 1.6 (the pilot's chargers).
   The OCPP 2.0.1 path will need parallel wiring through
   `EnhancedOCPPChargePoint.send_remote_start_transaction` — separate PR when
   the first OCPP 2.0.1 charger lands.

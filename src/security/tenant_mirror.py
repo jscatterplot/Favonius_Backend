@@ -274,7 +274,7 @@ async def repair_user_tenant_metadata(user: dict, pool: Optional["asyncpg.Pool"]
     (``favonius_role``, ``organization_id``, ``organization_name``) to Supabase.
 
     **Case B** — ``organization_id`` is present but ``favonius_role`` is absent
-    (the Gustas/HRX pattern): look up the role for that specific org and push
+    (the org-claim-without-role pattern): look up the role for that specific org and push
     just ``favonius_role`` (and ``organization_name`` if also absent). The
     ``organization_id`` is already correct in the JWT and is not overwritten.
 

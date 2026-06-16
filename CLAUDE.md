@@ -229,7 +229,7 @@ Favonius_Backend/
 │   ├── depot_config.yaml        # Depot configuration template
 │   └── tariff_config.yaml       # Tariff/rate configuration
 │
-├── schemas/vdv463/              # JSON schemas for VDV 463 message validation
+├── schemas/vdv463/              # VDV 463 schemas (fetched at runtime; not vendored — see README there)
 ├── optimization/                # Julia MILP reference implementation
 ├── monitoring/                  # Prometheus config
 ├── docs/                        # Architecture and API documentation
@@ -447,7 +447,7 @@ These come directly from the PRD and are non-negotiable:
 | Site grid power constraint (`max_grid_kw`) | NEVER violated | Section 9.4 |
 | MVP connector type | CCS only | Section 3.2 |
 
-**Building load is OPTIONAL for initial customer onboarding (e.g. HRX pilot)** — deferred until a meter/BMS integration is delivered. When no live source is configured, the optimizer runs in `degraded` mode and applies a depot-level static `building_load_assumption_kw` as a derate on `max_grid_kw` so the site-power constraint is still respected. The run's `status='degraded'` and the snapshot records the assumption used. Re-introduce as required once meter/BMS lands. (PRD Section 9.4)
+**Building load is OPTIONAL for initial customer onboarding (e.g. pilot)** — deferred until a meter/BMS integration is delivered. When no live source is configured, the optimizer runs in `degraded` mode and applies a depot-level static `building_load_assumption_kw` as a derate on `max_grid_kw` so the site-power constraint is still respected. The run's `status='degraded'` and the snapshot records the assumption used. Re-introduce as required once meter/BMS lands. (PRD Section 9.4)
 
 ---
 
@@ -510,7 +510,7 @@ Frontend-owned Supabase tables not consumed by this backend: `profiles`, `waitli
 - In-process TTL cache: `TENANT_MIRROR_TTL_S` (default `300`) seconds per `sub` to limit DB writes.
 - **Reverse-direction self-heal:** `repair_user_tenant_metadata` runs first in `ensure_tenant_mirrored`. Handles two cases:
   - **Case A** — JWT lacks `app_metadata.organization_id`: when the user has exactly one `user_organizations` row whose role is `owner` or `operator`, the repair `PUT`s the full triple (`favonius_role`, `organization_id`, `organization_name`) to `{SUPABASE_URL}/auth/v1/admin/users/{user_id}` using `SUPABASE_SERVICE_KEY`.
-  - **Case B** — JWT has `organization_id` but lacks `favonius_role` (the Gustas/HRX pattern): looks up the role for that specific `(user, org)` pair in `user_organizations` and pushes just `favonius_role` (plus `organization_name` if also absent). `organization_id` is not overwritten.
+  - **Case B** — JWT has `organization_id` but lacks `favonius_role` (the org-claim-without-role pattern): looks up the role for that specific `(user, org)` pair in `user_organizations` and pushes just `favonius_role` (plus `organization_name` if also absent). `organization_id` is not overwritten.
   In both cases the current request still proceeds with the unpatched token — the user's *next* token refresh sees the corrected claims. Skipped silently if `SUPABASE_URL`/`SUPABASE_SERVICE_KEY` are unset, no repairable membership exists, or the membership role is `admin`/`viewer` (the `admin` exclusion prevents a corrupted DB row from escalating to `favonius_admin`). Successful repairs log `tenant_metadata_repair: backfilled app_metadata` at WARNING level so high counts surface a frontend-signup regression.
 - Workspace **invitations** are managed in Supabase only; there is no `invitations` table in this backend.
 
@@ -706,7 +706,8 @@ Full coverage of all 28 OCPP 1.6 actions including: BootNotification, Heartbeat,
 
 VDV 463 is the German transit industry standard for BMS (Battery Management System) / ITCS (Intermodal Transport Control System) communication. Favonius acts as the CMS (Charging Management System).
 
-**Validated against schemas in `schemas/vdv463/`:**
+**Validated against the official VDV 463 JSON schemas** (fetched at runtime from
+<https://github.com/VDVde/VDV463>; not vendored — see `schemas/vdv463/README.md`):
 - `MessageStructure.json`
 - `ProvideChargingRequestsRequest.json`
 - `ProvideChargingInformationRequest.json`
@@ -1236,9 +1237,7 @@ make docker-verify
 | `docs/DATA_ANALYST_GUIDE.md` | Data access guide |
 | `docs/PILOT_RUNBOOK.md` | OCPP pilot ops runbook |
 | `docs/EVEREST_TESTING.md` | EVerest smoke test |
-| `docs/COMPLIANCE_GAP_ANALYSIS.md` | Lithuanian Art. 73-3 / NIS2 / IEC 62443 gap analysis |
 | `docs/SECURITY_NETWORK_ARCHITECTURE.md` | IEC 62443 security zones |
-| `docs/SECURITY_DECLARATION_ESO.md` | ESO security declaration template |
 | `docs/VULNERABILITY_DISCLOSURE_POLICY.md` | NIS2 Art. 21(2)(e) policy |
 | `docs/WIRELESS_PROHIBITION_POLICY.md` | Art. 73-3 wireless-module policy |
 | `docs/plans/ocpp_local_auth_list_roadmap.md` | OCPP local auth list staged roadmap |

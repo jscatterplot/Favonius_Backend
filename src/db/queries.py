@@ -2123,7 +2123,7 @@ async def list_authorized_id_tags(db, station_id: str) -> list[dict]:
         sufficient to authorize online, so it must also authorize offline.
         Excluding orphan cards (an earlier iteration of this query did so)
         breaks the invariant and produced empty pushes against deployments
-        that operate cards-only fleets, e.g. HRX Vilnius.
+        that operate cards-only fleets, e.g. the pilot depot.
 
     Returns each id_tag at most once, with a ``source`` discriminator
     (``vehicle`` | ``rfid_card``) for metrics and debug logging.

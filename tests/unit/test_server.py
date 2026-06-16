@@ -278,7 +278,7 @@ class TestOCPPWebSocketServer:
     @pytest.mark.timeout(10)
     async def test_basic_auth_alias_username_reaches_security_manager(self, server):
         """ABB serial usernames are preserved for alias-aware auth validation."""
-        credentials = base64.b64encode(b"TACW1141622G1433:secret").decode("ascii")
+        credentials = base64.b64encode(b"TACW1000000G0001:secret").decode("ascii")
         websocket = self._make_websocket(
             "10.0.0.5",
             {"Authorization": f"Basic {credentials}"},
@@ -289,11 +289,11 @@ class TestOCPPWebSocketServer:
             return_value=(False, "bad credentials")
         )
 
-        await server._handle_connection(websocket, "/ocpp/hrx-uab_hrx-vilnius-001")
+        await server._handle_connection(websocket, "/ocpp/pilot-depot-001")
 
         server.security_manager.authenticate_station.assert_awaited_once_with(
-            "hrx-uab_hrx-vilnius-001",
-            {"username": "TACW1141622G1433", "password": "secret"},
+            "pilot-depot-001",
+            {"username": "TACW1000000G0001", "password": "secret"},
         )
         websocket.close.assert_awaited_once_with(1008, "Authentication failed")
 
@@ -302,7 +302,7 @@ class TestOCPPWebSocketServer:
     async def test_ocpp_path_alias_resolves_from_supabase(self, server):
         """Vendor path identities resolve to canonical station ids before auth."""
         server.supabase_client.resolve_station_id = AsyncMock(
-            return_value="hrx-uab_hrx-vilnius-001"
+            return_value="pilot-depot-001"
         )
         websocket = self._make_websocket("10.0.0.5")
         server.security_manager = Mock()
@@ -311,11 +311,11 @@ class TestOCPPWebSocketServer:
             return_value=(False, "bad credentials")
         )
 
-        await server._handle_connection(websocket, "/ocpp/TACW1141622G1433")
+        await server._handle_connection(websocket, "/ocpp/TACW1000000G0001")
 
-        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1433")
+        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1000000G0001")
         server.security_manager.authenticate_station.assert_awaited_once_with(
-            "hrx-uab_hrx-vilnius-001",
+            "pilot-depot-001",
             {},
         )
         websocket.close.assert_awaited_once_with(1008, "Authentication failed")
@@ -326,7 +326,7 @@ class TestOCPPWebSocketServer:
         self, mock_config, mock_timescale_client, mock_connection_manager
     ):
         """When supabase_client is absent, alias resolution uses timescale_client."""
-        mock_timescale_client.resolve_station_id = AsyncMock(return_value="hrx-uab_hrx-vilnius-001")
+        mock_timescale_client.resolve_station_id = AsyncMock(return_value="pilot-depot-001")
         server = OCPPWebSocketServer(mock_config, mock_timescale_client)
         server.connection_manager = mock_connection_manager
         mock_task = Mock()
@@ -341,11 +341,11 @@ class TestOCPPWebSocketServer:
             return_value=(False, "bad credentials")
         )
 
-        await server._handle_connection(websocket, "/ocpp/TACW1141622G1433")
+        await server._handle_connection(websocket, "/ocpp/TACW1000000G0001")
 
-        mock_timescale_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1433")
+        mock_timescale_client.resolve_station_id.assert_awaited_once_with("TACW1000000G0001")
         server.security_manager.authenticate_station.assert_awaited_once_with(
-            "hrx-uab_hrx-vilnius-001",
+            "pilot-depot-001",
             {},
         )
 
@@ -354,7 +354,7 @@ class TestOCPPWebSocketServer:
     async def test_ocpp_multi_segment_path_uses_last_segment(self, server):
         """``/ocpp/{depot}/{charger}`` paths resolve to the charger serial.
 
-        Some integrations (HRX Vilnius pilot) embed depot routing in the
+        Some integrations (the pilot depot) embed depot routing in the
         WebSocket URL. The server must extract the trailing charger serial
         as the station id; the intermediate segment is used to auto-register
         an alias so downstream alias resolution targets the canonical row.
@@ -370,13 +370,13 @@ class TestOCPPWebSocketServer:
             return_value=(False, "bad credentials")
         )
 
-        await server._handle_connection(websocket, "/ocpp/hrx-uab_hrx-vilnius-001/TACW1141622G1433")
+        await server._handle_connection(websocket, "/ocpp/pilot-depot-001/TACW1000000G0001")
 
         # Alias lookup MUST target the charger serial, not the depot id.
-        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1433")
+        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1000000G0001")
         # Auth MUST receive the charger serial too.
         server.security_manager.authenticate_station.assert_awaited_once_with(
-            "TACW1141622G1433",
+            "TACW1000000G0001",
             {},
         )
 
@@ -385,7 +385,7 @@ class TestOCPPWebSocketServer:
     async def test_ocpp_multi_segment_path_auto_registers_alias(self, server):
         """Multi-segment OCPP paths upsert ``serial → parent`` before resolution.
 
-        This is the HRX Vilnius onboarding flow: the charger reports the
+        This is the pilot depot onboarding flow: the charger reports the
         trailing hardware serial as its CP id, but the parent segment is
         the operator-provisioned canonical station id. The server must
         ask the resolver to register the alias before resolving, so the
@@ -402,7 +402,7 @@ class TestOCPPWebSocketServer:
         # Resolver returns canonical AFTER ensure_station_alias has run, mirroring
         # the production flow (the freshly-inserted row is now visible).
         server.supabase_client.resolve_station_id = AsyncMock(
-            return_value="hrx-uab_hrx-vilnius-002"
+            return_value="pilot-depot-002"
         )
         websocket = self._make_websocket("10.0.0.5")
         server.security_manager = Mock()
@@ -411,13 +411,13 @@ class TestOCPPWebSocketServer:
             return_value=(False, "bad credentials")
         )
 
-        await server._handle_connection(websocket, "/ocpp/hrx-uab_hrx-vilnius-002/TACW1141622G1438")
+        await server._handle_connection(websocket, "/ocpp/pilot-depot-002/TACW1000000G0002")
 
-        assert registered_aliases == [("TACW1141622G1438", "hrx-uab_hrx-vilnius-002")]
-        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1438")
+        assert registered_aliases == [("TACW1000000G0002", "pilot-depot-002")]
+        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1000000G0002")
         # Once the alias is registered and resolved, auth runs on canonical.
         server.security_manager.authenticate_station.assert_awaited_once_with(
-            "hrx-uab_hrx-vilnius-002",
+            "pilot-depot-002",
             {},
         )
 
@@ -438,11 +438,11 @@ class TestOCPPWebSocketServer:
             return_value=(False, "bad credentials")
         )
 
-        await server._handle_connection(websocket, "/ocpp/hrx-uab_hrx-vilnius-002/TACW1141622G1438")
+        await server._handle_connection(websocket, "/ocpp/pilot-depot-002/TACW1000000G0002")
 
         # Resolution still ran with the unaliased serial — auth fails as a
         # natural consequence, not because we crashed the request.
-        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1438")
+        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1000000G0002")
         server.security_manager.authenticate_station.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -460,9 +460,9 @@ class TestOCPPWebSocketServer:
             return_value=(False, "bad credentials")
         )
 
-        await server._handle_connection(websocket, "/ocpp/TACW1141622G1433")
+        await server._handle_connection(websocket, "/ocpp/TACW1000000G0001")
 
-        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1141622G1433")
+        server.supabase_client.resolve_station_id.assert_awaited_once_with("TACW1000000G0001")
         # Single-segment paths must NOT trigger auto-registration; nothing
         # plausibly maps to a canonical id without a parent segment.
         server.supabase_client.ensure_station_alias.assert_not_awaited()
@@ -879,7 +879,7 @@ class TestProcessRequest:
 
 class TestServerCleanupConnectionRace:
     """Server-side guard against the late-cleanup race that fed the
-    hrx-vilnius reconnect cycle: connection A's _handle_connection task
+    pilot-depot reconnect cycle: connection A's _handle_connection task
     finishing long after A was replaced by B must not pop the station
     routing that now points at B."""
 
@@ -915,7 +915,7 @@ class TestServerCleanupConnectionRace:
     @pytest.mark.timeout(5)
     async def test_late_cleanup_preserves_successor_station_mapping(self, server):
         """A's late _cleanup_connection must NOT pop station→B mapping."""
-        station = "hrx-uab_hrx-vilnius-001"
+        station = "pilot-depot-001"
         old_id = "old-conn"
         new_id = "new-conn"
 
@@ -949,7 +949,7 @@ class TestServerCleanupConnectionRace:
     @pytest.mark.timeout(5)
     async def test_cleanup_when_current_pops_station_mapping(self, server):
         """The normal case: cleanup of the current connection clears state."""
-        station = "hrx-uab_hrx-vilnius-001"
+        station = "pilot-depot-001"
         conn_id = "current-conn"
 
         server.connections[conn_id] = Mock()
@@ -969,7 +969,7 @@ class TestServerCleanupConnectionRace:
     @pytest.mark.timeout(5)
     async def test_late_cleanup_does_not_mark_successor_connectors_unavailable(self, server):
         """Late cleanup must NOT mark connectors Unavailable for the live successor."""
-        station = "hrx-uab_hrx-vilnius-001"
+        station = "pilot-depot-001"
         old_id = "old-conn"
         new_id = "new-conn"
 
@@ -1032,7 +1032,7 @@ class TestServerCleanupConnectionLoopSafety:
     async def test_per_ip_counter_decremented_exactly_once_per_connection(self, server):
         """Eager cleanup of OLD followed by late cleanup of OLD must release
         the per-IP counter only once."""
-        station = "hrx-uab_hrx-vilnius-005"
+        station = "pilot-depot-005"
         old_id = "old-conn"
         client_ip = "85.254.97.158"
 
@@ -1110,7 +1110,7 @@ class TestServerCleanupConnectionLoopSafety:
         must still complete within the per-op timeout. Without the
         ``asyncio.wait_for`` wrapper, the eager reconnect branch would
         wedge here and queue up every new connection's handler."""
-        station = "hrx-uab_hrx-vilnius-005"
+        station = "pilot-depot-005"
         conn_id = "current-conn"
 
         server.connections[conn_id] = Mock()
@@ -1145,7 +1145,7 @@ class TestServerCleanupConnectionLoopSafety:
     async def test_cleanup_does_not_wedge_on_hung_unregister_connection(self, server):
         """Same guarantee for connection_manager.unregister_connection,
         which historically was the first await in _cleanup_connection."""
-        station = "hrx-uab_hrx-vilnius-005"
+        station = "pilot-depot-005"
         conn_id = "current-conn"
 
         server.connections[conn_id] = Mock()

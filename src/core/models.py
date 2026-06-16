@@ -118,7 +118,7 @@ class DepotConfig:
     battery_soc_max: float = 0.8
     max_site_power: float = 1000.0
     # Constant baseline load applied when the depot has no live building-load
-    # source (HRX-style onboarding). Optimizer treats it as additional grid
+    # source (pilot-style onboarding). Optimizer treats it as additional grid
     # demand so max_site_power is still respected. Zero when a meter or
     # forecast source is configured. See migration 020 + PRD §9.4.
     building_load_assumption_kw: float = 0.0

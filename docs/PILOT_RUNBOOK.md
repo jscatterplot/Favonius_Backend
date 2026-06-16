@@ -1,7 +1,7 @@
 # OCPP Pilot Runbook
 
 Operational runbook for bringing a physical OCPP 1.6 charger online against the
-Favonius backend and triaging the failure modes seen during a pilot (HRX Vilnius
+Favonius backend and triaging the failure modes seen during a pilot (the pilot depot
 ABB Terra AC). It is grounded in two scripts — `scripts/preflight.sh` and
 `scripts/pilot_simulator.py` — and the real operational tables
 (`station_credentials`, `connector_status`, `charging_command_queue`,

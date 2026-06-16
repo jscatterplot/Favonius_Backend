@@ -73,7 +73,7 @@ class TestComputeEnergyKwh:
         assert compute_energy_kwh(meter_stop_wh=1000, meter_start_wh=1000) == 0.0
 
     def test_none_when_meter_stop_missing(self):
-        """Missing meterStop — the HRX bug pattern. Must return None, not 0."""
+        """Missing meterStop — the pilot bug pattern. Must return None, not 0."""
         assert compute_energy_kwh(meter_stop_wh=None, meter_start_wh=1000) is None
 
     def test_none_when_meter_start_missing(self):

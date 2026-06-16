@@ -28,7 +28,7 @@ async def test_list_authorized_id_tags_compares_access_default_as_string() -> No
     ``operator does not exist: character varying = boolean`` at runtime,
     so the WHERE clause must use the canonical string literal instead.
     Regression guard for the offline-RFID sync that crashed against the
-    HRX Vilnius pilot.
+    the pilot depot.
     """
     db = MagicMock()
     db.fetch = AsyncMock(return_value=[])
@@ -56,7 +56,7 @@ async def test_list_authorized_id_tags_includes_orphan_cards() -> None:
     Earlier iterations of this query gated cards on ``rfid_card_vehicle_assignments``
     / ``rfid_card_driver_assignments`` EXISTS clauses, which silently
     excluded operator deployments that use cards without populating those
-    linkage tables (HRX Vilnius: 15 active orphan cards, zero vehicles).
+    linkage tables (the pilot depot: 15 active orphan cards, zero vehicles).
     That broke the invariant 'anything that authorizes online also
     authorizes offline' and produced empty SendLocalList pushes.
     """

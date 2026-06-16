@@ -39,6 +39,11 @@ htmlcov/
 .coverage
 .coverage.*
 .cache
+
+# VDV 463 schemas are fetched at runtime from the official VDV repository
+# (https://github.com/VDVde/VDV463) and are NOT redistributed here.
+# See schemas/vdv463/README.md.
+schemas/vdv463/*.json
 nosetests.xml
 coverage.xml
 *.cover

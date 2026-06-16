@@ -131,7 +131,7 @@ class TestConnectionManager:
         """Late unregister(A) must not nuke the station→B mapping after B took over.
 
         Regression for the "charger keeps reconnecting every ~30 s" cycle
-        observed on hrx-vilnius: connection A's _handle_connection task
+        observed on pilot-depot: connection A's _handle_connection task
         finishes long after A was already replaced by B via the
         ``Station already connected`` branch. Without the connection_id
         guard, that late unregister(A, station, A_id) was unconditionally

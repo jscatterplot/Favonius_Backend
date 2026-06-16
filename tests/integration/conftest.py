@@ -17,7 +17,7 @@ from prometheus_client import REGISTRY, CollectorRegistry
 from src.db.postgres_url import prepare_asyncpg_url_and_ssl
 
 _DEFAULT_TEST_DB_URL = "postgresql://postgres:postgres@localhost:5432/favonius_test"
-HRX_PILOT_SITE_ID = "f6a8acca-d9c2-4db1-9174-f43641f291cf"
+PILOT_SITE_ID = "a1b2c3d4-0000-4000-8000-000000000001"
 
 
 @dataclass(frozen=True)

@@ -25,7 +25,7 @@ Strategy (v1):
   ``LocalAuthListManagement`` get short-circuited on every subsequent
   reconnect until firmware changes — this is the fix for ABB Terra AC
   V1.8.x firmware where the config keys are accepted but ``SendLocalList``
-  itself returns ``NotSupported`` (HRX Vilnius pilot).
+  itself returns ``NotSupported`` (the pilot depot).
 
 Delta updates and DB-trigger-driven mid-session resyncs are deliberately
 out of scope for v1; reconnect events are the trigger and a Full update
@@ -126,8 +126,8 @@ _LOCAL_LIST_MAX_ENTRIES = 16
 # authorization list + cache + pre-authorize path. `FreevendEnabled` is
 # an ABB Terra AC vendor-specific key (FW ≥ 1.6.6) that defaults to TRUE
 # and silently bypasses Authorize by sending StartTransaction with the
-# charger's serial number as the idTag — see denial pattern in HRX
-# Vilnius logs where `id_tag=TACW1141622G1438` matched the boot serial.
+# charger's serial number as the idTag — see denial pattern in the pilot depot
+# logs where `id_tag=TACW1000000G0002` matched the boot serial.
 # `NotSupported` from a non-ABB charger just means we silently fall
 # through to whatever default behavior that vendor ships with.
 _BOOTSTRAP_CONFIG_KEYS: tuple[tuple[str, str], ...] = (
@@ -360,7 +360,7 @@ async def _bootstrap_local_auth_config(cp: _ChargePointProto, station_id: str) -
     Each ``change_configuration`` call is wrapped in ``asyncio.wait_for``
     with ``_BOOTSTRAP_CHANGECONFIG_TIMEOUT_S``. Without that wrapper the
     OCPP library's 30 s default timeout dwarfs the WS reconnect cadence
-    we observed at HRX Vilnius (~10-60 s) and the bootstrap never gets
+    we observed at the pilot depot (~10-60 s) and the bootstrap never gets
     to fail before the connection is gone.
     """
 
@@ -716,7 +716,7 @@ async def sync_charger(
         # short-circuit via the probe cache. Without this branch, every
         # reconnect on a stuck-in-first-sync charger fires the full
         # ChangeConfiguration → SendLocalList sequence and the WebSocket
-        # repeatedly dies mid-RPC (HRX Vilnius ABB Terra AC V1.8.x).
+        # repeatedly dies mid-RPC (the pilot depot ABB Terra AC V1.8.x).
         if bootstrap_outcome in {BootstrapOutcome.UNSUPPORTED, BootstrapOutcome.UNKNOWN}:
             bootstrap_status = (
                 "UnsupportedFromBootstrap"
@@ -725,7 +725,7 @@ async def sync_charger(
             )
             # Persist before best-effort Freevend disable so reconnect churn
             # cannot drop the negative cache if the sync task is cancelled
-            # mid-RPC (HRX Vilnius ABB Terra AC reconnect cadence).
+            # mid-RPC (the pilot depot ABB Terra AC reconnect cadence).
             if (
                 bootstrap_outcome is BootstrapOutcome.UNSUPPORTED
                 and not probe_positive

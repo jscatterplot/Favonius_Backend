@@ -127,12 +127,12 @@ class TestBuildUploadUrl:
 class TestDeriveUploadBaseUrl:
     def test_derives_from_host_and_forwarded_proto(self):
         url = derive_upload_base_url(
-            host="favoniusbackend-production.up.railway.app",
+            host="example-app.up.railway.app",
             forwarded_proto="https",
             fallback_scheme="http",
         )
         assert url == (
-            "https://favoniusbackend-production.up.railway.app"
+            "https://example-app.up.railway.app"
             "/internal/charger_logs/upload"
         )
         assert url.endswith(UPLOAD_PATH)

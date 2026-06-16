@@ -14,7 +14,7 @@ def _dt(y, m, d):
 def _consumption_data():
     return {
         "group_by": "card",
-        "depot_name": "HRX Depot",
+        "depot_name": "Pilot Depot",
         "currency": "EUR",
         "rows": [
             {
@@ -47,7 +47,7 @@ def _consumption_data():
 def test_render_consumption_pdf_is_valid_pdf():
     pdf = render_report_pdf(
         title="Monthly electricity consumption — May 2026",
-        depot_name="HRX Depot",
+        depot_name="Pilot Depot",
         kind="monthly_consumption",
         period_start=_dt(2026, 5, 1),
         period_end=_dt(2026, 5, 31),
@@ -64,7 +64,7 @@ def test_render_consumption_pdf_is_valid_pdf():
 def test_render_pdf_without_data_still_valid():
     pdf = render_report_pdf(
         title="Weekly ops",
-        depot_name="HRX Depot",
+        depot_name="Pilot Depot",
         kind="weekly_ops",
         period_start=_dt(2026, 5, 18),
         period_end=_dt(2026, 5, 24),

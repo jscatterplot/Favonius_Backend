@@ -235,8 +235,8 @@ class TestSecurityManager:
     @pytest.mark.timeout(10)
     async def test_production_basic_auth_accepts_configured_username_alias(self, security_manager):
         """Onboarded production chargers may use an active vendor username alias."""
-        station_id = "hrx-uab_hrx-vilnius-001"
-        auth_data = {"username": "TACW1141622G1433", "password": "valid_password"}
+        station_id = "pilot-depot-001"
+        auth_data = {"username": "TACW1000000G0001", "password": "valid_password"}
 
         with (
             patch.object(security_manager, "_is_station_locked_out", return_value=False),
@@ -262,10 +262,10 @@ class TestSecurityManager:
         assert error is None
         assert username_allowed.await_count == 1
         assert all(
-            c == ((station_id, "TACW1141622G1433"), {}) for c in username_allowed.await_args_list
+            c == ((station_id, "TACW1000000G0001"), {}) for c in username_allowed.await_args_list
         )
         validate_basic_auth.assert_awaited_once_with(
-            station_id, "TACW1141622G1433", "valid_password"
+            station_id, "TACW1000000G0001", "valid_password"
         )
 
     @pytest.mark.asyncio
@@ -639,10 +639,10 @@ class TestChargerAuthFailureAlertSql:
             return_value={
                 "charger_id": "11111111-1111-1111-1111-111111111111",
                 "depot_id": "22222222-2222-2222-2222-222222222222",
-                "ocpp_id": "hrx-uab_hrx-vilnius-001",
-                "charger_name": "HRX Vilnius #1",
+                "ocpp_id": "pilot-depot-001",
+                "charger_name": "the pilot depot #1",
                 "organization_id": "33333333-3333-3333-3333-333333333333",
-                "depot_name": "HRX Vilnius",
+                "depot_name": "the pilot depot",
             }
         )
         return client
@@ -685,11 +685,11 @@ class TestChargerAuthFailureAlertSql:
 
         with patch("src.notifications.alerts.upsert_alert", new=AsyncMock(return_value=None)):
             await security_manager._emit_charger_auth_failure_alert(
-                "hrx-uab_hrx-vilnius-001", "wrong_password"
+                "pilot-depot-001", "wrong_password"
             )
 
         static_auth_client.lookup_charger_context.assert_awaited_once_with(
-            "hrx-uab_hrx-vilnius-001"
+            "pilot-depot-001"
         )
 
     @pytest.mark.asyncio
@@ -702,10 +702,10 @@ class TestChargerAuthFailureAlertSql:
         security_manager.timescale_client.pg_pool = pool
 
         with patch("src.notifications.alerts.resolve_alert", new=AsyncMock(return_value=None)):
-            await security_manager._resolve_charger_auth_failure_alert("hrx-uab_hrx-vilnius-001")
+            await security_manager._resolve_charger_auth_failure_alert("pilot-depot-001")
 
         static_auth_client.lookup_charger_context.assert_awaited_once_with(
-            "hrx-uab_hrx-vilnius-001"
+            "pilot-depot-001"
         )
 
     @pytest.mark.asyncio

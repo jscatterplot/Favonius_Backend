@@ -208,7 +208,7 @@ class TestTimescaleClient:
         telemetry_data = [
             {
                 "time": datetime.now(timezone.utc),
-                "station_id": "hrx-uab_hrx-vilnius-005",
+                "station_id": "pilot-depot-005",
                 "connector_id": 1,
                 "session_id": "6",
                 "power_kw": 10.769,
@@ -239,7 +239,7 @@ class TestTimescaleClient:
         assert "INSERT INTO telemetry" in telemetry_sql
         assert "station_id, connector_id" in telemetry_sql
         last_args = mock_ts_conn.execute.await_args_list[-1].args
-        assert last_args[2] == "hrx-uab_hrx-vilnius-005"
+        assert last_args[2] == "pilot-depot-005"
         assert last_args[3] == 1
 
     @pytest.mark.asyncio
@@ -408,8 +408,8 @@ class TestTimescaleClient:
         timescale_client.pg_pool = mock_pool
 
         registered = await timescale_client.ensure_station_alias(
-            "TACW1141622G1438",
-            "hrx-uab_hrx-vilnius-002",
+            "TACW1000000G0002",
+            "pilot-depot-002",
         )
 
         assert registered is True
@@ -429,8 +429,8 @@ class TestTimescaleClient:
         timescale_client.pg_pool = mock_pool
 
         registered = await timescale_client.ensure_station_alias(
-            "hrx-uab_hrx-vilnius-002",
-            "hrx-uab_hrx-vilnius-002",
+            "pilot-depot-002",
+            "pilot-depot-002",
         )
 
         assert registered is False
@@ -448,8 +448,8 @@ class TestTimescaleClient:
         timescale_client.pg_pool = mock_pool
 
         registered = await timescale_client.ensure_station_alias(
-            "TACW1141622G1438",
-            "hrx-uab_hrx-vilnius-002",
+            "TACW1000000G0002",
+            "pilot-depot-002",
         )
 
         assert registered is False
@@ -483,7 +483,7 @@ class TestTimescaleClient:
         sb_client.db_pool = mock_supabase_pool
         timescale_client.set_supabase_client(sb_client)
 
-        result = await timescale_client._resolve_charger_id("hrx-uab_hrx-vilnius-002")
+        result = await timescale_client._resolve_charger_id("pilot-depot-002")
 
         assert result == "uuid-A"
         # Lookup must NOT have hit the timescale pool.
@@ -543,8 +543,8 @@ class TestTimescaleClient:
         timescale_client.set_supabase_client(sb_client)
 
         registered = await timescale_client.ensure_station_alias(
-            "TACW1141622G1438",
-            "hrx-uab_hrx-vilnius-002",
+            "TACW1000000G0002",
+            "pilot-depot-002",
         )
 
         assert registered is True
@@ -638,12 +638,12 @@ class TestTimescaleClient:
         mock_pool.acquire.return_value.__aexit__.return_value = None
         timescale_client.pg_pool = mock_pool
 
-        cleared = await timescale_client.mark_connectors_available_after_reconnect("hrx-ac-1")
+        cleared = await timescale_client.mark_connectors_available_after_reconnect("pilot-ac-1")
 
         assert cleared == 2
         mock_conn.fetch.assert_awaited_once()
         sql, station_id = mock_conn.fetch.await_args.args
-        assert station_id == "hrx-ac-1"
+        assert station_id == "pilot-ac-1"
         # SQL contract: must select Unavailable+ConnectionLost and insert Available.
         assert "'Unavailable'" in sql
         assert "'ConnectionLost'" in sql
@@ -663,5 +663,5 @@ class TestTimescaleClient:
         mock_pool.acquire.return_value.__aexit__.return_value = None
         timescale_client.pg_pool = mock_pool
 
-        cleared = await timescale_client.mark_connectors_available_after_reconnect("hrx-ac-1")
+        cleared = await timescale_client.mark_connectors_available_after_reconnect("pilot-ac-1")
         assert cleared == 0

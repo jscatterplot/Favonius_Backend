@@ -641,7 +641,7 @@ class TestOCPP16SessionMeteringConfigCache:
     Without the cache the handler re-runs the full sequential
     ``ChangeConfiguration`` storm on every WebSocket reconnect. ABB Terra AC
     chargers that drop and reconnect every ~60 s never escape the bootstrap
-    long enough to handle real OCPP traffic — this is the HRX Vilnius
+    long enough to handle real OCPP traffic — this is the pilot depot
     reconfig loop in production logs from 2026-05-14.
     """
 
@@ -688,7 +688,7 @@ class TestOCPP16SessionMeteringConfigCache:
     @pytest.mark.asyncio
     async def test_cache_hit_skips_change_configuration(self, _session_with_pool) -> None:
         """Same firmware as last successful push → no ChangeConfiguration
-        calls. This is the core HRX Vilnius fix."""
+        calls. This is the core pilot depot fix."""
         s, pool = _session_with_pool
         s._cp.firmware_version = "V1.8.36"
         s._cp.change_configuration = AsyncMock()
