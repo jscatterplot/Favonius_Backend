@@ -15,8 +15,9 @@ Tests cover:
 
 from __future__ import annotations
 
+import asyncio
 import time
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import pytest
@@ -624,3 +625,93 @@ class TestCleanup:
         """Cleanup without DB pool is a no-op."""
         limiter = RateLimiter(db_pool=None)
         await limiter._cleanup_expired_rows()  # Should not raise
+
+
+# ============ Tests: Dirty flush + cadence ============
+
+
+class TestDirtyFlush:
+    """Dirty-bucket tracking reduces unnecessary UPSERT volume."""
+
+    @pytest.mark.asyncio
+    async def test_flush_only_dirty_buckets(self):
+        mock_conn = AsyncMock()
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value = mock_cm
+
+        limiter = RateLimiter(db_pool=mock_pool)
+        limiter.check_api_limit("client_a")
+        limiter.check_optimize_limit("client_b")
+        limiter._dirty_keys = {("api", "client_a")}
+
+        await limiter._flush_to_db()
+
+        rows = mock_conn.executemany.call_args[0][1]
+        assert len(rows) == 1
+        assert rows[0][0] == "api"
+        assert rows[0][1] == "client_a"
+
+    @pytest.mark.asyncio
+    async def test_flush_sorts_rows_deterministically(self):
+        mock_conn = AsyncMock()
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value = mock_cm
+
+        limiter = RateLimiter(db_pool=mock_pool)
+        limiter.check_api_limit("z_client")
+        limiter.check_api_limit("a_client")
+
+        await limiter._flush_to_db()
+
+        rows = mock_conn.executemany.call_args[0][1]
+        keys = [row[1] for row in rows]
+        assert keys == sorted(keys)
+
+    @pytest.mark.asyncio
+    async def test_flush_skips_when_nothing_dirty(self):
+        mock_pool = MagicMock()
+        limiter = RateLimiter(db_pool=mock_pool)
+
+        await limiter._flush_to_db()
+
+        mock_pool.acquire.assert_not_called()
+
+
+class TestSyncCadence:
+    """Merge/cleanup run less often than flush."""
+
+    @pytest.mark.asyncio
+    async def test_sync_loop_skips_merge_on_first_tick(self):
+        limiter = RateLimiter(
+            db_pool=MagicMock(),
+            config=RateLimitConfig(
+                sync_interval_seconds=1.0,
+                merge_interval_seconds=2.0,
+                cleanup_interval_seconds=4.0,
+            ),
+        )
+        limiter._running = True
+        limiter.check_api_limit("client_a")
+        limiter._flush_to_db = AsyncMock()
+        limiter._merge_from_db = AsyncMock()
+        limiter._cleanup_expired_rows = AsyncMock()
+
+        async def _stop_after_first_sleep(_seconds: float) -> None:
+            limiter._running = False
+
+        with patch(
+            "src.security.rate_limiter.asyncio.sleep",
+            new_callable=AsyncMock,
+            side_effect=_stop_after_first_sleep,
+        ):
+            await limiter._sync_loop()
+
+        limiter._flush_to_db.assert_awaited_once()
+        limiter._merge_from_db.assert_not_awaited()
+        limiter._cleanup_expired_rows.assert_not_awaited()

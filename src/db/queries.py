@@ -116,6 +116,19 @@ async def get_latest_vehicle_soc(
     return row["soc"] if row else None
 
 
+# Default scan window for DISTINCT ON latest-vehicle telemetry lookups. Bounds
+# hypertable scans so poll-heavy endpoints do not spill temp I/O over full history.
+VEHICLE_TELEMETRY_RECENCY_HOURS = 24
+
+
+def default_vehicle_telemetry_recency_floor(
+    now: Optional[datetime] = None,
+) -> datetime:
+    """Lower bound for bounded latest-vehicle telemetry queries (typically now - 24h)."""
+    ref = _as_utc_aware(now or datetime.now(timezone.utc))
+    return ref - timedelta(hours=VEHICLE_TELEMETRY_RECENCY_HOURS)
+
+
 # Freshest SoC per vehicle, merging the OCPP charger feed (`telemetry`) and the
 # telematics feed (`vehicle_telemetry`, migration 044). The 24h scan floor is a
 # parameter ($2) — not DB now() — so callers that inject a clock (golden tests)
@@ -157,6 +170,63 @@ _TELEMETRY_ONLY_VEHICLE_SOC_SQL = """
     ORDER BY vehicle_id, time DESC
 """
 
+# Full latest row per vehicle (charger fields + telematics SoC merge). Telematics
+# rows contribute soc/time only; charger telemetry carries power/plug state.
+_MERGED_VEHICLE_TELEMETRY_SQL = """
+    SELECT DISTINCT ON (vehicle_id)
+        vehicle_id::text AS vehicle_id,
+        time,
+        soc,
+        charging_kw,
+        charger_id::text AS charger_id,
+        is_plugged,
+        energy_kwh
+    FROM (
+        SELECT
+            vehicle_id,
+            time,
+            soc,
+            charging_kw,
+            charger_id,
+            is_plugged,
+            energy_kwh,
+            0 AS src_priority
+        FROM telemetry
+        WHERE vehicle_id = ANY($1::uuid[])
+          AND time > $2
+        UNION ALL
+        SELECT
+            vehicle_id,
+            time,
+            soc,
+            NULL::double precision AS charging_kw,
+            NULL::uuid AS charger_id,
+            NULL::boolean AS is_plugged,
+            NULL::double precision AS energy_kwh,
+            1 AS src_priority
+        FROM vehicle_telemetry
+        WHERE vehicle_id = ANY($1::uuid[])
+          AND soc IS NOT NULL
+          AND time > $2
+    ) merged
+    ORDER BY vehicle_id, time DESC, src_priority
+"""
+
+_TELEMETRY_ONLY_VEHICLE_TELEMETRY_SQL = """
+    SELECT DISTINCT ON (vehicle_id)
+        vehicle_id::text AS vehicle_id,
+        time,
+        soc,
+        charging_kw,
+        charger_id::text AS charger_id,
+        is_plugged,
+        energy_kwh
+    FROM telemetry
+    WHERE vehicle_id = ANY($1::uuid[])
+      AND time > $2
+    ORDER BY vehicle_id, time DESC
+"""
+
 
 async def fetch_freshest_vehicle_socs(
     fetcher: Any,
@@ -189,6 +259,33 @@ async def fetch_freshest_vehicle_socs(
             "falling back to charger telemetry only"
         )
         return await fetcher.fetch(_TELEMETRY_ONLY_VEHICLE_SOC_SQL, vehicle_ids, recency_floor)
+
+
+async def fetch_freshest_vehicle_telemetry(
+    fetcher: Any,
+    vehicle_ids: list[UUID] | list[str],
+    *,
+    recency_floor: Optional[datetime] = None,
+) -> list:
+    """Return the freshest telemetry row per vehicle (bounded scan, merged feeds).
+
+    Canonical path for fleet list and realtime vehicle-state endpoints. Each row
+    includes ``vehicle_id``, ``time``, ``soc``, ``charging_kw``, ``charger_id``,
+    ``is_plugged``, and ``energy_kwh``. Falls back to charger telemetry only when
+    ``vehicle_telemetry`` is absent.
+    """
+    if not vehicle_ids:
+        return []
+    floor = recency_floor or default_vehicle_telemetry_recency_floor()
+    uuid_ids = [UUID(str(vid)) for vid in vehicle_ids]
+    try:
+        return await fetcher.fetch(_MERGED_VEHICLE_TELEMETRY_SQL, uuid_ids, floor)
+    except asyncpg.exceptions.UndefinedTableError:
+        logger.warning(
+            "vehicle_telemetry missing (migration 044 not applied?); "
+            "falling back to charger telemetry only"
+        )
+        return await fetcher.fetch(_TELEMETRY_ONLY_VEHICLE_TELEMETRY_SQL, uuid_ids, floor)
 
 
 async def insert_telemetry(
@@ -3264,28 +3361,31 @@ async def open_sessions_by_stations(db, station_ids: list[str]) -> dict[str, dic
     return {row["station_id"]: dict(row) for row in rows}
 
 
-async def latest_telemetry_by_vehicles(db, vehicle_ids: list[str]) -> dict[str, dict]:
+async def latest_telemetry_by_vehicles(
+    db,
+    vehicle_ids: list[str],
+    *,
+    recency_floor: Optional[datetime] = None,
+) -> dict[str, dict]:
     """Latest telemetry row per vehicle_id.
 
     Returns mapping ``vehicle_id -> {soc, charging_kw, charger_id, is_plugged, time}``.
     """
-    if not vehicle_ids:
-        return {}
-    query = """
-        SELECT DISTINCT ON (vehicle_id)
-               vehicle_id::text  AS vehicle_id,
-               time              AS last_seen_at,
-               soc               AS current_soc,
-               charging_kw       AS current_power_kw,
-               charger_id::text  AS charger_id,
-               is_plugged,
-               energy_kwh
-        FROM telemetry
-        WHERE vehicle_id = ANY($1::uuid[])
-        ORDER BY vehicle_id, time DESC
-    """
-    rows = await db.fetch(query, vehicle_ids)
-    return {row["vehicle_id"]: dict(row) for row in rows}
+    rows = await fetch_freshest_vehicle_telemetry(
+        db, vehicle_ids, recency_floor=recency_floor
+    )
+    return {
+        row["vehicle_id"]: {
+            "vehicle_id": row["vehicle_id"],
+            "last_seen_at": row["time"],
+            "current_soc": row["soc"],
+            "current_power_kw": row["charging_kw"],
+            "charger_id": row["charger_id"],
+            "is_plugged": row["is_plugged"],
+            "energy_kwh": row["energy_kwh"],
+        }
+        for row in rows
+    }
 
 
 async def latest_telemetry_by_stations(db, station_ids: list[str]) -> dict[tuple[str, int], dict]:
@@ -3563,7 +3663,12 @@ async def list_completed_sessions_for_charger(
     return [dict(r) for r in rows]
 
 
-async def latest_telemetry_for_depot_vehicles(db, *, vehicle_ids: list[str]) -> list[dict]:
+async def latest_telemetry_for_depot_vehicles(
+    db,
+    *,
+    vehicle_ids: list[str],
+    recency_floor: Optional[datetime] = None,
+) -> list[dict]:
     """Lightweight per-vehicle real-time state for a depot.
 
     Distinct from :func:`latest_telemetry_by_vehicles` (which keys by
@@ -3572,23 +3677,21 @@ async def latest_telemetry_for_depot_vehicles(db, *, vehicle_ids: list[str]) -> 
     and includes the ``charger_id`` so the UI can show which charger a
     vehicle is plugged into without a second join.
     """
-    if not vehicle_ids:
-        return []
-    query = """
-        SELECT DISTINCT ON (vehicle_id)
-               vehicle_id::text  AS vehicle_id,
-               charger_id::text  AS charger_id,
-               time              AS last_seen_at,
-               soc               AS soc,
-               charging_kw       AS power_kw,
-               is_plugged,
-               energy_kwh
-        FROM telemetry
-        WHERE vehicle_id = ANY($1::uuid[])
-        ORDER BY vehicle_id, time DESC
-    """
-    rows = await db.fetch(query, vehicle_ids)
-    return [dict(r) for r in rows]
+    rows = await fetch_freshest_vehicle_telemetry(
+        db, vehicle_ids, recency_floor=recency_floor
+    )
+    return [
+        {
+            "vehicle_id": row["vehicle_id"],
+            "charger_id": row["charger_id"],
+            "last_seen_at": row["time"],
+            "soc": row["soc"],
+            "power_kw": row["charging_kw"],
+            "is_plugged": row["is_plugged"],
+            "energy_kwh": row["energy_kwh"],
+        }
+        for row in rows
+    ]
 
 
 # Source markers for get_session_energy_kwh return values.

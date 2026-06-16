@@ -27,6 +27,8 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
 
+import asyncpg
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,6 +62,10 @@ class RateLimitConfig:
 
     # DB sync interval (seconds)
     sync_interval_seconds: float = 15.0
+    # How often to merge remote counts into local buckets (seconds).
+    merge_interval_seconds: float = 60.0
+    # How often to delete expired rows from rate_limit_state (seconds).
+    cleanup_interval_seconds: float = 300.0
 
 
 @dataclass
@@ -120,6 +126,10 @@ class RateLimiter:
         self._handoff_buckets: dict[tuple, list[float]] = defaultdict(list)
         self._last_trigger_optimization: dict[UUID, float] = {}
 
+        # Dirty keys pending flush: (bucket_type, bucket_key)
+        self._dirty_keys: set[tuple[str, str]] = set()
+        self._sync_loop_ticks: int = 0
+
         # Background sync task
         self._task: Optional[asyncio.Task] = None
         self._running = False
@@ -158,6 +168,12 @@ class RateLimiter:
         self._agent_buckets.clear()
         self._handoff_buckets.clear()
         self._last_trigger_optimization.clear()
+        self._dirty_keys.clear()
+        self._sync_loop_ticks = 0
+
+    def _mark_dirty(self, bucket_type: str, bucket_key: str) -> None:
+        """Record that a bucket changed since the last successful DB flush."""
+        self._dirty_keys.add((bucket_type, bucket_key))
 
     # ── Rate Limit Checks (hot path, in-memory only) ─────────────────────
 
@@ -200,6 +216,7 @@ class RateLimiter:
             return self._make_result(False, bucket, limit, 60)
 
         bucket.append(time.time())
+        self._mark_dirty("api", client_id)
         return self._make_result(True, bucket, limit, 60)
 
     def check_admin_write_limit(self, client_id: str) -> RateLimitResult:
@@ -220,6 +237,7 @@ class RateLimiter:
             return self._make_result(False, bucket, limit, 60)
 
         bucket.append(time.time())
+        self._mark_dirty("admin_write", client_id)
         return self._make_result(True, bucket, limit, 60)
 
     def check_optimize_limit(self, client_id: str) -> RateLimitResult:
@@ -236,6 +254,7 @@ class RateLimiter:
             return self._make_result(False, bucket, limit, 60)
 
         bucket.append(time.time())
+        self._mark_dirty("optimize", client_id)
         return self._make_result(True, bucket, limit, 60)
 
     def check_agent_limit(self, client_id: str) -> RateLimitResult:
@@ -254,6 +273,7 @@ class RateLimiter:
             return self._make_result(False, bucket, limit, 60)
 
         bucket.append(time.time())
+        self._mark_dirty("agent", client_id)
         return self._make_result(True, bucket, limit, 60)
 
     def check_trigger_cooldown(self, depot_id: UUID) -> bool:
@@ -307,6 +327,8 @@ class RateLimiter:
             return self._make_result(False, bucket, limit, 3600)
 
         bucket.append(time.time())
+        key = f"{depot_pair[0]}:{depot_pair[1]}"
+        self._mark_dirty("handoff", key)
         return self._make_result(True, bucket, limit, 3600)
 
     # ── Background Sync ──────────────────────────────────────────────────
@@ -317,13 +339,93 @@ class RateLimiter:
             try:
                 await asyncio.sleep(self.config.sync_interval_seconds)
                 if self._pool is not None:
-                    await self._flush_to_db()
-                    await self._merge_from_db()
-                    await self._cleanup_expired_rows()
+                    self._sync_loop_ticks += 1
+                    if self._dirty_keys:
+                        await self._flush_to_db()
+                    merge_every = max(
+                        1,
+                        int(
+                            round(
+                                self.config.merge_interval_seconds
+                                / self.config.sync_interval_seconds
+                            )
+                        ),
+                    )
+                    cleanup_every = max(
+                        1,
+                        int(
+                            round(
+                                self.config.cleanup_interval_seconds
+                                / self.config.sync_interval_seconds
+                            )
+                        ),
+                    )
+                    if self._sync_loop_ticks % merge_every == 0:
+                        await self._merge_from_db()
+                    if self._sync_loop_ticks % cleanup_every == 0:
+                        await self._cleanup_expired_rows()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Rate limiter sync error: %s", e, exc_info=True)
+
+    def _collect_flush_rows(self, now: float) -> list[tuple]:
+        """Build UPSERT rows for dirty buckets only."""
+        rows: list[tuple] = []
+
+        for client_id, timestamps in list(self._api_buckets.items()):
+            if ("api", client_id) not in self._dirty_keys:
+                continue
+            clean = [t for t in timestamps if t > now - 60]
+            if clean:
+                window_start = datetime.fromtimestamp(
+                    math.floor(clean[0] / 60) * 60, tz=timezone.utc
+                )
+                rows.append(("api", client_id, window_start, len(clean)))
+
+        for client_id, timestamps in list(self._admin_write_buckets.items()):
+            if ("admin_write", client_id) not in self._dirty_keys:
+                continue
+            clean = [t for t in timestamps if t > now - 60]
+            if clean:
+                window_start = datetime.fromtimestamp(
+                    math.floor(clean[0] / 60) * 60, tz=timezone.utc
+                )
+                rows.append(("admin_write", client_id, window_start, len(clean)))
+
+        for client_id, timestamps in list(self._optimize_buckets.items()):
+            if ("optimize", client_id) not in self._dirty_keys:
+                continue
+            clean = [t for t in timestamps if t > now - 60]
+            if clean:
+                window_start = datetime.fromtimestamp(
+                    math.floor(clean[0] / 60) * 60, tz=timezone.utc
+                )
+                rows.append(("optimize", client_id, window_start, len(clean)))
+
+        for client_id, timestamps in list(self._agent_buckets.items()):
+            if ("agent", client_id) not in self._dirty_keys:
+                continue
+            clean = [t for t in timestamps if t > now - 60]
+            if clean:
+                window_start = datetime.fromtimestamp(
+                    math.floor(clean[0] / 60) * 60, tz=timezone.utc
+                )
+                rows.append(("agent", client_id, window_start, len(clean)))
+
+        for depot_pair, timestamps in list(self._handoff_buckets.items()):
+            key = f"{depot_pair[0]}:{depot_pair[1]}"
+            if ("handoff", key) not in self._dirty_keys:
+                continue
+            clean = [t for t in timestamps if t > now - 3600]
+            if clean:
+                window_start = datetime.fromtimestamp(
+                    math.floor(clean[0] / 3600) * 3600, tz=timezone.utc
+                )
+                rows.append(("handoff", key, window_start, len(clean)))
+
+        rows.sort(key=lambda row: (row[0], row[1], row[2]))
+        return rows
 
     async def _flush_to_db(self) -> None:
         """Write local bucket counts to the database.
@@ -334,62 +436,12 @@ class RateLimiter:
         if self._pool is None:
             return
 
-        now = time.time()
-        rows: list[tuple] = []
-
-        # Aggregate API buckets
-        for client_id, timestamps in list(self._api_buckets.items()):
-            clean = [t for t in timestamps if t > now - 60]
-            if clean:
-                window_start = datetime.fromtimestamp(
-                    math.floor(clean[0] / 60) * 60, tz=timezone.utc
-                )
-                rows.append(("api", client_id, window_start, len(clean)))
-
-        # Aggregate admin-write buckets (same 60s window shape as api)
-        for client_id, timestamps in list(self._admin_write_buckets.items()):
-            clean = [t for t in timestamps if t > now - 60]
-            if clean:
-                window_start = datetime.fromtimestamp(
-                    math.floor(clean[0] / 60) * 60, tz=timezone.utc
-                )
-                rows.append(("admin_write", client_id, window_start, len(clean)))
-
-        # Aggregate optimize buckets
-        for client_id, timestamps in list(self._optimize_buckets.items()):
-            clean = [t for t in timestamps if t > now - 60]
-            if clean:
-                window_start = datetime.fromtimestamp(
-                    math.floor(clean[0] / 60) * 60, tz=timezone.utc
-                )
-                rows.append(("optimize", client_id, window_start, len(clean)))
-
-        # Aggregate agent buckets
-        for client_id, timestamps in list(self._agent_buckets.items()):
-            clean = [t for t in timestamps if t > now - 60]
-            if clean:
-                window_start = datetime.fromtimestamp(
-                    math.floor(clean[0] / 60) * 60, tz=timezone.utc
-                )
-                rows.append(("agent", client_id, window_start, len(clean)))
-
-        # Aggregate handoff buckets
-        for depot_pair, timestamps in list(self._handoff_buckets.items()):
-            clean = [t for t in timestamps if t > now - 3600]
-            if clean:
-                window_start = datetime.fromtimestamp(
-                    math.floor(clean[0] / 3600) * 3600, tz=timezone.utc
-                )
-                key = f"{depot_pair[0]}:{depot_pair[1]}"
-                rows.append(("handoff", key, window_start, len(clean)))
-
+        rows = self._collect_flush_rows(time.time())
         if not rows:
+            self._dirty_keys.clear()
             return
 
-        try:
-            async with self._pool.acquire() as conn:
-                await conn.executemany(
-                    """
+        sql = """
                     INSERT INTO rate_limit_state
                         (bucket_type, bucket_key, window_start, request_count, last_updated)
                     VALUES ($1, $2, $3, $4, NOW())
@@ -397,10 +449,14 @@ class RateLimiter:
                     DO UPDATE SET
                         request_count = GREATEST(rate_limit_state.request_count, $4),
                         last_updated = NOW()
-                    """,
-                    rows,
-                )
+                    """
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.executemany(sql, rows)
                 logger.debug("Flushed %d rate limit buckets to DB", len(rows))
+            self._dirty_keys.clear()
+        except asyncpg.DeadlockDetectedError:
+            logger.warning("Rate limit flush deadlock; will retry next sync tick")
         except Exception as e:
             logger.error("Failed to flush rate limit state: %s", e)
 
