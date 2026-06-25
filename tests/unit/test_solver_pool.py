@@ -8,11 +8,14 @@ and timeout behaviour are exercised in isolation.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from tests.unit.solver_pool_workers import (
     crash_worker,
     echo_worker,
+    sleep_echo_worker,
     slow_worker,
 )
 from src.core.optimizer.exceptions import SolverError, SolverTimeoutError
@@ -334,6 +337,44 @@ async def test_pool_recycles_workers_and_keeps_solving():
     # max_workers=1 + recycle-every-2 over 5 solves ⇒ the single slot was served
     # by more than one process, i.e. memory was returned between batches.
     assert len(pids) >= 2, f"expected workers to recycle, saw pids={pids}"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_queued_solve_keeps_full_timeout_budget():
+    """With one worker, a solve queued behind a long one must still get its full
+    timeout once it starts: the semaphore makes queue wait untimed, so the short
+    parent timeout is not consumed while sitting in the backlog. Without the
+    gate, the quick solve would raise SolverTimeoutError."""
+    pool = SolverPool(
+        max_workers=1,
+        worker_fn=sleep_echo_worker,
+        worker_init_fn=_noop_init,
+        worker_alarm_grace_s=0,
+        parent_timeout_buffer_s=0.6,  # quick solve's whole budget
+        worker_max_tasks=0,  # no recycle churn mid-test
+    )
+    await pool.start()
+    try:
+
+        async def long_solve():
+            # Sleeps 1.2s, occupying the single worker slot.
+            return await pool.solve(state=1.2, config="c", time_limit=10.0)
+
+        async def quick_solve():
+            # parent_timeout = 0.0 + 0 + 0.6 = 0.6s. Queued ~1.2s behind the long
+            # solve; only the semaphore keeps that wait from eating the budget.
+            return await pool.solve(state=0.0, config="c", time_limit=0.0)
+
+        long_task = asyncio.create_task(long_solve())
+        await asyncio.sleep(0.05)  # let the long solve grab the slot first
+        quick_result = await quick_solve()
+        long_result = await long_task
+
+        assert quick_result["slept"] == 0.0  # completed, not timed out
+        assert long_result["slept"] == 1.2
+    finally:
+        await pool.stop()
 
 
 @pytest.mark.unit

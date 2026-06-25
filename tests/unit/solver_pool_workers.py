@@ -25,3 +25,13 @@ def slow_worker(*_args: Any, sleep_s: float = 5.0, **_kwargs: Any) -> dict:
     """Sleep past the parent timeout so the wait_for fires."""
     time.sleep(sleep_s)
     return {"slept": sleep_s}
+
+
+def sleep_echo_worker(state: Any = 0.0, *_args: Any, **_kwargs: Any) -> dict:
+    """Sleep ``state`` seconds (occupying the worker slot), then echo.
+
+    Used to test that a solve queued behind a long one still gets its full
+    parent timeout once it actually starts executing.
+    """
+    time.sleep(float(state))
+    return {"slept": float(state), "pid": os.getpid()}
