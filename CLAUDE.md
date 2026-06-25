@@ -1029,8 +1029,9 @@ test(api): add coverage for handoff rate limiting
 | `OPTIMIZATION_SOC_TARGET` | `0.8` | Target SoC before departure |
 | `GUROBI_LICENSE_FILE` | — | Path to `gurobi.lic` |
 | `GUROBI_LIC_CONTENT` | — | License file contents (for Railway) |
-| `SOLVER_PROCESS_POOL_SIZE` | `2` | Worker processes for MILP solves. Solves run out of the API process so the asyncio loop stays responsive. |
-| `SOLVER_WORKER_AS_LIMIT_MB` | `1500` | Per-worker `RLIMIT_AS` ceiling. A runaway solve crashes the worker, not the API container. |
+| `SOLVER_PROCESS_POOL_SIZE` | `1` | Worker processes for MILP solves. Solves run out of the API process so the asyncio loop stays responsive. Each persistent worker holds Pyomo+Gurobi resident (~0.3–0.5 GB); raise only when depots must solve concurrently. |
+| `SOLVER_WORKER_MAX_TASKS` | `20` | Recycle each solver worker after this many solves (`max_tasks_per_child`) so Pyomo/Gurobi memory does not creep across solves. `<=0` disables recycling (workers live for the pool's lifetime). |
+| `SOLVER_WORKER_AS_LIMIT_MB` | `1500` | Per-worker `RLIMIT_AS` ceiling. A runaway solve crashes the worker, not the API container. Lower (e.g. 1000) to cap spikes on a small-fleet deploy. |
 | `SOLVER_PROCESS_POOL_DISABLED` | `false` | Set `true` to fall back to running solves in a thread inside the API process (loop will block briefly). Debug only. |
 
 > **Two config sources:** the `OPTIMIZATION_*` variables above are read by the **legacy** `websocket_handler` config (`src/websocket_handler/config.py`). The new-architecture `DepotController` reads its own `FAVONIUS_*` knobs (`src/core/controller_config.py`) — note the defaults differ (e.g. horizon `24` vs `4`).
@@ -1161,7 +1162,7 @@ On shutdown: stop controllers → stop OCPP server → close DB pool.
 - `solver_used` field in `OptimizationResult` records which solver ran
 
 **Process-pool execution (`src/core/optimizer/pool.py`):**
-- Each MILP solve runs in a child process via `ProcessPoolExecutor` (spawn mode), so the FastAPI event loop stays responsive during a 60 s solve. Default 2 workers (`SOLVER_PROCESS_POOL_SIZE`); per-worker virtual-memory ceiling via `RLIMIT_AS` (`SOLVER_WORKER_AS_LIMIT_MB`, default 1500 MiB).
+- Each MILP solve runs in a child process via `ProcessPoolExecutor` (spawn mode), so the FastAPI event loop stays responsive during a 60 s solve. Default 1 worker (`SOLVER_PROCESS_POOL_SIZE`); per-worker virtual-memory ceiling via `RLIMIT_AS` (`SOLVER_WORKER_AS_LIMIT_MB`, default 1500 MiB). Each worker is recycled after `SOLVER_WORKER_MAX_TASKS` solves (default 20, `max_tasks_per_child`) so Pyomo/Gurobi memory is returned to the OS rather than accumulating across solves.
 - `SolverPool` catches `BrokenProcessPool` and parent-side `asyncio.TimeoutError`, recreates the executor, and retries once. Second failure raises `SolverError` / `SolverTimeoutError`.
 - Wired in `src/api/main.py` lifespan, exposed via `core.optimizer.pool.get_solver_pool()`. `src/core/controller.py` dispatches through the pool when one is installed; falls back to `asyncio.to_thread(optimize, …)` when no pool is set (unit tests and emergency disable).
 - Disable for local debugging only: `SOLVER_PROCESS_POOL_DISABLED=true`.

@@ -5,6 +5,7 @@ Reference: PRD_v2.md#8-optimization-engine-specifications
 
 from __future__ import annotations
 
+import gc
 import logging
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
@@ -662,5 +663,13 @@ def optimize(
         f"objective=${result.objective_value:.2f}, "
         f"solve_time={result.solve_time_s:.2f}s"
     )
+
+    # Pyomo ConcreteModels hold internal reference cycles, so the heap they build
+    # is reclaimed by the cyclic collector, not plain refcounting. Drop the model
+    # and force one collection now so a long-lived solver worker returns this
+    # solve's memory between solves (complements worker recycling in
+    # core.optimizer.pool). ``result`` holds only plain Python lists, not model refs.
+    del model, result_dict
+    gc.collect()
 
     return result

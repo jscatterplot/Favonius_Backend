@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_WORKER_AS_LIMIT_BYTES = 1_500 * 1024 * 1024  # ~1.5 GiB per worker
 DEFAULT_WORKER_ALARM_GRACE_S = 15
 DEFAULT_MAX_WORKERS = 2
+# Recycle each worker after this many solves so Pyomo/Gurobi memory that
+# accumulates across solves is returned to the OS. ``None`` keeps workers for
+# the life of the pool (the pre-3.11 behaviour).
+DEFAULT_WORKER_MAX_TASKS: Optional[int] = 20
 
 
 def _worker_init(as_limit_bytes: int) -> None:
@@ -101,6 +105,7 @@ class SolverPool:
         worker_as_limit_bytes: int = DEFAULT_WORKER_AS_LIMIT_BYTES,
         worker_alarm_grace_s: int = DEFAULT_WORKER_ALARM_GRACE_S,
         parent_timeout_buffer_s: float = 5.0,
+        worker_max_tasks: Optional[int] = DEFAULT_WORKER_MAX_TASKS,
     ) -> None:
         self._max_workers = max_workers
         self._worker_fn = worker_fn
@@ -108,16 +113,23 @@ class SolverPool:
         self._worker_as_limit_bytes = worker_as_limit_bytes
         self._worker_alarm_grace_s = worker_alarm_grace_s
         self._parent_timeout_buffer_s = parent_timeout_buffer_s
+        # ``<= 0`` disables recycling (workers live for the pool's lifetime).
+        self._worker_max_tasks = worker_max_tasks if (worker_max_tasks or 0) > 0 else None
         self._executor: Optional[ProcessPoolExecutor] = None
         self._lock = asyncio.Lock()
         self._mp_context = multiprocessing.get_context("spawn")
 
     def _make_executor(self) -> ProcessPoolExecutor:
+        # ``max_tasks_per_child`` (Python 3.11+) replaces each worker after a
+        # bounded number of solves, releasing the Pyomo/Gurobi heap it built up.
+        # Safe with our explicit "spawn" context; the recreate path already
+        # tolerates workers coming and going.
         return ProcessPoolExecutor(
             max_workers=self._max_workers,
             mp_context=self._mp_context,
             initializer=self._worker_init_fn,
             initargs=(self._worker_as_limit_bytes,),
+            max_tasks_per_child=self._worker_max_tasks,
         )
 
     async def start(self) -> None:

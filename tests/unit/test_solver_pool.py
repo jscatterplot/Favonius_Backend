@@ -273,6 +273,70 @@ def test_optimizer_exceptions_round_trip_pickle():
 
 
 @pytest.mark.unit
+def test_make_executor_wires_max_tasks_per_child():
+    """The recycle bound is passed through to ``ProcessPoolExecutor``."""
+    pool = SolverPool(
+        max_workers=1,
+        worker_fn=echo_worker,
+        worker_init_fn=_noop_init,
+        worker_max_tasks=7,
+    )
+    executor = pool._make_executor()
+    try:
+        assert getattr(executor, "_max_tasks_per_child") == 7
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    # ``<= 0`` disables recycling (workers live for the pool's lifetime).
+    pool_off = SolverPool(
+        max_workers=1,
+        worker_fn=echo_worker,
+        worker_init_fn=_noop_init,
+        worker_max_tasks=0,
+    )
+    executor_off = pool_off._make_executor()
+    try:
+        assert getattr(executor_off, "_max_tasks_per_child") is None
+    finally:
+        executor_off.shutdown(wait=False, cancel_futures=True)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_pool_recycles_workers_and_keeps_solving():
+    """With a low recycle bound the worker is replaced mid-life, yet every
+    solve still returns — and we observe more than one worker PID, proving the
+    recycling actually happens."""
+    pool = SolverPool(
+        max_workers=1,
+        worker_fn=echo_worker,
+        worker_init_fn=_noop_init,
+        worker_alarm_grace_s=0,
+        parent_timeout_buffer_s=3.0,
+        worker_max_tasks=2,  # replace each worker after 2 solves
+    )
+    await pool.start()
+    pids = set()
+    try:
+        for i in range(5):  # > 2 * max_tasks_per_child → at least two workers
+            result = await pool.solve(
+                state=f"s{i}",
+                config="c",
+                time_limit=0.1,
+                previous_result=None,
+                horizon_start=None,
+            )
+            assert result["args"][0] == f"s{i}"
+            pids.add(result["pid"])
+    finally:
+        await pool.stop()
+
+    # max_workers=1 + recycle-every-2 over 5 solves ⇒ the single slot was served
+    # by more than one process, i.e. memory was returned between batches.
+    assert len(pids) >= 2, f"expected workers to recycle, saw pids={pids}"
+
+
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_recreate_skips_when_executor_already_replaced():
     pool = SolverPool(max_workers=1, worker_fn=echo_worker, worker_init_fn=_noop_init)

@@ -21,9 +21,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import Any, AsyncIterator, Optional
 
 logger = logging.getLogger(__name__)
+
+# Upper bound on buffered, not-yet-sent SSE events. A bounded queue applies
+# backpressure (``emit`` awaits a free slot) so a runaway producer — e.g. a
+# pathological agent loop — cannot buffer unbounded bytes in memory. The cap is
+# generous; a healthy turn emits well under a dozen events.
+_SSE_QUEUE_MAXSIZE = max(1, int(os.getenv("AGENT_SSE_QUEUE_MAXSIZE", "1000")))
 
 # Headers a caller passes to ``StreamingResponse`` for SSE:
 # - ``Cache-Control: no-cache``  → tell every cache the body is volatile.
@@ -98,7 +105,7 @@ class SSEEventStream:
     """
 
     def __init__(self) -> None:
-        self._queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
+        self._queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=_SSE_QUEUE_MAXSIZE)
         self._closed: bool = False
 
     async def emit(self, name: str, data: Any) -> None:
@@ -119,7 +126,17 @@ class SSEEventStream:
             return
         self._closed = True
         # Sentinel ``None`` tells the consumer iterator to stop.
-        self._queue.put_nowait(None)
+        try:
+            self._queue.put_nowait(None)
+        except asyncio.QueueFull:
+            # The queue is full of pending events (bounded for memory safety).
+            # Deliver the sentinel after the consumer drains, without blocking
+            # the producer or dropping any buffered event — preserves order and
+            # the "clients receive every event" contract.
+            try:
+                asyncio.get_running_loop().create_task(self._queue.put(None))
+            except RuntimeError:  # pragma: no cover - no loop (not the SSE path)
+                pass
 
     def __aiter__(self) -> AsyncIterator[bytes]:
         return self._iter()

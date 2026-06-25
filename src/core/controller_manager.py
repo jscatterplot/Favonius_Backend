@@ -67,11 +67,20 @@ class ControllerManager:
         logger.info("Starting controllers for all active depots")
 
         try:
-            # Query all depots from Supabase (static pool)
+            # Only start controllers for depots that actually have chargers. A
+            # depot with zero ``charging_stations`` has nothing to optimize, so
+            # eagerly spinning up its control loop (StateAssembler +
+            # TriggerMonitor + a long-lived task) just burns memory — notably for
+            # stray/test ``sites`` rows. If such a depot later gains a charger and
+            # is optimized, ``get_or_create_controller`` (the /optimize path)
+            # lazily creates the controller on demand.
             query = """
-            SELECT id::text AS depot_id
-            FROM sites
-            ORDER BY created_at
+            SELECT s.id::text AS depot_id
+            FROM sites s
+            WHERE EXISTS (
+                SELECT 1 FROM charging_stations cs WHERE cs.site_id = s.id
+            )
+            ORDER BY s.created_at
             """
             async with self.pools.static.acquire() as conn:
                 rows = await conn.fetch(query)
@@ -79,10 +88,10 @@ class ControllerManager:
             depot_ids = [row["depot_id"] for row in rows]
 
             if not depot_ids:
-                logger.warning("No depots found in database")
+                logger.warning("No depots with chargers found; no controllers started")
                 return
 
-            logger.info(f"Found {len(depot_ids)} depots, starting controllers...")
+            logger.info(f"Found {len(depot_ids)} depots with chargers, starting controllers...")
 
             # Start controller for each depot
             for depot_id in depot_ids:
