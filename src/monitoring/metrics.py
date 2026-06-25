@@ -7,7 +7,15 @@ Reference: PRD_v2.md Section 10.1 (Performance Requirements)
 All metrics are prefixed with `favonius_` per CONTROL_LOOP.md.
 """
 
-from prometheus_client import Counter, Gauge, Histogram
+import os
+
+from prometheus_client import REGISTRY, Counter, Gauge, Histogram
+from prometheus_client.core import GaugeMetricFamily
+
+try:  # psutil is a project dependency; never let an import hiccup break /metrics.
+    import psutil
+except Exception:  # pragma: no cover - defensive
+    psutil = None  # type: ignore[assignment]
 
 # Optimization metrics
 # Per PRD Section 8.3: Solve time < 60 seconds for 20 vehicles
@@ -343,3 +351,54 @@ NAVIREC_STALE_READINGS = Counter(
     "favonius_navirec_stale_readings_total",
     "Readings whose device timestamp already exceeded the telemetry freshness window",
 )
+
+
+# ── Process-tree resident memory ──────────────────────────────────────────────
+# The default prometheus_client ProcessCollector only sees the main process.
+# MILP solves run in ``spawn`` child processes (``core.optimizer.pool``); without
+# this collector their RSS is invisible — and that is exactly the memory we most
+# need to watch on Railway (each persistent worker holds Pyomo/Gurobi resident).
+# Computed lazily on each scrape: no background task, no extra retained memory.
+class _ProcessTreeRSSCollector:
+    """Yield ``favonius_process_rss_bytes`` for the main process and its children."""
+
+    def collect(self):  # noqa: D401 - prometheus_client collector protocol
+        family = GaugeMetricFamily(
+            "favonius_process_rss_bytes",
+            "Resident set size in bytes by role (main process vs. its child "
+            "processes, predominantly the solver workers)",
+            labels=["role"],
+        )
+        if psutil is None:
+            return
+        try:
+            proc = psutil.Process(os.getpid())
+            main_rss = proc.memory_info().rss
+        except Exception:  # pragma: no cover - never break a scrape
+            return
+
+        children_rss = 0
+        try:
+            for child in proc.children(recursive=True):
+                try:
+                    children_rss += child.memory_info().rss
+                except Exception:  # pragma: no cover - child may exit mid-scrape
+                    continue
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+        family.add_metric(["main"], float(main_rss))
+        family.add_metric(["children"], float(children_rss))
+        family.add_metric(["total"], float(main_rss + children_rss))
+        yield family
+
+
+def register_process_tree_rss_collector(registry=REGISTRY) -> None:
+    """Idempotently register the process-tree RSS collector (called from lifespan)."""
+    if getattr(register_process_tree_rss_collector, "_registered", False):
+        return
+    try:
+        registry.register(_ProcessTreeRSSCollector())
+    except ValueError:  # already registered on this registry
+        pass
+    register_process_tree_rss_collector._registered = True  # type: ignore[attr-defined]

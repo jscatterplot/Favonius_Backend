@@ -80,7 +80,7 @@ from ..db.exceptions import (
 from ..db.pools import DatabasePools
 from ..db.postgres_url import describe_database_target
 from ..db.snapshot_store import persist_snapshot
-from ..monitoring.metrics import CONTROLLER_MANAGER_UP
+from ..monitoring.metrics import CONTROLLER_MANAGER_UP, register_process_tree_rss_collector
 from ..observability.log_buffer import (
     get_log_buffer,
     install_log_buffer,
@@ -515,18 +515,21 @@ async def lifespan(app: FastAPI):
         solver_pool = None
     else:
         try:
-            solver_pool_size = int(os.getenv("SOLVER_PROCESS_POOL_SIZE", "2"))
+            solver_pool_size = int(os.getenv("SOLVER_PROCESS_POOL_SIZE", "1"))
             worker_as_limit_mb = int(os.getenv("SOLVER_WORKER_AS_LIMIT_MB", "1500"))
+            worker_max_tasks = int(os.getenv("SOLVER_WORKER_MAX_TASKS", "20"))
             solver_pool = SolverPool(
                 max_workers=solver_pool_size,
                 worker_as_limit_bytes=worker_as_limit_mb * 1024 * 1024,
+                worker_max_tasks=worker_max_tasks,
             )
             await solver_pool.start()
             set_solver_pool(solver_pool)
             logger.info(
-                "SolverPool started (workers=%d, AS limit=%d MiB)",
+                "SolverPool started (workers=%d, AS limit=%d MiB, recycle every %d solves)",
                 solver_pool_size,
                 worker_as_limit_mb,
+                worker_max_tasks,
             )
         except Exception as e:
             set_solver_pool(None)
@@ -537,6 +540,15 @@ async def lifespan(app: FastAPI):
                 exc_info=True,
             )
             solver_pool = None
+
+    # ── Process-tree memory observability ─────────────────────────────────────
+    # Expose RSS for the main process AND its solver child processes via /metrics
+    # (the default ProcessCollector only sees the main process). Lets us see the
+    # main-vs-worker memory split on Railway. Lazy per-scrape; never fails a boot.
+    try:
+        register_process_tree_rss_collector()
+    except Exception as e:  # pragma: no cover - observability must not block startup
+        logger.warning("Process-tree RSS collector not registered: %s", e)
 
     # ── Controller manager ────────────────────────────────────────────────────
     try:

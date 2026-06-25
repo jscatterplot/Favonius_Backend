@@ -21,9 +21,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import Any, AsyncIterator, Optional
 
 logger = logging.getLogger(__name__)
+
+# Upper bound on buffered, not-yet-sent SSE *events*. The queue is bounded so a
+# runaway producer — e.g. a pathological agent loop — cannot buffer unbounded
+# bytes in memory. ``emit`` is non-blocking: on overflow it sheds the oldest
+# buffered event rather than awaiting a free slot, so a hung or disconnected
+# consumer can never wedge the detached producer task. The cap is generous; a
+# healthy turn emits well under a dozen events, so shedding only happens when the
+# consumer has stopped draining. (The queue itself is sized at +1 to reserve a
+# slot for the end-of-stream sentinel so ``close`` is lossless.)
+_SSE_QUEUE_MAXSIZE = max(1, int(os.getenv("AGENT_SSE_QUEUE_MAXSIZE", "1000")))
 
 # Headers a caller passes to ``StreamingResponse`` for SSE:
 # - ``Cache-Control: no-cache``  → tell every cache the body is volatile.
@@ -92,41 +103,86 @@ class SSEEventStream:
     the instance to receive encoded byte chunks. Order is preserved
     because the underlying queue is FIFO.
 
-    Closing while events are still buffered drains them before the
-    iterator stops — clients receive every event the producer sent up to
-    the close call, even if the producer also raises.
+    :meth:`emit` and :meth:`close` never block the producer. When the
+    consumer keeps up (the normal case — a turn emits a handful of events
+    against a 1000-deep queue) clients receive every event in order. If the
+    consumer stops draining (client disconnect, cancelled response body) the
+    queue fills and :meth:`emit` sheds the *oldest* buffered events to bound
+    memory, so the detached producer task always reaches its
+    ``finally: close()`` instead of wedging on a full ``put``. The newest
+    events — including the final ``answer`` — always survive, and
+    :meth:`close` is lossless: a slot is reserved for the end-of-stream
+    sentinel so terminating the stream never evicts a buffered event. The
+    consumer iterator also calls :meth:`close` from its own ``finally`` so a
+    cancelled stream flips ``_closed`` and any further :meth:`emit` calls
+    become cheap no-ops.
     """
 
     def __init__(self) -> None:
-        self._queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
+        # Hold up to ``_SSE_QUEUE_MAXSIZE`` buffered *events* plus one reserved
+        # slot for the sentinel, so ``close`` can always terminate the stream
+        # without dropping a pending event.
+        self._queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(
+            maxsize=_SSE_QUEUE_MAXSIZE + 1
+        )
         self._closed: bool = False
+        self._dropped: int = 0
 
     async def emit(self, name: str, data: Any) -> None:
         """Encode ``(name, data)`` and enqueue it for the consumer.
 
-        If :meth:`close` has already run, this is a no-op so a producer
-        that races the consumer's disconnect can still complete cleanly.
+        Non-blocking. Events are capped at ``_SSE_QUEUE_MAXSIZE``; on overflow
+        the oldest buffered event is shed rather than blocking the producer — a
+        hung or disconnected consumer must never wedge the detached turn task.
+        If :meth:`close` has already run this is a no-op so a producer that
+        races the consumer's disconnect can still complete cleanly.
         """
         if self._closed:
             logger.debug("SSEEventStream.emit called after close; dropping event=%s", name)
             return
         chunk = format_sse_event(name, data)
-        await self._queue.put(chunk)
+        # Cap *events* at _SSE_QUEUE_MAXSIZE; the reserved +1 slot is for the
+        # sentinel only. Shedding only happens when the consumer is not draining.
+        if self._queue.qsize() >= _SSE_QUEUE_MAXSIZE:
+            try:
+                self._queue.get_nowait()  # drop the oldest buffered event
+                self._dropped += 1
+            except asyncio.QueueEmpty:  # pragma: no cover - consumer drained concurrently
+                pass
+        try:
+            self._queue.put_nowait(chunk)
+        except asyncio.QueueFull:  # pragma: no cover - reserved slot keeps headroom
+            pass
 
     def close(self) -> None:
-        """Signal end-of-stream. Idempotent."""
+        """Signal end-of-stream. Idempotent, non-blocking, and lossless."""
         if self._closed:
             return
         self._closed = True
-        # Sentinel ``None`` tells the consumer iterator to stop.
-        self._queue.put_nowait(None)
+        # The reserved slot guarantees the sentinel fits without evicting a
+        # buffered event, so a terminating stream never drops a pending answer.
+        try:
+            self._queue.put_nowait(None)
+        except asyncio.QueueFull:  # pragma: no cover - reserved slot should always fit
+            pass
+        if self._dropped:
+            logger.warning(
+                "SSEEventStream shed %d event(s) on a stalled/disconnected consumer",
+                self._dropped,
+            )
 
     def __aiter__(self) -> AsyncIterator[bytes]:
         return self._iter()
 
     async def _iter(self) -> AsyncIterator[bytes]:
-        while True:
-            chunk = await self._queue.get()
-            if chunk is None:
-                return
-            yield chunk
+        try:
+            while True:
+                chunk = await self._queue.get()
+                if chunk is None:
+                    return
+                yield chunk
+        finally:
+            # A client disconnect cancels this iterator. Flip ``_closed`` so the
+            # detached producer's subsequent emits short-circuit to no-ops
+            # instead of encoding events nobody will read.
+            self.close()

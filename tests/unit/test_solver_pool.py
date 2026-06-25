@@ -8,11 +8,14 @@ and timeout behaviour are exercised in isolation.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from tests.unit.solver_pool_workers import (
     crash_worker,
     echo_worker,
+    sleep_echo_worker,
     slow_worker,
 )
 from src.core.optimizer.exceptions import SolverError, SolverTimeoutError
@@ -270,6 +273,108 @@ def test_optimizer_exceptions_round_trip_pickle():
     assert isinstance(violation_roundtrip, ConstraintViolationError)
     assert violation_roundtrip.constraint_name == "soc_limit"
     assert violation_roundtrip.vehicle_id == "v1"
+
+
+@pytest.mark.unit
+def test_make_executor_wires_max_tasks_per_child():
+    """The recycle bound is passed through to ``ProcessPoolExecutor``."""
+    pool = SolverPool(
+        max_workers=1,
+        worker_fn=echo_worker,
+        worker_init_fn=_noop_init,
+        worker_max_tasks=7,
+    )
+    executor = pool._make_executor()
+    try:
+        assert getattr(executor, "_max_tasks_per_child") == 7
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    # ``<= 0`` disables recycling (workers live for the pool's lifetime).
+    pool_off = SolverPool(
+        max_workers=1,
+        worker_fn=echo_worker,
+        worker_init_fn=_noop_init,
+        worker_max_tasks=0,
+    )
+    executor_off = pool_off._make_executor()
+    try:
+        assert getattr(executor_off, "_max_tasks_per_child") is None
+    finally:
+        executor_off.shutdown(wait=False, cancel_futures=True)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_pool_recycles_workers_and_keeps_solving():
+    """With a low recycle bound the worker is replaced mid-life, yet every
+    solve still returns — and we observe more than one worker PID, proving the
+    recycling actually happens."""
+    pool = SolverPool(
+        max_workers=1,
+        worker_fn=echo_worker,
+        worker_init_fn=_noop_init,
+        worker_alarm_grace_s=0,
+        parent_timeout_buffer_s=3.0,
+        worker_max_tasks=2,  # replace each worker after 2 solves
+    )
+    await pool.start()
+    pids = set()
+    try:
+        for i in range(5):  # > 2 * max_tasks_per_child → at least two workers
+            result = await pool.solve(
+                state=f"s{i}",
+                config="c",
+                time_limit=0.1,
+                previous_result=None,
+                horizon_start=None,
+            )
+            assert result["args"][0] == f"s{i}"
+            pids.add(result["pid"])
+    finally:
+        await pool.stop()
+
+    # max_workers=1 + recycle-every-2 over 5 solves ⇒ the single slot was served
+    # by more than one process, i.e. memory was returned between batches.
+    assert len(pids) >= 2, f"expected workers to recycle, saw pids={pids}"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_queued_solve_keeps_full_timeout_budget():
+    """With one worker, a solve queued behind a long one must still get its full
+    timeout once it starts: the semaphore makes queue wait untimed, so the short
+    parent timeout is not consumed while sitting in the backlog. Without the
+    gate, the quick solve would raise SolverTimeoutError."""
+    pool = SolverPool(
+        max_workers=1,
+        worker_fn=sleep_echo_worker,
+        worker_init_fn=_noop_init,
+        worker_alarm_grace_s=0,
+        parent_timeout_buffer_s=0.6,  # quick solve's whole budget
+        worker_max_tasks=0,  # no recycle churn mid-test
+    )
+    await pool.start()
+    try:
+
+        async def long_solve():
+            # Sleeps 1.2s, occupying the single worker slot.
+            return await pool.solve(state=1.2, config="c", time_limit=10.0)
+
+        async def quick_solve():
+            # parent_timeout = 0.0 + 0 + 0.6 = 0.6s. Queued ~1.2s behind the long
+            # solve; only the semaphore keeps that wait from eating the budget.
+            return await pool.solve(state=0.0, config="c", time_limit=0.0)
+
+        long_task = asyncio.create_task(long_solve())
+        await asyncio.sleep(0.05)  # let the long solve grab the slot first
+        quick_result = await quick_solve()
+        long_result = await long_task
+
+        assert quick_result["slept"] == 0.0  # completed, not timed out
+        assert long_result["slept"] == 1.2
+    finally:
+        await pool.stop()
 
 
 @pytest.mark.unit

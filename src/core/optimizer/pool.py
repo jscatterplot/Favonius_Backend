@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_WORKER_AS_LIMIT_BYTES = 1_500 * 1024 * 1024  # ~1.5 GiB per worker
 DEFAULT_WORKER_ALARM_GRACE_S = 15
 DEFAULT_MAX_WORKERS = 2
+# Recycle each worker after this many solves so Pyomo/Gurobi memory that
+# accumulates across solves is returned to the OS. ``None`` keeps workers for
+# the life of the pool (the pre-3.11 behaviour).
+DEFAULT_WORKER_MAX_TASKS: Optional[int] = 20
 
 
 def _worker_init(as_limit_bytes: int) -> None:
@@ -101,6 +105,7 @@ class SolverPool:
         worker_as_limit_bytes: int = DEFAULT_WORKER_AS_LIMIT_BYTES,
         worker_alarm_grace_s: int = DEFAULT_WORKER_ALARM_GRACE_S,
         parent_timeout_buffer_s: float = 5.0,
+        worker_max_tasks: Optional[int] = DEFAULT_WORKER_MAX_TASKS,
     ) -> None:
         self._max_workers = max_workers
         self._worker_fn = worker_fn
@@ -108,16 +113,26 @@ class SolverPool:
         self._worker_as_limit_bytes = worker_as_limit_bytes
         self._worker_alarm_grace_s = worker_alarm_grace_s
         self._parent_timeout_buffer_s = parent_timeout_buffer_s
+        # ``<= 0`` disables recycling (workers live for the pool's lifetime).
+        self._worker_max_tasks = worker_max_tasks if (worker_max_tasks or 0) > 0 else None
         self._executor: Optional[ProcessPoolExecutor] = None
         self._lock = asyncio.Lock()
+        # Bounds in-flight solves to the worker count so a queued solve does NOT
+        # burn its parent timeout sitting in the executor backlog (see solve()).
+        self._slots = asyncio.Semaphore(max(1, max_workers))
         self._mp_context = multiprocessing.get_context("spawn")
 
     def _make_executor(self) -> ProcessPoolExecutor:
+        # ``max_tasks_per_child`` (Python 3.11+) replaces each worker after a
+        # bounded number of solves, releasing the Pyomo/Gurobi heap it built up.
+        # Safe with our explicit "spawn" context; the recreate path already
+        # tolerates workers coming and going.
         return ProcessPoolExecutor(
             max_workers=self._max_workers,
             mp_context=self._mp_context,
             initializer=self._worker_init_fn,
             initargs=(self._worker_as_limit_bytes,),
+            max_tasks_per_child=self._worker_max_tasks,
         )
 
     async def start(self) -> None:
@@ -180,50 +195,59 @@ class SolverPool:
         """Dispatch one solve. Recreates the pool on broken-pool or timeout."""
         parent_timeout = time_limit + self._worker_alarm_grace_s + self._parent_timeout_buffer_s
 
-        last_exc: Optional[BaseException] = None
-        for attempt in (1, 2):
-            executor = self._executor
-            if executor is None:
-                raise RuntimeError("SolverPool is not started")
-            loop = asyncio.get_event_loop()
-            SOLVER_POOL_INFLIGHT.inc()
-            try:
-                future = loop.run_in_executor(
-                    executor,
-                    self._worker_fn,
-                    state,
-                    config,
-                    time_limit,
-                    previous_result,
-                    horizon_start,
-                    self._worker_alarm_grace_s,
-                )
-                return await asyncio.wait_for(future, timeout=parent_timeout)
-            except BrokenProcessPool as exc:
-                last_exc = exc
-                logger.error(
-                    "SolverPool broken (attempt=%d); recreating executor.",
-                    attempt,
-                    exc_info=True,
-                )
-                await self._recreate(reason="broken_pool", failed_executor=executor)
-            except asyncio.TimeoutError as exc:
-                last_exc = exc
-                logger.error(
-                    "SolverPool wait_for timeout after %.1fs (attempt=%d); recreating executor.",
-                    parent_timeout,
-                    attempt,
-                )
-                # The runaway worker may still be holding a slot. Burn the
-                # executor so the OS reaps the orphan and the next call starts
-                # clean.
-                await self._recreate(reason="timeout", failed_executor=executor)
-                if attempt == 2:
-                    raise SolverTimeoutError(time_limit) from exc
-            finally:
-                SOLVER_POOL_INFLIGHT.dec()
+        # Acquire a worker slot BEFORE arming the parent timeout. ``wait_for``
+        # times the future from the moment it is awaited, but a future submitted
+        # to a busy ``ProcessPoolExecutor`` sits in its backlog first — so on a
+        # small pool (e.g. the default 1 worker) a solve queued behind a long one
+        # could be killed mid-execution after spending most of its budget merely
+        # waiting. Gating on a semaphore sized to the worker count means the
+        # timed section below starts only once a worker is (about to be) free, so
+        # queue wait is untimed and each solve gets its full configured budget.
+        async with self._slots:
+            last_exc: Optional[BaseException] = None
+            for attempt in (1, 2):
+                executor = self._executor
+                if executor is None:
+                    raise RuntimeError("SolverPool is not started")
+                loop = asyncio.get_event_loop()
+                SOLVER_POOL_INFLIGHT.inc()
+                try:
+                    future = loop.run_in_executor(
+                        executor,
+                        self._worker_fn,
+                        state,
+                        config,
+                        time_limit,
+                        previous_result,
+                        horizon_start,
+                        self._worker_alarm_grace_s,
+                    )
+                    return await asyncio.wait_for(future, timeout=parent_timeout)
+                except BrokenProcessPool as exc:
+                    last_exc = exc
+                    logger.error(
+                        "SolverPool broken (attempt=%d); recreating executor.",
+                        attempt,
+                        exc_info=True,
+                    )
+                    await self._recreate(reason="broken_pool", failed_executor=executor)
+                except asyncio.TimeoutError as exc:
+                    last_exc = exc
+                    logger.error(
+                        "SolverPool wait_for timeout after %.1fs (attempt=%d); recreating executor.",
+                        parent_timeout,
+                        attempt,
+                    )
+                    # The runaway worker may still be holding a slot. Burn the
+                    # executor so the OS reaps the orphan and the next call starts
+                    # clean.
+                    await self._recreate(reason="timeout", failed_executor=executor)
+                    if attempt == 2:
+                        raise SolverTimeoutError(time_limit) from exc
+                finally:
+                    SOLVER_POOL_INFLIGHT.dec()
 
-        raise SolverError(f"Solver pool broken twice; last error: {last_exc}", "broken_pool")
+            raise SolverError(f"Solver pool broken twice; last error: {last_exc}", "broken_pool")
 
 
 _solver_pool: Optional[SolverPool] = None

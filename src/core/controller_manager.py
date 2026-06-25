@@ -67,7 +67,12 @@ class ControllerManager:
         logger.info("Starting controllers for all active depots")
 
         try:
-            # Query all depots from Supabase (static pool)
+            # Start a controller for every depot. (A charger-less depot has
+            # nothing to optimize yet, but keeping its control loop means a
+            # charger onboarded after startup is picked up on the next hourly
+            # cycle without needing a manual /optimize or an API restart — the
+            # charger-create paths go through the DB layer and do not touch the
+            # ControllerManager.)
             query = """
             SELECT id::text AS depot_id
             FROM sites

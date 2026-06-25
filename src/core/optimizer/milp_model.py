@@ -5,6 +5,7 @@ Reference: PRD_v2.md#8-optimization-engine-specifications
 
 from __future__ import annotations
 
+import gc
 import logging
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
@@ -624,43 +625,56 @@ def optimize(
     # Use provided horizon_start or current time (state was just assembled, so current time is close)
     if horizon_start is None:
         horizon_start = datetime.utcnow()
-    model = build_optimization_model(state, config, horizon_start=horizon_start)
+    model = None
+    result_dict = None
+    try:
+        model = build_optimization_model(state, config, horizon_start=horizon_start)
 
-    # Apply warm-starting if previous result provided
-    if previous_result is not None:
-        warm_start_model(model, previous_result, state, config)
+        # Apply warm-starting if previous result provided
+        if previous_result is not None:
+            warm_start_model(model, previous_result, state, config)
 
-    # Solve model
-    result_dict = solve_model(
-        model, time_limit=time_limit, warm_started=previous_result is not None
-    )
+        # Solve model
+        result_dict = solve_model(
+            model, time_limit=time_limit, warm_started=previous_result is not None
+        )
 
-    # Validate solution
-    _validate_solution(model, state, config)
+        # Validate solution
+        _validate_solution(model, state, config)
 
-    # Determine status: use 'completed' for acceptance criteria (AT-*); solver outcome was optimal/feasible
-    status = "completed"
+        # Status 'completed' for acceptance criteria (AT-*); solver was optimal/feasible.
+        status = "completed"
 
-    # Convert to OptimizationResult
-    run_id = uuid4()
-    solver_used = result_dict.get("solver_used", "gurobi")
-    result = OptimizationResult(
-        run_id=run_id,
-        schedule=result_dict["schedule"],
-        battery_dispatch=result_dict["battery_dispatch"],
-        grid_power=result_dict["grid_power"],
-        peak_demand_kw=result_dict["peak_demand_kw"],
-        objective_value=result_dict["objective_value"],
-        solve_time_s=result_dict["solve_time_s"],
-        status=status,
-        solver_used=solver_used,
-    )
+        # Convert to OptimizationResult
+        run_id = uuid4()
+        solver_used = result_dict.get("solver_used", "gurobi")
+        result = OptimizationResult(
+            run_id=run_id,
+            schedule=result_dict["schedule"],
+            battery_dispatch=result_dict["battery_dispatch"],
+            grid_power=result_dict["grid_power"],
+            peak_demand_kw=result_dict["peak_demand_kw"],
+            objective_value=result_dict["objective_value"],
+            solve_time_s=result_dict["solve_time_s"],
+            status=status,
+            solver_used=solver_used,
+        )
 
-    start_type = "warm-start" if previous_result is not None else "cold-start"
-    logger.info(
-        f"Optimization complete ({start_type}, {solver_used}): "
-        f"objective=${result.objective_value:.2f}, "
-        f"solve_time={result.solve_time_s:.2f}s"
-    )
+        start_type = "warm-start" if previous_result is not None else "cold-start"
+        logger.info(
+            f"Optimization complete ({start_type}, {solver_used}): "
+            f"objective=${result.objective_value:.2f}, "
+            f"solve_time={result.solve_time_s:.2f}s"
+        )
 
-    return result
+        return result
+    finally:
+        # Pyomo ConcreteModels hold internal reference cycles, so the heap they
+        # build is reclaimed by the cyclic collector, not plain refcounting. Drop
+        # the model and force one collection on BOTH the success AND the failure
+        # path (infeasible/timeout/error, or a raising ``_validate_solution``) so
+        # a depot with repeatedly bad inputs cannot accumulate Pyomo/Gurobi heap
+        # in the long-lived worker (complements recycling in core.optimizer.pool).
+        # ``result`` (returned above) holds only plain Python lists, not model refs.
+        del model, result_dict
+        gc.collect()
