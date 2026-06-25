@@ -134,17 +134,14 @@ class SSEEventStream:
             return
         self._closed = True
         # Sentinel ``None`` tells the consumer iterator to stop. When the
-        # queue is full, drop the oldest buffered event so a producer stuck
-        # on emit can observe ``_closed`` and exit instead of deadlocking.
-        while True:
-            try:
-                self._queue.put_nowait(None)
-                return
-            except asyncio.QueueFull:
-                try:
-                    self._queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
+        # queue is full, skip the sentinel — the consumer also exits once
+        # ``_closed`` is set and every buffered event has been drained.
+        # A producer stuck in :meth:`emit` observes ``_closed`` and exits
+        # instead of deadlocking.
+        try:
+            self._queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
 
     def __aiter__(self) -> AsyncIterator[bytes]:
         return self._iter()
@@ -152,6 +149,8 @@ class SSEEventStream:
     async def _iter(self) -> AsyncIterator[bytes]:
         try:
             while True:
+                if self._closed and self._queue.empty():
+                    return
                 chunk = await self._queue.get()
                 if chunk is None:
                     return
