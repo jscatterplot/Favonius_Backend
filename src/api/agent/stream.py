@@ -118,32 +118,45 @@ class SSEEventStream:
             logger.debug("SSEEventStream.emit called after close; dropping event=%s", name)
             return
         chunk = format_sse_event(name, data)
-        await self._queue.put(chunk)
+        while not self._closed:
+            try:
+                self._queue.put_nowait(chunk)
+                return
+            except asyncio.QueueFull:
+                # Yield so the consumer (or close()) can drain a slot. Never
+                # block on put indefinitely — a disconnected client stops
+                # reading and close() must be able to unblock the producer.
+                await asyncio.sleep(0)
 
     def close(self) -> None:
         """Signal end-of-stream. Idempotent."""
         if self._closed:
             return
         self._closed = True
-        # Sentinel ``None`` tells the consumer iterator to stop.
-        try:
-            self._queue.put_nowait(None)
-        except asyncio.QueueFull:
-            # The queue is full of pending events (bounded for memory safety).
-            # Deliver the sentinel after the consumer drains, without blocking
-            # the producer or dropping any buffered event — preserves order and
-            # the "clients receive every event" contract.
+        # Sentinel ``None`` tells the consumer iterator to stop. When the
+        # queue is full, drop the oldest buffered event so a producer stuck
+        # on emit can observe ``_closed`` and exit instead of deadlocking.
+        while True:
             try:
-                asyncio.get_running_loop().create_task(self._queue.put(None))
-            except RuntimeError:  # pragma: no cover - no loop (not the SSE path)
-                pass
+                self._queue.put_nowait(None)
+                return
+            except asyncio.QueueFull:
+                try:
+                    self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
 
     def __aiter__(self) -> AsyncIterator[bytes]:
         return self._iter()
 
     async def _iter(self) -> AsyncIterator[bytes]:
-        while True:
-            chunk = await self._queue.get()
-            if chunk is None:
-                return
-            yield chunk
+        try:
+            while True:
+                chunk = await self._queue.get()
+                if chunk is None:
+                    return
+                yield chunk
+        finally:
+            # Client disconnect cancels this iterator; close unblocks a producer
+            # that is waiting for a free queue slot.
+            self.close()
